@@ -12,12 +12,23 @@ service firebase.storage {
         && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == "admin";
     }
 
+    function isSafeImage() {
+      return request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType in [
+          "image/jpeg",
+          "image/jpg",
+          "image/png",
+          "image/webp"
+        ];
+    }
+
     match /token-proofs/{uid}/{fileName} {
       allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
-      allow write: if signedIn()
+      // Create only — no overwrite/delete so proofs stay auditable.
+      allow create: if signedIn()
         && request.auth.uid == uid
-        && request.resource.size < 8 * 1024 * 1024
-        && request.resource.contentType.matches("image/.*");
+        && isSafeImage();
+      allow update, delete: if false;
     }
   }
 }

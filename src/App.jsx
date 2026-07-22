@@ -585,7 +585,7 @@ function StatCard({ icon: Icon, label, value }) {
   );
 }
 
-function FileUpload({ id, label, file, onChange, required = false }) {
+function FileUpload({ id, label, file, onChange, required = false, accept = "image/*" }) {
   const inputId = useMemo(
     () => id || `file-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
     [id, label],
@@ -598,7 +598,7 @@ function FileUpload({ id, label, file, onChange, required = false }) {
         <input
           id={inputId}
           type="file"
-          accept="image/*"
+          accept={accept}
           onChange={(event) => onChange(event.target.files?.[0] || null)}
           required={required}
         />
@@ -621,17 +621,20 @@ function DrawCard({ profile }) {
   const [buyingNumber, setBuyingNumber] = useState(null);
 
   useEffect(() => {
-    const drawsQuery = query(
-      collection(db, "draws"),
-      orderBy("createdAt", "desc"),
-    );
+    const drawsQuery = profile?.role === "admin"
+      ? query(collection(db, "draws"), orderBy("createdAt", "desc"))
+      : query(
+          collection(db, "draws"),
+          where("status", "==", "live"),
+          orderBy("createdAt", "desc"),
+        );
     const stopDraws = onSnapshot(drawsQuery, (snapshot) => {
       const allDraws = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
       setRooms(allDraws);
     });
 
     return stopDraws;
-  }, []);
+  }, [profile?.role]);
 
   useEffect(() => {
     function handleRouteChange() {
@@ -676,11 +679,16 @@ function DrawCard({ profile }) {
       await runTransaction(db, async (transaction) => {
         const userRef = doc(db, "users", profile.uid);
         const slotRef = doc(db, "draws", selectedRoom.id, "slots", String(slot.number));
-        const recordRef = doc(collection(db, "drawRecords"));
+        const recordRef = doc(
+          db,
+          "drawRecords",
+          `${selectedRoom.id}_${slot.number}`,
+        );
         const userSnap = await transaction.get(userRef);
         const slotSnap = await transaction.get(slotRef);
         const currentTokens = Number(userSnap.data()?.tokens || 0);
         const tokenCost = Number(selectedRoom.tokenCost || 10);
+        const slotNumber = Number(slot.number);
 
         if (!slotSnap.exists() || slotSnap.data().status !== "available") {
           throw new Error("This number is already taken.");
@@ -709,7 +717,7 @@ function DrawCard({ profile }) {
           roomSlug: selectedRoom.slug || selectedRoom.id,
           roomLink: makeRoomLink(selectedRoom.id),
           round: selectedRoom.round || "round-001",
-          number: slot.number,
+          number: slotNumber,
           tokenCost,
           createdAt: serverTimestamp(),
         });
@@ -1032,14 +1040,13 @@ function TokenRequest({ profile }) {
       const proofInfo = await createProofInfo({
         proof,
         profile,
-        amount: Number(amount),
       });
 
       await addDoc(collection(db, "tokenRequests"), {
         uid: profile.uid,
         username: profile.username,
         email: profile.email || "",
-        amount: Number(amount),
+        amount: Math.floor(Number(amount)),
         ...proofInfo,
         status: "pending",
         adminNote: "",
@@ -1081,10 +1088,12 @@ function TokenRequest({ profile }) {
             label="Payment proof image"
             file={proof}
             onChange={setProof}
+            required
+            accept="image/jpeg,image/png,image/webp"
           />
           <p className="form-note">
-            Storage is optional for testing. If no image is uploaded, the request
-            uses a dummy proof record.
+            Upload a JPEG, PNG, or WebP bank transfer proof. Requests without a
+            real image upload are rejected.
           </p>
           <button className="primary-btn" type="submit" disabled={submitting}>
             <FileImage size={18} />
@@ -1107,56 +1116,28 @@ function TokenRequest({ profile }) {
   );
 }
 
-async function createProofInfo({ proof, profile, amount }) {
-  const dummyProof = {
-    proofMode: "dummy",
-    proofPath: "dummy/testing-only",
-    proofFileName: proof?.name || "dummy-proof.svg",
-    proofUrl: createDummyProofUrl(profile.username, amount),
-  };
-
-  if (!proof) return dummyProof;
-
-  try {
-    const proofPath = `token-proofs/${profile.uid}/${Date.now()}-${proof.name}`;
-    const proofRef = ref(storage, proofPath);
-    await uploadBytes(proofRef, proof, {
-      contentType: proof.type || "image/jpeg",
-    });
-
-    return {
-      proofMode: "storage",
-      proofPath,
-      proofFileName: proof.name,
-      proofUrl: await getDownloadURL(proofRef),
-    };
-  } catch (error) {
-    console.warn("Storage proof upload failed, using dummy proof.", error);
-    return dummyProof;
+async function createProofInfo({ proof, profile }) {
+  if (!proof) {
+    throw new Error("Please upload a payment proof image (JPEG, PNG, or WebP).");
   }
-}
 
-function createDummyProofUrl(username, amount) {
-  const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="720" height="420" viewBox="0 0 720 420">
-      <rect width="720" height="420" fill="#f8fafc"/>
-      <rect x="48" y="48" width="624" height="324" rx="18" fill="#ffffff" stroke="#cbd5e1" stroke-width="3"/>
-      <text x="80" y="130" font-family="Arial, sans-serif" font-size="42" font-weight="700" fill="#172033">Dummy Payment Proof</text>
-      <text x="80" y="194" font-family="Arial, sans-serif" font-size="26" fill="#475569">Storage is not enabled yet.</text>
-      <text x="80" y="252" font-family="Arial, sans-serif" font-size="24" fill="#155eef">User: ${escapeSvg(username || "player")}</text>
-      <text x="80" y="300" font-family="Arial, sans-serif" font-size="24" fill="#155eef">Requested tokens: ${escapeSvg(String(amount || 0))}</text>
-    </svg>
-  `;
+  const allowedTypes = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+  const contentType = proof.type || "";
+  if (!allowedTypes.has(contentType)) {
+    throw new Error("Proof must be a JPEG, PNG, or WebP image.");
+  }
 
-  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-}
+  const safeName = proof.name.replace(/[^\w.\-]+/g, "_").slice(0, 80) || "proof.jpg";
+  const proofPath = `token-proofs/${profile.uid}/${Date.now()}-${safeName}`;
+  const proofRef = ref(storage, proofPath);
+  await uploadBytes(proofRef, proof, { contentType });
 
-function escapeSvg(value) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+  return {
+    proofMode: "storage",
+    proofPath,
+    proofFileName: safeName,
+    proofUrl: await getDownloadURL(proofRef),
+  };
 }
 
 function RequestList({ requests, adminMode = false, onApprove, onReject }) {

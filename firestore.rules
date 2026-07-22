@@ -36,7 +36,10 @@ service cloud.firestore {
         userDoc(request.auth.uid).data.role == "admin";
     }
 
-    // Auth uid is identity. usernames/{lower(name)} reserves a unique display name.
+    function isLiveDraw(drawId) {
+      return drawDoc(drawId).data.status == "live";
+    }
+
     function isValidUsername(name) {
       return name is string
         && name.size() >= 3
@@ -92,15 +95,19 @@ service cloud.firestore {
     function isAdminUserEdit() {
       return isAdmin()
         && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["tokens", "updatedAt"]);
+          .hasOnly(["tokens", "updatedAt"])
+        && request.resource.data.tokens is number
+        && request.resource.data.tokens >= 0;
     }
 
     function isValidSlotPurchase(drawId) {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
-        && drawDoc(drawId).data.status == "live"
+        && isLiveDraw(drawId)
         && resource.data.status == "available"
         && request.resource.data.status == "locked"
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["status", "uid", "username", "tokenCost", "updatedAt"])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == userDoc(request.auth.uid).data.username
         && request.resource.data.number == resource.data.number
@@ -110,26 +117,55 @@ service cloud.firestore {
           userDoc(request.auth.uid).data.tokens - drawDoc(drawId).data.tokenCost;
     }
 
-    function isMatchingDrawRecord() {
+    // Purchase-only create: no card assignment fields; one record per draw+number.
+    function isValidDrawRecordCreate(recordId) {
       return signedIn()
+        && ownsUsername(userDoc(request.auth.uid).data.username)
+        && request.resource.data.keys().hasOnly([
+          "uid",
+          "username",
+          "drawId",
+          "drawTitle",
+          "roomSlug",
+          "roomLink",
+          "round",
+          "number",
+          "tokenCost",
+          "createdAt"
+        ])
         && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == userDoc(request.auth.uid).data.username
+        && request.resource.data.drawId is string
+        && request.resource.data.drawId.size() > 0
+        && request.resource.data.number is int
+        && request.resource.data.number > 0
+        && recordId == request.resource.data.drawId + "_" + string(request.resource.data.number)
+        && isLiveDraw(request.resource.data.drawId)
+        && request.resource.data.tokenCost == drawDoc(request.resource.data.drawId).data.tokenCost
+        && request.resource.data.drawTitle == drawDoc(request.resource.data.drawId).data.title
+        && request.resource.data.createdAt == request.time
         && afterSlotDoc(
           request.resource.data.drawId,
-          request.resource.data.number
+          string(request.resource.data.number)
         ).data.uid == request.auth.uid
         && afterSlotDoc(
           request.resource.data.drawId,
-          request.resource.data.number
+          string(request.resource.data.number)
         ).data.username == request.resource.data.username
         && afterSlotDoc(
           request.resource.data.drawId,
-          request.resource.data.number
-        ).data.tokenCost == request.resource.data.tokenCost;
+          string(request.resource.data.number)
+        ).data.tokenCost == request.resource.data.tokenCost
+        && afterSlotDoc(
+          request.resource.data.drawId,
+          string(request.resource.data.number)
+        ).data.status == "locked";
     }
 
     function isValidRoomMessage(drawId) {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
+        && isLiveDraw(drawId)
         && request.resource.data.keys().hasOnly([
           "drawId",
           "source",
@@ -148,6 +184,55 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time;
     }
 
+    function isValidTokenRequestCreate() {
+      return signedIn()
+        && ownsUsername(userDoc(request.auth.uid).data.username)
+        && request.resource.data.keys().hasOnly([
+          "uid",
+          "username",
+          "email",
+          "amount",
+          "proofMode",
+          "proofPath",
+          "proofFileName",
+          "proofUrl",
+          "status",
+          "adminNote",
+          "createdAt"
+        ])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == userDoc(request.auth.uid).data.username
+        && request.resource.data.email == userDoc(request.auth.uid).data.email
+        && request.resource.data.amount is int
+        && request.resource.data.amount > 0
+        && request.resource.data.amount <= 10000
+        && request.resource.data.status == "pending"
+        && request.resource.data.adminNote == ""
+        && request.resource.data.proofMode == "storage"
+        && request.resource.data.proofPath is string
+        && request.resource.data.proofPath.matches(
+          "token-proofs/" + request.auth.uid + "/[^/]+"
+        )
+        && request.resource.data.proofFileName is string
+        && request.resource.data.proofFileName.size() > 0
+        && request.resource.data.proofFileName.size() <= 200
+        && request.resource.data.proofUrl is string
+        && request.resource.data.proofUrl.size() > 0
+        && request.resource.data.proofUrl.size() <= 4000
+        && request.resource.data.createdAt == request.time;
+    }
+
+    function isValidTokenRequestReview() {
+      return isAdmin()
+        && resource.data.status == "pending"
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["status", "adminNote", "reviewedAt", "reviewedBy"])
+        && request.resource.data.status in ["approved", "rejected"]
+        && request.resource.data.reviewedBy == request.auth.uid
+        && request.resource.data.adminNote is string
+        && request.resource.data.adminNote.size() <= 500;
+    }
+
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();
       allow create: if isOwner(uid)
@@ -160,8 +245,6 @@ service cloud.firestore {
     match /usernames/{usernameId} {
       allow read: if signedIn();
 
-      // Claim is only valid if profile username (after this transaction) matches.
-      // Renames that already own a name must release it in the same transaction.
       allow create: if signedIn()
         && request.resource.data.uid == request.auth.uid
         && isValidUsername(request.resource.data.username)
@@ -189,43 +272,41 @@ service cloud.firestore {
 
     match /tokenRequests/{requestId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
-      allow create: if signedIn()
-        && request.resource.data.uid == request.auth.uid
-        && request.resource.data.status == "pending";
-      allow update: if isAdmin();
+      allow create: if isValidTokenRequestCreate();
+      allow update: if isValidTokenRequestReview();
       allow delete: if false;
     }
 
     match /draws/{drawId} {
-      allow read: if signedIn();
+      allow read: if isAdmin() || (signedIn() && resource.data.status == "live");
       allow create, update: if isAdmin();
       allow delete: if isAdmin();
 
       match /slots/{slotId} {
-        allow read: if signedIn();
+        allow read: if isAdmin() || (signedIn() && isLiveDraw(drawId));
         allow create: if isAdmin();
         allow update: if isAdmin() || isValidSlotPurchase(drawId);
         allow delete: if isAdmin();
       }
 
       match /messages/{messageId} {
-        allow read: if signedIn();
-        allow create: if isValidRoomMessage(drawId)
-          && request.resource.data.source == "draw";
+        allow read: if isAdmin() || (signedIn() && isLiveDraw(drawId));
+        allow create: if isValidRoomMessage(drawId);
         allow update: if false;
         allow delete: if isAdmin();
       }
     }
 
+    // Card pool stays private until admin assigns into drawRecords.
     match /cards/{cardId} {
-      allow read: if signedIn();
+      allow read: if isAdmin();
       allow create, update: if isAdmin();
       allow delete: if false;
     }
 
     match /drawRecords/{recordId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
-      allow create: if isMatchingDrawRecord();
+      allow create: if isValidDrawRecordCreate(recordId);
       allow update: if isAdmin();
       allow delete: if false;
     }
