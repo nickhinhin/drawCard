@@ -79,6 +79,95 @@ const statusLabels = {
 
 const collectionStatuses = ["pending", "shipping", "shipped"];
 
+function normalizeUsername(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, "_")
+    .slice(0, 24);
+}
+
+function usernameKey(value) {
+  return normalizeUsername(value).toLowerCase();
+}
+
+async function saveProfileUsername(uid, rawUsername, currentUsername = "") {
+  const cleanUsername = normalizeUsername(rawUsername);
+  const newKey = usernameKey(cleanUsername);
+  const oldKey = usernameKey(currentUsername);
+
+  if (cleanUsername.length < 3) {
+    throw new Error("Username must be at least 3 characters.");
+  }
+
+  await runTransaction(db, async (transaction) => {
+    const profileRef = doc(db, "users", uid);
+    const newRef = doc(db, "usernames", newKey);
+    const newSnap = await transaction.get(newRef);
+
+    const oldRef = oldKey && oldKey !== newKey ? doc(db, "usernames", oldKey) : null;
+    const oldSnap = oldRef ? await transaction.get(oldRef) : null;
+
+    if (newSnap.exists() && newSnap.data()?.uid !== uid) {
+      throw new Error("This username is already taken.");
+    }
+
+    // Profile must move to the claimed name in the same transaction (rules enforce this).
+    transaction.update(profileRef, {
+      username: cleanUsername,
+      updatedAt: serverTimestamp(),
+    });
+
+    if (!newSnap.exists()) {
+      transaction.set(newRef, {
+        uid,
+        username: cleanUsername,
+        createdAt: serverTimestamp(),
+      });
+    } else if (newSnap.data()?.username !== cleanUsername) {
+      transaction.update(newRef, {
+        username: cleanUsername,
+      });
+    }
+
+    if (oldSnap?.exists() && oldSnap.data()?.uid === uid) {
+      transaction.delete(oldRef);
+    }
+  });
+
+  return cleanUsername;
+}
+
+/** For users who already have a profile username but no reservation doc yet. */
+async function ensureUsernameClaim(uid, username) {
+  const cleanUsername = normalizeUsername(username);
+  const key = usernameKey(cleanUsername);
+  if (cleanUsername.length < 3) return;
+
+  await runTransaction(db, async (transaction) => {
+    const profileRef = doc(db, "users", uid);
+    const claimRef = doc(db, "usernames", key);
+    const claimSnap = await transaction.get(claimRef);
+
+    if (claimSnap.exists()) {
+      if (claimSnap.data()?.uid !== uid) {
+        throw new Error("This username is already taken. Please choose a new one.");
+      }
+      return;
+    }
+
+    // Touch profile so afterUserDoc matches the claimed key (required by rules).
+    transaction.update(profileRef, {
+      username: cleanUsername,
+      updatedAt: serverTimestamp(),
+    });
+    transaction.set(claimRef, {
+      uid,
+      username: cleanUsername,
+      createdAt: serverTimestamp(),
+    });
+  });
+}
+
 function App() {
   const [authUser, setAuthUser] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -87,6 +176,7 @@ function App() {
   const [signingIn, setSigningIn] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("draw");
+  const [usernameConflict, setUsernameConflict] = useState(false);
 
   useEffect(() => {
     const authTimer = window.setTimeout(() => {
@@ -153,8 +243,31 @@ function App() {
     return stopProfile;
   }, [authUser]);
 
+  useEffect(() => {
+    if (!authUser || !profile?.username) {
+      setUsernameConflict(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    ensureUsernameClaim(authUser.uid, profile.username)
+      .then(() => {
+        if (!cancelled) setUsernameConflict(false);
+      })
+      .catch(() => {
+        if (!cancelled) setUsernameConflict(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authUser, profile?.username]);
+
   const isAdmin = profile?.role === "admin";
-  const needsUsername = Boolean(authUser && profile && !profile.username);
+  const needsUsername = Boolean(
+    authUser && profile && (!profile.username || usernameConflict),
+  );
 
   const tabs = useMemo(
     () => [
@@ -278,7 +391,11 @@ function App() {
             signingIn={signingIn}
           />
         ) : needsUsername ? (
-          <UsernameGate authUser={authUser} profile={profile} />
+          <UsernameGate
+            authUser={authUser}
+            profile={profile}
+            conflict={usernameConflict}
+          />
         ) : (
           <>
             <AccountPanel authUser={authUser} profile={profile} isAdmin={isAdmin} />
@@ -335,42 +452,17 @@ function WelcomePanel({ authError, onLogin, signingIn }) {
   );
 }
 
-function UsernameGate({ authUser, profile }) {
+function UsernameGate({ authUser, profile, conflict = false }) {
   const [username, setUsername] = useState(
-    profile?.displayName?.split(" ")?.[0] || "",
+    conflict ? "" : profile?.displayName?.split(" ")?.[0] || "",
   );
   const [saving, setSaving] = useState(false);
 
   async function saveUsername(event) {
     event.preventDefault();
-    const cleanUsername = username.trim().replace(/\s+/g, "_").slice(0, 24);
-
-    if (cleanUsername.length < 3) {
-      alert("Username must be at least 3 characters.");
-      return;
-    }
-
     setSaving(true);
     try {
-      await runTransaction(db, async (transaction) => {
-        const usernameRef = doc(db, "usernames", cleanUsername.toLowerCase());
-        const profileRef = doc(db, "users", authUser.uid);
-        const usernameSnap = await transaction.get(usernameRef);
-
-        if (usernameSnap.exists() && usernameSnap.data().uid !== authUser.uid) {
-          throw new Error("This username is already taken.");
-        }
-
-        transaction.set(usernameRef, {
-          uid: authUser.uid,
-          username: cleanUsername,
-          createdAt: serverTimestamp(),
-        });
-        transaction.update(profileRef, {
-          username: cleanUsername,
-          updatedAt: serverTimestamp(),
-        });
-      });
+      await saveProfileUsername(authUser.uid, username, profile?.username || "");
     } catch (error) {
       alert(error.message);
     } finally {
@@ -384,11 +476,13 @@ function UsernameGate({ authUser, profile }) {
         <UserRoundPlus size={24} />
         <div>
           <p className="eyebrow">One more step</p>
-          <h1>Register a username</h1>
+          <h1>{conflict ? "Choose a new username" : "Choose a username"}</h1>
         </div>
       </div>
       <p className="muted">
-        This name replaces the card number when you lock a spot in a draw.
+        {conflict
+          ? `“${profile?.username}” is already taken. Pick a unique username to continue.`
+          : "Usernames are unique. This name shows on locked numbers and chat. You can change it later from your account panel."}
       </p>
       <form className="stack-form" onSubmit={saveUsername}>
         <label>
@@ -411,6 +505,33 @@ function UsernameGate({ authUser, profile }) {
 }
 
 function AccountPanel({ authUser, profile, isAdmin }) {
+  const [username, setUsername] = useState(profile?.username || "");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    setUsername(profile?.username || "");
+  }, [profile?.username]);
+
+  async function saveUsername(event) {
+    event.preventDefault();
+    setSaving(true);
+    setSaved(false);
+    try {
+      const cleanUsername = await saveProfileUsername(
+        authUser.uid,
+        username,
+        profile?.username || "",
+      );
+      setUsername(cleanUsername);
+      setSaved(true);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <aside className="account-panel">
       <div className="profile-row">
@@ -424,6 +545,27 @@ function AccountPanel({ authUser, profile, isAdmin }) {
           <span>{authUser.email}</span>
         </div>
       </div>
+
+      <form className="stack-form username-edit-form" onSubmit={saveUsername}>
+        <label>
+          Username
+          <input
+            value={username}
+            onChange={(event) => {
+              setUsername(event.target.value);
+              setSaved(false);
+            }}
+            placeholder="e.g. nick_draws"
+            maxLength={24}
+            required
+          />
+        </label>
+        <p className="muted username-edit-hint">Must be unique. Old name is released when you change it.</p>
+        <button className="small-btn" type="submit" disabled={saving}>
+          <Pencil size={16} />
+          {saving ? "Saving..." : saved ? "Saved" : "Change username"}
+        </button>
+      </form>
 
       <div className="stats-grid">
         <StatCard icon={Ticket} label="Tokens" value={profile?.tokens ?? 0} />

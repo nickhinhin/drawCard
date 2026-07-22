@@ -9,11 +9,19 @@
 
 ## UsernameGate
 
-- Section: first-login username registration.
+- Section: first-login username setup (also shown if the current name is claimed by someone else).
 - Calls: `runTransaction`.
 - Input: typed username and current auth UID.
-- Output: updates `users/{uid}.username` and creates `usernames/{username}`.
-- Notes: transaction prevents two users from claiming the same lowercase username.
+- Output: updates `users/{uid}.username` and creates `usernames/{lowercaseUsername}`.
+- Notes: transaction enforces uniqueness. Auth uid remains the identity.
+
+## AccountPanel username edit
+
+- Section: change username anytime.
+- Calls: `runTransaction`.
+- Input: new username, current username, and auth UID.
+- Output: claims `usernames/{new}`, deletes owned `usernames/{old}`, updates profile.
+- Notes: rules require the profile username after the transaction to match the claimed reservation.
 
 ## TokenRequest
 

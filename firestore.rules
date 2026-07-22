@@ -26,16 +26,58 @@ service cloud.firestore {
       return getAfter(/databases/$(database)/documents/draws/$(drawId)/slots/$(slotId));
     }
 
+    function usernamePath(name) {
+      return /databases/$(database)/documents/usernames/$(name.lower());
+    }
+
     function isAdmin() {
       return signedIn() &&
         exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
         userDoc(request.auth.uid).data.role == "admin";
     }
 
+    // Auth uid is identity. usernames/{lower(name)} reserves a unique display name.
+    function isValidUsername(name) {
+      return name is string
+        && name.size() >= 3
+        && name.size() <= 24;
+    }
+
+    function willOwnUsername(name) {
+      return isValidUsername(name)
+        && existsAfter(usernamePath(name))
+        && getAfter(usernamePath(name)).data.uid == request.auth.uid;
+    }
+
+    function ownsUsername(name) {
+      return isValidUsername(name)
+        && exists(usernamePath(name))
+        && get(usernamePath(name)).data.uid == request.auth.uid;
+    }
+
+    function currentUsername() {
+      return userDoc(request.auth.uid).data.username;
+    }
+
+    function hasNoUsername() {
+      return !("username" in userDoc(request.auth.uid).data)
+        || !(userDoc(request.auth.uid).data.username is string)
+        || userDoc(request.auth.uid).data.username.size() == 0;
+    }
+
+    function isReleasingCurrentUsername() {
+      return isValidUsername(currentUsername())
+        && !existsAfter(usernamePath(currentUsername()));
+    }
+
     function isProfileEdit(uid) {
       return isOwner(uid)
         && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["username", "displayName", "photoURL", "updatedAt"]);
+          .hasOnly(["username", "displayName", "photoURL", "updatedAt"])
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["username"])
+          || willOwnUsername(request.resource.data.username)
+        );
     }
 
     function isTokenSpend(uid) {
@@ -55,6 +97,7 @@ service cloud.firestore {
 
     function isValidSlotPurchase(drawId) {
       return signedIn()
+        && ownsUsername(userDoc(request.auth.uid).data.username)
         && drawDoc(drawId).data.status == "live"
         && resource.data.status == "available"
         && request.resource.data.status == "locked"
@@ -86,6 +129,7 @@ service cloud.firestore {
 
     function isValidRoomMessage(drawId) {
       return signedIn()
+        && ownsUsername(userDoc(request.auth.uid).data.username)
         && request.resource.data.keys().hasOnly([
           "drawId",
           "source",
@@ -113,11 +157,34 @@ service cloud.firestore {
       allow update: if isProfileEdit(uid) || isTokenSpend(uid) || isAdminUserEdit();
     }
 
-    match /usernames/{username} {
+    match /usernames/{usernameId} {
       allow read: if signedIn();
+
+      // Claim is only valid if profile username (after this transaction) matches.
+      // Renames that already own a name must release it in the same transaction.
       allow create: if signedIn()
-        && request.resource.data.uid == request.auth.uid;
-      allow update, delete: if false;
+        && request.resource.data.uid == request.auth.uid
+        && isValidUsername(request.resource.data.username)
+        && usernameId == request.resource.data.username.lower()
+        && isValidUsername(afterUserDoc(request.auth.uid).data.username)
+        && afterUserDoc(request.auth.uid).data.username.lower() == usernameId
+        && (
+          hasNoUsername()
+          || currentUsername().lower() == usernameId
+          || isReleasingCurrentUsername()
+          || !ownsUsername(currentUsername())
+        );
+
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["username"])
+        && isValidUsername(request.resource.data.username)
+        && usernameId == request.resource.data.username.lower();
+
+      allow delete: if signedIn()
+        && resource.data.uid == request.auth.uid;
     }
 
     match /tokenRequests/{requestId} {

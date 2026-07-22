@@ -5,7 +5,7 @@ Firebase-backed React website for live card draws.
 ## Features
 
 - Google login through Firebase Authentication.
-- First-login username registration.
+- First-login username setup, changeable anytime from the account panel.
 - Token applications with bank proof image upload to Firebase Storage.
 - Admin review queue for approving or rejecting token requests.
 - Live Kick stream embed per draw.
@@ -69,11 +69,12 @@ After that, admin users can approve token requests, create rooms, and complete/d
 
 ## Data model
 
-- `users/{uid}`: profile, username, token balance, role.
-- `usernames/{username}`: username reservation.
+- `users/{uid}`: profile, display username, token balance, role. Auth `uid` is the only identity.
+- `usernames/{lowercaseUsername}`: unique username reservation owned by one uid. Changing username claims the new key and deletes the old reservation in one transaction.
+- Username is 3–24 characters, unique case-insensitively. Slots, chat, and draw records store a username snapshot at write time.
 - `tokenRequests/{id}`: requested token amount, proof image URL, review status.
 - `draws/{id}`: room title, slug, room link, thumbnail, Kick URL, card count, token price, pool info, status.
-- `draws/{id}/slots/{number}`: card slot availability and buyer info.
+- `draws/{id}/slots/{number}`: card slot availability and buyer info (`uid` + username snapshot).
 - `draws/{id}/messages/{messageId}`: room chat messages from signed-in users.
 - `cards/{id}`: admin-created card name and compressed image.
 - `drawRecords/{id}`: purchase record plus admin-assigned card result and collection status.

@@ -312,6 +312,18 @@ a {
   text-overflow: ellipsis;
 }
 
+.username-edit-form {
+  margin: 16px 0;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.username-edit-hint {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
 .stats-grid {
   display: grid;
   grid-template-columns: 1fr;
