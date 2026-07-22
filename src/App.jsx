@@ -84,6 +84,7 @@ function normalizeUsername(value) {
   return String(value || "")
     .trim()
     .replace(/\s+/g, "_")
+    .replace(/[^A-Za-z0-9_]/g, "")
     .slice(0, 24);
 }
 
@@ -97,7 +98,9 @@ async function saveProfileUsername(uid, rawUsername, currentUsername = "") {
   const oldKey = usernameKey(currentUsername);
 
   if (cleanUsername.length < 3) {
-    throw new Error("Username must be at least 3 characters.");
+    throw new Error(
+      "Username must be 3–24 characters using letters, numbers, or underscore.",
+    );
   }
 
   await runTransaction(db, async (transaction) => {
@@ -230,9 +233,9 @@ function App() {
 
       await setDoc(profileRef, {
         uid: authUser.uid,
-        email: authUser.email,
-        displayName: authUser.displayName || "",
-        photoURL: authUser.photoURL || "",
+        email: authUser.email || "",
+        displayName: (authUser.displayName || "").slice(0, 80),
+        photoURL: (authUser.photoURL || "").slice(0, 500),
         username: "",
         tokens: 0,
         role: "user",
@@ -493,6 +496,8 @@ function UsernameGate({ authUser, profile, conflict = false }) {
             onChange={(event) => setUsername(event.target.value)}
             placeholder="e.g. nick_draws"
             maxLength={24}
+            pattern="[A-Za-z0-9_]{3,24}"
+            title="Letters, numbers, and underscore only"
             required
           />
         </label>
@@ -558,6 +563,8 @@ function AccountPanel({ authUser, profile, isAdmin }) {
             }}
             placeholder="e.g. nick_draws"
             maxLength={24}
+            pattern="[A-Za-z0-9_]{3,24}"
+            title="Letters, numbers, and underscore only"
             required
           />
         </label>
@@ -1438,7 +1445,8 @@ function AdminPanel({ profile }) {
           reviewedBy: profile.uid,
         });
         transaction.update(userRef, {
-          tokens: increment(Number(request.amount || 0)),
+          tokens: increment(Number(requestSnap.data().amount || 0)),
+          lastTokenGrantRequestId: request.id,
           updatedAt: serverTimestamp(),
         });
       });
