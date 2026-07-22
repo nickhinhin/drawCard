@@ -1,0 +1,166 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function afterUserDoc(uid) {
+      return getAfter(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function drawDoc(drawId) {
+      return get(/databases/$(database)/documents/draws/$(drawId));
+    }
+
+    function afterSlotDoc(drawId, slotId) {
+      return getAfter(/databases/$(database)/documents/draws/$(drawId)/slots/$(slotId));
+    }
+
+    function isAdmin() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        userDoc(request.auth.uid).data.role == "admin";
+    }
+
+    function isProfileEdit(uid) {
+      return isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["username", "displayName", "photoURL", "updatedAt"]);
+    }
+
+    function isTokenSpend(uid) {
+      return isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["tokens", "updatedAt"])
+        && request.resource.data.tokens is number
+        && request.resource.data.tokens >= 0
+        && request.resource.data.tokens <= resource.data.tokens;
+    }
+
+    function isAdminUserEdit() {
+      return isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["tokens", "updatedAt"]);
+    }
+
+    function isValidSlotPurchase(drawId) {
+      return signedIn()
+        && drawDoc(drawId).data.status == "live"
+        && resource.data.status == "available"
+        && request.resource.data.status == "locked"
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == userDoc(request.auth.uid).data.username
+        && request.resource.data.number == resource.data.number
+        && request.resource.data.tokenCost == drawDoc(drawId).data.tokenCost
+        && userDoc(request.auth.uid).data.tokens >= drawDoc(drawId).data.tokenCost
+        && afterUserDoc(request.auth.uid).data.tokens ==
+          userDoc(request.auth.uid).data.tokens - drawDoc(drawId).data.tokenCost;
+    }
+
+    function isMatchingDrawRecord() {
+      return signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && afterSlotDoc(
+          request.resource.data.drawId,
+          request.resource.data.number
+        ).data.uid == request.auth.uid
+        && afterSlotDoc(
+          request.resource.data.drawId,
+          request.resource.data.number
+        ).data.username == request.resource.data.username
+        && afterSlotDoc(
+          request.resource.data.drawId,
+          request.resource.data.number
+        ).data.tokenCost == request.resource.data.tokenCost;
+    }
+
+    function isValidRoomMessage(drawId) {
+      return signedIn()
+        && request.resource.data.keys().hasOnly([
+          "drawId",
+          "source",
+          "uid",
+          "username",
+          "text",
+          "createdAt"
+        ])
+        && request.resource.data.drawId == drawId
+        && request.resource.data.source == "draw"
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == userDoc(request.auth.uid).data.username
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 500
+        && request.resource.data.createdAt == request.time;
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.tokens == 0
+        && request.resource.data.role == "user";
+      allow update: if isProfileEdit(uid) || isTokenSpend(uid) || isAdminUserEdit();
+    }
+
+    match /usernames/{username} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /tokenRequests/{requestId} {
+      allow read: if isAdmin() || isOwner(resource.data.uid);
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == "pending";
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /draws/{drawId} {
+      allow read: if signedIn();
+      allow create, update: if isAdmin();
+      allow delete: if isAdmin();
+
+      match /slots/{slotId} {
+        allow read: if signedIn();
+        allow create: if isAdmin();
+        allow update: if isAdmin() || isValidSlotPurchase(drawId);
+        allow delete: if isAdmin();
+      }
+
+      match /messages/{messageId} {
+        allow read: if signedIn();
+        allow create: if isValidRoomMessage(drawId)
+          && request.resource.data.source == "draw";
+        allow update: if false;
+        allow delete: if isAdmin();
+      }
+    }
+
+    match /cards/{cardId} {
+      allow read: if signedIn();
+      allow create, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /drawRecords/{recordId} {
+      allow read: if isAdmin() || isOwner(resource.data.uid);
+      allow create: if isMatchingDrawRecord();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+  }
+}
