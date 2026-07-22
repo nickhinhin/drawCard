@@ -100,6 +100,21 @@ service cloud.firestore {
         && request.resource.data.tokens >= 0;
     }
 
+    // 3s global chat cooldown, enforced via users/{uid}.lastChatAt in the same write.
+    function chatCooldownPassed() {
+      return !("lastChatAt" in userDoc(request.auth.uid).data)
+        || !(userDoc(request.auth.uid).data.lastChatAt is timestamp)
+        || request.time >= userDoc(request.auth.uid).data.lastChatAt + duration.value(3, "s");
+    }
+
+    function isChatRateLimitUpdate(uid) {
+      return isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["lastChatAt", "updatedAt"])
+        && request.resource.data.lastChatAt == request.time
+        && chatCooldownPassed();
+    }
+
     function isValidSlotPurchase(drawId) {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
@@ -166,6 +181,8 @@ service cloud.firestore {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
         && isLiveDraw(drawId)
+        && chatCooldownPassed()
+        && afterUserDoc(request.auth.uid).data.lastChatAt == request.time
         && request.resource.data.keys().hasOnly([
           "drawId",
           "source",
@@ -182,6 +199,25 @@ service cloud.firestore {
         && request.resource.data.text.size() > 0
         && request.resource.data.text.size() <= 500
         && request.resource.data.createdAt == request.time;
+    }
+
+    // Only Firebase Storage HTTPS download URLs for this user's proof path.
+    function isSafeStorageProofUrl(url, uid) {
+      return url is string
+        && url.size() > 0
+        && url.size() <= 4000
+        && (
+          url.matches(
+            "https://firebasestorage\\.googleapis\\.com/v0/b/[^/]+/o/token-proofs%2F"
+              + uid
+              + "%2F[^\\s?#]+(\\?[^\\s]*)?"
+          )
+          || url.matches(
+            "https://[a-z0-9.-]+\\.firebasestorage\\.app/v0/b/[^/]+/o/token-proofs%2F"
+              + uid
+              + "%2F[^\\s?#]+(\\?[^\\s]*)?"
+          )
+        );
     }
 
     function isValidTokenRequestCreate() {
@@ -216,9 +252,10 @@ service cloud.firestore {
         && request.resource.data.proofFileName is string
         && request.resource.data.proofFileName.size() > 0
         && request.resource.data.proofFileName.size() <= 200
-        && request.resource.data.proofUrl is string
-        && request.resource.data.proofUrl.size() > 0
-        && request.resource.data.proofUrl.size() <= 4000
+        && isSafeStorageProofUrl(
+          request.resource.data.proofUrl,
+          request.auth.uid
+        )
         && request.resource.data.createdAt == request.time;
     }
 
@@ -239,7 +276,10 @@ service cloud.firestore {
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.tokens == 0
         && request.resource.data.role == "user";
-      allow update: if isProfileEdit(uid) || isTokenSpend(uid) || isAdminUserEdit();
+      allow update: if isProfileEdit(uid)
+        || isTokenSpend(uid)
+        || isAdminUserEdit()
+        || isChatRateLimitUpdate(uid);
     }
 
     match /usernames/{usernameId} {

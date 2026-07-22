@@ -78,6 +78,7 @@ const statusLabels = {
 };
 
 const collectionStatuses = ["pending", "shipping", "shipped"];
+const CHAT_COOLDOWN_MS = 3000;
 
 function normalizeUsername(value) {
   return String(value || "")
@@ -916,6 +917,7 @@ function ChatRoom({ drawId, profile }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  const [cooldownMs, setCooldownMs] = useState(0);
 
   useEffect(() => {
     const messagesQuery = query(
@@ -929,20 +931,63 @@ function ChatRoom({ drawId, profile }) {
     return stopMessages;
   }, [drawId]);
 
+  useEffect(() => {
+    const lastChatAt = profile?.lastChatAt;
+    if (!lastChatAt?.toMillis) {
+      setCooldownMs(0);
+      return undefined;
+    }
+
+    function tick() {
+      const remaining = Math.max(
+        0,
+        CHAT_COOLDOWN_MS - (Date.now() - lastChatAt.toMillis()),
+      );
+      setCooldownMs(remaining);
+    }
+
+    tick();
+    if (CHAT_COOLDOWN_MS - (Date.now() - lastChatAt.toMillis()) <= 0) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(tick, 250);
+    return () => window.clearInterval(timer);
+  }, [profile?.lastChatAt]);
+
   async function sendMessage(event) {
     event.preventDefault();
     const cleanText = text.trim();
-    if (!cleanText) return;
+    if (!cleanText || sending || cooldownMs > 0) return;
 
     setSending(true);
     try {
-      await addDoc(collection(db, "draws", drawId, "messages"), {
-        drawId,
-        source: "draw",
-        uid: profile.uid,
-        username: profile.username,
-        text: cleanText.slice(0, 500),
-        createdAt: serverTimestamp(),
+      await runTransaction(db, async (transaction) => {
+        const userRef = doc(db, "users", profile.uid);
+        const messageRef = doc(collection(db, "draws", drawId, "messages"));
+        const userSnap = await transaction.get(userRef);
+        const lastChatAt = userSnap.data()?.lastChatAt;
+
+        if (lastChatAt?.toMillis) {
+          const elapsed = Date.now() - lastChatAt.toMillis();
+          if (elapsed < CHAT_COOLDOWN_MS) {
+            const waitSec = Math.ceil((CHAT_COOLDOWN_MS - elapsed) / 1000);
+            throw new Error(`Please wait ${waitSec}s before sending another message.`);
+          }
+        }
+
+        transaction.update(userRef, {
+          lastChatAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        transaction.set(messageRef, {
+          drawId,
+          source: "draw",
+          uid: profile.uid,
+          username: profile.username,
+          text: cleanText.slice(0, 500),
+          createdAt: serverTimestamp(),
+        });
       });
       setText("");
     } catch (error) {
@@ -951,6 +996,9 @@ function ChatRoom({ drawId, profile }) {
       setSending(false);
     }
   }
+
+  const cooldownSec = Math.ceil(cooldownMs / 1000);
+  const sendDisabled = sending || cooldownMs > 0 || !text.trim();
 
   return (
     <section className="panel chat-panel">
@@ -985,10 +1033,11 @@ function ChatRoom({ drawId, profile }) {
           maxLength={500}
           onChange={(event) => setText(event.target.value)}
           placeholder="Type a room message"
+          disabled={sending}
         />
-        <button className="primary-btn" type="submit" disabled={sending || !text.trim()}>
+        <button className="primary-btn" type="submit" disabled={sendDisabled}>
           <Send size={18} />
-          {sending ? "Sending..." : "Send"}
+          {sending ? "Sending..." : cooldownMs > 0 ? `Wait ${cooldownSec}s` : "Send"}
         </button>
       </form>
     </section>
@@ -1140,9 +1189,40 @@ async function createProofInfo({ proof, profile }) {
   };
 }
 
+async function openTokenProof(request) {
+  const expectedPrefix = `token-proofs/${request.uid}/`;
+  if (
+    request.proofMode !== "storage"
+    || typeof request.proofPath !== "string"
+    || !request.proofPath.startsWith(expectedPrefix)
+    || request.proofPath.includes("..")
+  ) {
+    throw new Error("This request has no valid storage proof.");
+  }
+
+  const url = await getDownloadURL(ref(storage, request.proofPath));
+  const opened = window.open(url, "_blank", "noopener,noreferrer");
+  if (!opened) {
+    throw new Error("Popup blocked. Allow popups to view the proof.");
+  }
+}
+
 function RequestList({ requests, adminMode = false, onApprove, onReject }) {
+  const [openingId, setOpeningId] = useState("");
+
   if (!requests.length) {
     return <p className="muted">No requests yet.</p>;
+  }
+
+  async function handleOpenProof(request) {
+    setOpeningId(request.id);
+    try {
+      await openTokenProof(request);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setOpeningId("");
+    }
   }
 
   return (
@@ -1160,11 +1240,16 @@ function RequestList({ requests, adminMode = false, onApprove, onReject }) {
             </span>
           </div>
           <div className="record-actions">
-            {request.proofUrl && (
-              <a href={request.proofUrl} target="_blank" rel="noreferrer">
-                {request.proofMode === "dummy" ? "Dummy proof" : "Proof"}{" "}
+            {request.proofPath && (
+              <button
+                className="small-btn"
+                type="button"
+                disabled={openingId === request.id}
+                onClick={() => handleOpenProof(request)}
+              >
                 <ExternalLink size={15} />
-              </a>
+                {openingId === request.id ? "Opening..." : "Proof"}
+              </button>
             )}
             {adminMode && request.status === "pending" && (
               <>
