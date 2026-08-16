@@ -22,8 +22,10 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/draws/$(drawId));
     }
 
-    function afterSlotDoc(drawId, slotId) {
-      return getAfter(/databases/$(database)/documents/draws/$(drawId)/slots/$(slotId));
+    function afterRoundSlotDoc(drawId, roundId, slotId) {
+      return getAfter(
+        /databases/$(database)/documents/draws/$(drawId)/rounds/$(roundId)/slots/$(slotId)
+      );
     }
 
     function tokenRequestPath(requestId) {
@@ -40,11 +42,6 @@ service cloud.firestore {
         userDoc(request.auth.uid).data.role == "admin";
     }
 
-    function isLiveDraw(drawId) {
-      return drawDoc(drawId).data.status == "live";
-    }
-
-    // ASCII usernames only — reduces lookalike / homoglyph spoofing.
     function isValidUsername(name) {
       return name is string
         && name.size() >= 3
@@ -89,17 +86,13 @@ service cloud.firestore {
         )
         && (
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(["displayName"])
-          || (
-            request.resource.data.displayName is string
-            && request.resource.data.displayName.size() <= 80
-          )
+          || (request.resource.data.displayName is string
+            && request.resource.data.displayName.size() <= 80)
         )
         && (
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(["photoURL"])
-          || (
-            request.resource.data.photoURL is string
-            && request.resource.data.photoURL.size() <= 500
-          )
+          || (request.resource.data.photoURL is string
+            && request.resource.data.photoURL.size() <= 500)
         );
     }
 
@@ -112,7 +105,6 @@ service cloud.firestore {
         && request.resource.data.tokens <= resource.data.tokens;
     }
 
-    // Admin may mint tokens only by approving a pending tokenRequest in the same tx.
     function isAdminTokenGrant(uid) {
       return isAdmin()
         && request.resource.data.diff(resource.data).affectedKeys()
@@ -121,23 +113,18 @@ service cloud.firestore {
         && request.resource.data.lastTokenGrantRequestId.size() > 0
         && request.resource.data.lastTokenGrantRequestId.size() <= 128
         && exists(tokenRequestPath(request.resource.data.lastTokenGrantRequestId))
-        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.status
-          == "pending"
+        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.status == "pending"
         && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.uid == uid
         && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount is int
         && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount > 0
-        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount <= 10000
+        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount <= 1000000
         && existsAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId))
-        && getAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.status
-          == "approved"
-        && getAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.reviewedBy
-          == request.auth.uid
-        && request.resource.data.tokens
-          == resource.data.tokens
-            + get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount;
+        && getAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.status == "approved"
+        && getAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.reviewedBy == request.auth.uid
+        && request.resource.data.tokens == resource.data.tokens
+          + get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount;
     }
 
-    // 3s global chat cooldown, enforced via users/{uid}.lastChatAt in the same write.
     function chatCooldownPassed() {
       return !("lastChatAt" in userDoc(request.auth.uid).data)
         || !(userDoc(request.auth.uid).data.lastChatAt is timestamp)
@@ -152,130 +139,141 @@ service cloud.firestore {
         && chatCooldownPassed();
     }
 
+    function isCardConversionUserEdit(uid) {
+      return isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            "tokens",
+            "updatedAt",
+            "lastConversionRecordId",
+            "lastConversionAmount"
+          ])
+        && request.resource.data.lastConversionRecordId is string
+        && request.resource.data.lastConversionAmount is number
+        && request.resource.data.lastConversionAmount > 0
+        && getAfter(
+          /databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)
+        ).data.uid == uid
+        && getAfter(
+          /databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)
+        ).data.convertedToTokens == true
+        && getAfter(
+          /databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)
+        ).data.tokenRefund == request.resource.data.lastConversionAmount
+        && request.resource.data.lastConversionAmount <= cardConversionAmountForRecord(
+          getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)).data
+        ) * 0.8
+        && request.resource.data.lastConversionAmount > cardConversionAmountForRecord(
+          getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)).data
+        ) * 0.8 - 1
+        && request.resource.data.tokens == resource.data.tokens + request.resource.data.lastConversionAmount;
+    }
+
     function isValidSlotPurchase(drawId) {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
-        && isLiveDraw(drawId)
+        && drawDoc(drawId).data.status == "live"
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            "status",
+            "uid",
+            "username",
+            "tokenCost",
+            "targetCardId",
+            "targetCardName",
+            "targetCardImageUrl",
+            "targetCardValue",
+            "round",
+            "updatedAt"
+          ])
         && resource.data.status == "available"
         && request.resource.data.status == "locked"
-        && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["status", "uid", "username", "tokenCost", "updatedAt"])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == userDoc(request.auth.uid).data.username
         && request.resource.data.number == resource.data.number
-        && request.resource.data.tokenCost == drawDoc(drawId).data.tokenCost
-        && userDoc(request.auth.uid).data.tokens >= drawDoc(drawId).data.tokenCost
+        && request.resource.data.round == resource.data.round
+        && request.resource.data.round == drawDoc(drawId).data.round
+        && request.resource.data.targetCardId in drawDoc(drawId).data.poolCardIds
+        && request.resource.data.targetCardName is string
+        && request.resource.data.targetCardImageUrl is string
+        && request.resource.data.targetCardValue == request.resource.data.tokenCost
+        && request.resource.data.tokenCost == drawDoc(drawId).data.poolCardValues[request.resource.data.targetCardId]
+        && userDoc(request.auth.uid).data.tokens >= request.resource.data.tokenCost
         && afterUserDoc(request.auth.uid).data.tokens ==
-          userDoc(request.auth.uid).data.tokens - drawDoc(drawId).data.tokenCost;
+          userDoc(request.auth.uid).data.tokens - request.resource.data.tokenCost;
     }
 
-    function isValidDrawRecordCreate(recordId) {
+    function isMatchingRoundDrawRecord() {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
-        && request.resource.data.keys().hasOnly([
-          "uid",
-          "username",
-          "drawId",
-          "drawTitle",
-          "roomSlug",
-          "roomLink",
-          "round",
-          "number",
-          "tokenCost",
-          "createdAt"
-        ])
         && request.resource.data.uid == request.auth.uid
-        && request.resource.data.username == userDoc(request.auth.uid).data.username
-        && request.resource.data.drawId is string
-        && request.resource.data.drawId.size() > 0
-        && request.resource.data.drawId.size() <= 128
-        && request.resource.data.drawTitle is string
-        && request.resource.data.drawTitle.size() > 0
-        && request.resource.data.drawTitle.size() <= 120
-        && request.resource.data.roomSlug is string
-        && request.resource.data.roomSlug.size() > 0
-        && request.resource.data.roomSlug.size() <= 80
-        && request.resource.data.roomLink is string
-        && request.resource.data.roomLink.size() > 0
-        && request.resource.data.roomLink.size() <= 500
         && request.resource.data.round is string
-        && request.resource.data.round.size() > 0
-        && request.resource.data.round.size() <= 40
-        && request.resource.data.number is int
-        && request.resource.data.number > 0
-        && request.resource.data.number <= 100
-        && recordId == request.resource.data.drawId + "_" + string(request.resource.data.number)
-        && isLiveDraw(request.resource.data.drawId)
-        && request.resource.data.tokenCost == drawDoc(request.resource.data.drawId).data.tokenCost
-        && request.resource.data.drawTitle == drawDoc(request.resource.data.drawId).data.title
-        && request.resource.data.createdAt == request.time
-        && afterSlotDoc(
+        && afterRoundSlotDoc(
           request.resource.data.drawId,
-          string(request.resource.data.number)
+          request.resource.data.round,
+          request.resource.data.number
         ).data.uid == request.auth.uid
-        && afterSlotDoc(
+        && afterRoundSlotDoc(
           request.resource.data.drawId,
-          string(request.resource.data.number)
+          request.resource.data.round,
+          request.resource.data.number
         ).data.username == request.resource.data.username
-        && afterSlotDoc(
+        && afterRoundSlotDoc(
           request.resource.data.drawId,
-          string(request.resource.data.number)
+          request.resource.data.round,
+          request.resource.data.number
         ).data.tokenCost == request.resource.data.tokenCost
-        && afterSlotDoc(
+        && afterRoundSlotDoc(
           request.resource.data.drawId,
-          string(request.resource.data.number)
-        ).data.status == "locked";
+          request.resource.data.round,
+          request.resource.data.number
+        ).data.targetCardId == request.resource.data.targetCardId
+        && afterRoundSlotDoc(
+          request.resource.data.drawId,
+          request.resource.data.round,
+          request.resource.data.number
+        ).data.targetCardValue == request.resource.data.targetCardValue;
     }
 
-    function isValidDrawRecordAdminUpdate() {
-      return isAdmin()
+    function cardConversionAmount() {
+      return resource.data.cardValue is number
+        ? resource.data.cardValue
+        : resource.data.tokenCost;
+    }
+
+    function cardConversionAmountForRecord(recordData) {
+      return recordData.cardValue is number
+        ? recordData.cardValue
+        : recordData.tokenCost;
+    }
+
+    function isCardTokenConversion() {
+      return signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.cardId is string
+        && cardConversionAmount() is number
+        && cardConversionAmount() > 0
+        && resource.data.convertedToTokens != true
         && request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly([
-            "cardId",
-            "cardName",
-            "cardImageUrl",
             "collectionStatus",
-            "assignedAt",
-            "assignedBy",
+            "convertedToTokens",
+            "convertedAt",
+            "tokenRefund",
             "updatedAt"
           ])
-        && (
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["cardId"])
-          || (
-            request.resource.data.cardId is string
-            && request.resource.data.cardId.size() > 0
-            && request.resource.data.cardId.size() <= 128
-          )
-        )
-        && (
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["cardName"])
-          || (
-            request.resource.data.cardName is string
-            && request.resource.data.cardName.size() > 0
-            && request.resource.data.cardName.size() <= 80
-          )
-        )
-        && (
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["cardImageUrl"])
-          || (
-            request.resource.data.cardImageUrl is string
-            && request.resource.data.cardImageUrl.size() <= 900000
-          )
-        )
-        && (
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["collectionStatus"])
-          || request.resource.data.collectionStatus in ["pending", "shipping", "shipped"]
-        )
-        && (
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["assignedBy"])
-          || request.resource.data.assignedBy == request.auth.uid
-        );
+        && request.resource.data.collectionStatus == "converted"
+        && request.resource.data.convertedToTokens == true
+        && request.resource.data.tokenRefund <= cardConversionAmount() * 0.8
+        && request.resource.data.tokenRefund > cardConversionAmount() * 0.8 - 1
+        && request.resource.data.convertedAt == request.time
+        && request.resource.data.updatedAt == request.time;
     }
 
     function isValidRoomMessage(drawId) {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
-        && isLiveDraw(drawId)
+        && drawDoc(drawId).data.status == "live"
         && chatCooldownPassed()
         && afterUserDoc(request.auth.uid).data.lastChatAt == request.time
         && request.resource.data.keys().hasOnly([
@@ -301,55 +299,29 @@ service cloud.firestore {
         && url.size() > 0
         && url.size() <= 4000
         && (
-          url.matches(
-            "https://firebasestorage\\.googleapis\\.com/v0/b/[^/]+/o/token-proofs%2F"
-              + uid
-              + "%2F[^\\s?#]+(\\?[^\\s]*)?"
-          )
-          || url.matches(
-            "https://[a-z0-9.-]+\\.firebasestorage\\.app/v0/b/[^/]+/o/token-proofs%2F"
-              + uid
-              + "%2F[^\\s?#]+(\\?[^\\s]*)?"
-          )
+          url.matches("https://firebasestorage\\.googleapis\\.com/v0/b/[^/]+/o/token-proofs%2F" + uid + "%2F[^\\s?#]+(\\?[^\\s]*)?")
+          || url.matches("https://[a-z0-9.-]+\\.firebasestorage\\.app/v0/b/[^/]+/o/token-proofs%2F" + uid + "%2F[^\\s?#]+(\\?[^\\s]*)?")
         );
     }
 
     function isValidTokenRequestCreate() {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
-        && request.resource.data.keys().hasOnly([
-          "uid",
-          "username",
-          "email",
-          "amount",
-          "proofMode",
-          "proofPath",
-          "proofFileName",
-          "proofUrl",
-          "status",
-          "adminNote",
-          "createdAt"
-        ])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == userDoc(request.auth.uid).data.username
         && request.resource.data.email == userDoc(request.auth.uid).data.email
         && request.resource.data.amount is int
         && request.resource.data.amount > 0
-        && request.resource.data.amount <= 10000
+        && request.resource.data.amount <= 1000000
         && request.resource.data.status == "pending"
         && request.resource.data.adminNote == ""
         && request.resource.data.proofMode == "storage"
         && request.resource.data.proofPath is string
-        && request.resource.data.proofPath.matches(
-          "token-proofs/" + request.auth.uid + "/[^/]+"
-        )
+        && request.resource.data.proofPath.matches("token-proofs/" + request.auth.uid + "/[^/]+")
         && request.resource.data.proofFileName is string
         && request.resource.data.proofFileName.size() > 0
         && request.resource.data.proofFileName.size() <= 200
-        && isSafeStorageProofUrl(
-          request.resource.data.proofUrl,
-          request.auth.uid
-        )
+        && isSafeStorageProofUrl(request.resource.data.proofUrl, request.auth.uid)
         && request.resource.data.createdAt == request.time;
     }
 
@@ -368,15 +340,8 @@ service cloud.firestore {
       allow read: if isOwner(uid) || isAdmin();
       allow create: if isOwner(uid)
         && request.resource.data.keys().hasOnly([
-          "uid",
-          "email",
-          "displayName",
-          "photoURL",
-          "username",
-          "tokens",
-          "role",
-          "createdAt",
-          "updatedAt"
+          "uid", "email", "displayName", "photoURL", "username", "tokens",
+          "role", "createdAt", "updatedAt"
         ])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.email == request.auth.token.email
@@ -387,15 +352,15 @@ service cloud.firestore {
         && request.resource.data.displayName.size() <= 80
         && request.resource.data.photoURL is string
         && request.resource.data.photoURL.size() <= 500;
-      allow update: if isProfileEdit(uid)
-        || isTokenSpend(uid)
-        || isAdminTokenGrant(uid)
-        || isChatRateLimitUpdate(uid);
+      allow update: if isProfileEdit(uid) ||
+        isTokenSpend(uid) ||
+        isCardConversionUserEdit(uid) ||
+        isAdminTokenGrant(uid) ||
+        isChatRateLimitUpdate(uid);
     }
 
     match /usernames/{usernameId} {
       allow read: if signedIn();
-
       allow create: if signedIn()
         && request.resource.data.uid == request.auth.uid
         && isValidUsername(request.resource.data.username)
@@ -408,17 +373,13 @@ service cloud.firestore {
           || isReleasingCurrentUsername()
           || !ownsUsername(currentUsername())
         );
-
       allow update: if signedIn()
         && resource.data.uid == request.auth.uid
         && request.resource.data.uid == resource.data.uid
-        && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["username"])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["username"])
         && isValidUsername(request.resource.data.username)
         && usernameId == request.resource.data.username.lower();
-
-      allow delete: if signedIn()
-        && resource.data.uid == request.auth.uid;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
     }
 
     match /tokenRequests/{requestId} {
@@ -429,35 +390,54 @@ service cloud.firestore {
     }
 
     match /draws/{drawId} {
-      allow read: if isAdmin() || (signedIn() && resource.data.status == "live");
+      allow read: if true;
       allow create, update: if isAdmin();
       allow delete: if isAdmin();
 
       match /slots/{slotId} {
-        allow read: if isAdmin() || (signedIn() && isLiveDraw(drawId));
+        allow read: if true;
         allow create: if isAdmin();
         allow update: if isAdmin() || isValidSlotPurchase(drawId);
         allow delete: if isAdmin();
       }
 
+      match /rounds/{roundId} {
+        allow read: if true;
+        allow create, update, delete: if isAdmin();
+
+        match /slots/{slotId} {
+          allow read: if true;
+          allow create: if isAdmin();
+          allow update: if isAdmin() || isValidSlotPurchase(drawId);
+          allow delete: if isAdmin();
+        }
+      }
+
       match /messages/{messageId} {
-        allow read: if isAdmin() || (signedIn() && isLiveDraw(drawId));
-        allow create: if isValidRoomMessage(drawId);
+        allow read: if signedIn();
+        allow create: if isValidRoomMessage(drawId)
+          && request.resource.data.source == "draw";
         allow update: if false;
         allow delete: if isAdmin();
       }
     }
 
     match /cards/{cardId} {
-      allow read: if isAdmin();
+      allow read: if signedIn();
+      allow create, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /settings/{settingId} {
+      allow read: if signedIn();
       allow create, update: if isAdmin();
       allow delete: if false;
     }
 
     match /drawRecords/{recordId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
-      allow create: if isValidDrawRecordCreate(recordId);
-      allow update: if isValidDrawRecordAdminUpdate();
+      allow create: if isMatchingRoundDrawRecord();
+      allow update: if isAdmin() || isCardTokenConversion();
       allow delete: if false;
     }
   }
