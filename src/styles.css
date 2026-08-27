@@ -199,6 +199,11 @@ a {
   padding: 0 22px;
 }
 
+.ghost-btn.large {
+  min-height: 52px;
+  padding: 0 22px;
+}
+
 .ghost-btn,
 .small-btn {
   min-height: 36px;
@@ -310,6 +315,91 @@ a {
   color: var(--muted);
   font-size: 1.08rem;
   line-height: 1.7;
+}
+
+.welcome-auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.auth-dialog-backdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  padding: 20px;
+  place-items: center;
+  background: rgba(9, 9, 11, 0.72);
+}
+
+.auth-dialog {
+  position: relative;
+  width: min(100%, 460px);
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  padding: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #ffffff;
+  box-shadow: var(--shadow-raised);
+}
+
+.auth-dialog h2 {
+  margin: 2px 42px 8px 0;
+  color: var(--zinc-900);
+  font-size: 1.8rem;
+}
+
+.auth-dialog > .muted {
+  margin: 0 0 20px;
+  line-height: 1.6;
+}
+
+.auth-dialog-close {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  border: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.auth-google-btn {
+  width: 100%;
+  min-height: 48px;
+}
+
+.auth-divider,
+.form-or-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 800;
+}
+
+.auth-divider {
+  margin: 20px 0;
+}
+
+.form-or-divider {
+  margin: 2px 0;
+}
+
+.auth-divider::before,
+.auth-divider::after,
+.form-or-divider::before,
+.form-or-divider::after {
+  height: 1px;
+  background: var(--line);
+  content: "";
+  flex: 1;
+}
+
+.auth-dialog .form-note {
+  display: block;
+  margin-top: 16px;
 }
 
 .welcome-visual {
@@ -3200,6 +3290,29 @@ textarea:focus {
 
   .auth-actions {
     gap: 6px;
+  }
+
+  .auth-actions > .primary-btn {
+    min-height: 38px;
+    padding: 0 10px;
+    font-size: 0.82rem;
+  }
+
+  .welcome-auth-actions {
+    display: grid;
+  }
+
+  .welcome-auth-actions > button {
+    width: 100%;
+  }
+
+  .auth-dialog-backdrop {
+    padding: 10px;
+  }
+
+  .auth-dialog {
+    max-height: calc(100vh - 20px);
+    padding: 24px 18px;
   }
 
   .auth-actions .ghost-btn {

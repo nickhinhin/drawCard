@@ -393,7 +393,10 @@ service cloud.firestore {
           "role", "createdAt", "updatedAt"
         ])
         && request.resource.data.uid == request.auth.uid
-        && request.resource.data.email == request.auth.token.email
+        && (
+          (("email" in request.auth.token) && request.resource.data.email == request.auth.token.email)
+          || (!("email" in request.auth.token) && request.resource.data.email == "")
+        )
         && request.resource.data.tokens == 0
         && request.resource.data.role == "user"
         && request.resource.data.username == ""

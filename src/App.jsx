@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   BadgeDollarSign,
   Boxes,
@@ -25,6 +25,7 @@ import {
   Save,
   Search,
   Shield,
+  Smartphone,
   Send,
   Ticket,
   Upload,
@@ -32,9 +33,11 @@ import {
   X,
 } from "lucide-react";
 import {
+  RecaptchaVerifier,
   getRedirectResult,
   onAuthStateChanged,
   signInWithPopup,
+  signInWithPhoneNumber,
   signInWithRedirect,
   signOut,
 } from "firebase/auth";
@@ -45,6 +48,7 @@ import {
   doc,
   getDocs,
   increment,
+  limitToLast,
   onSnapshot,
   orderBy,
   query,
@@ -154,30 +158,44 @@ async function saveProfileUsername(uid, rawUsername, currentUsername = "") {
 async function ensureUsernameClaim(uid, username) {
   const cleanUsername = normalizeUsername(username);
   const key = usernameKey(cleanUsername);
-  if (cleanUsername.length < 3) return;
+  if (cleanUsername.length < 3) {
+    throw new Error("請先設定 3–24 個英文字母、數字或底線的玩家名稱。");
+  }
 
   await runTransaction(db, async (transaction) => {
     const profileRef = doc(db, "users", uid);
     const claimRef = doc(db, "usernames", key);
+    const profileSnap = await transaction.get(profileRef);
     const claimSnap = await transaction.get(claimRef);
+
+    if (!profileSnap.exists()) {
+      throw new Error("找不到玩家資料，請重新登入後再試。");
+    }
 
     if (claimSnap.exists()) {
       if (claimSnap.data()?.uid !== uid) {
         throw new Error("這個玩家名稱已被使用，請選擇另一個名稱。");
       }
-      return;
+      if (claimSnap.data()?.username !== cleanUsername) {
+        transaction.update(claimRef, { username: cleanUsername });
+      }
+    } else {
+      transaction.set(claimRef, {
+        uid,
+        username: cleanUsername,
+        createdAt: serverTimestamp(),
+      });
     }
 
-    transaction.update(profileRef, {
-      username: cleanUsername,
-      updatedAt: serverTimestamp(),
-    });
-    transaction.set(claimRef, {
-      uid,
-      username: cleanUsername,
-      createdAt: serverTimestamp(),
-    });
+    if (profileSnap.data()?.username !== cleanUsername) {
+      transaction.update(profileRef, {
+        username: cleanUsername,
+        updatedAt: serverTimestamp(),
+      });
+    }
   });
+
+  return cleanUsername;
 }
 
 const CARD_CATEGORIES = [
@@ -193,12 +211,13 @@ const CARD_CATEGORIES = [
 ];
 
 const TOKEN_PACKAGES = [
-  { hkd: 500, tokens: 1050 },
-  { hkd: 1000, tokens: 2100 },
-  { hkd: 3000, tokens: 6480 },
-  { hkd: 10000, tokens: 22000 },
-  { hkd: 30000, tokens: 70200 },
+  { hkd: 500, tokens: 525 },
+  { hkd: 1000, tokens: 1050 },
+  { hkd: 3000, tokens: 3240 },
+  { hkd: 10000, tokens: 11000 },
+  { hkd: 30000, tokens: 35100 },
 ];
+const TOKEN_PACKAGE_RATE_VERSION = 2;
 
 const DEFAULT_VIP_TIERS = [
   { id: "vip0", name: "VIP0", threshold: 3000, rewardCardId: "", rewardName: "M2 卡包" },
@@ -224,6 +243,7 @@ function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState("");
   const [signingIn, setSigningIn] = useState(false);
+  const [authDialogOpen, setAuthDialogOpen] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("draw");
   const [usernameConflict, setUsernameConflict] = useState(false);
@@ -336,6 +356,7 @@ function App() {
     try {
       googleProvider.setCustomParameters({ prompt: "select_account" });
       await signInWithPopup(auth, googleProvider);
+      setAuthDialogOpen(false);
     } catch (error) {
       const popupFallbackCodes = new Set([
         "auth/popup-blocked",
@@ -425,11 +446,10 @@ function App() {
             <button
               className="primary-btn"
               type="button"
-              onClick={handleLogin}
-              disabled={signingIn}
+              onClick={() => setAuthDialogOpen(true)}
             >
               <LogIn size={18} />
-              {signingIn ? "正在開啟 Google..." : "使用 Google 登入"}
+              登入 / 註冊
             </button>
           )}
         </div>
@@ -439,7 +459,8 @@ function App() {
         {!authUser ? (
           <WelcomePanel
             authError={authError}
-            onLogin={handleLogin}
+            onGoogleLogin={handleLogin}
+            onPhoneLogin={() => setAuthDialogOpen(true)}
             signingIn={signingIn}
           />
         ) : isProfileLoading ? (
@@ -463,6 +484,14 @@ function App() {
           </>
         )}
       </main>
+      {authDialogOpen && !authUser && (
+        <AuthDialog
+          authError={authError}
+          onClose={() => setAuthDialogOpen(false)}
+          onGoogleLogin={handleLogin}
+          signingIn={signingIn}
+        />
+      )}
     </div>
   );
 }
@@ -476,25 +505,31 @@ function LoadingScreen() {
   );
 }
 
-function WelcomePanel({ authError, onLogin, signingIn }) {
+function WelcomePanel({ authError, onGoogleLogin, onPhoneLogin, signingIn }) {
   return (
     <section className="welcome">
       <div>
         <p className="eyebrow">Live stream card draw</p>
         <h1>直播抽卡，選號入場，結果即時記錄。</h1>
         <p className="welcome-copy">
-          使用 Google 登入後申請代幣，進入直播房間選擇抽卡號碼，所有購買紀錄、結果與配送狀態都會保存在 Firebase。
+          使用手機號碼或 Google 登入後申請代幣，進入直播房間選擇抽卡號碼，所有購買紀錄、結果與配送狀態都會保存在 Firebase。
         </p>
         {authError && <p className="error-note">{authError}</p>}
-        <button
-          className="primary-btn large"
-          type="button"
-          onClick={onLogin}
-          disabled={signingIn}
-        >
-          <LogIn size={19} />
-          {signingIn ? "正在開啟 Google..." : "使用 Google 登入"}
-        </button>
+        <div className="welcome-auth-actions">
+          <button className="primary-btn large" type="button" onClick={onPhoneLogin}>
+            <Smartphone size={19} />
+            手機號碼登入 / 註冊
+          </button>
+          <button
+            className="ghost-btn large"
+            type="button"
+            onClick={onGoogleLogin}
+            disabled={signingIn}
+          >
+            <LogIn size={19} />
+            {signingIn ? "正在開啟 Google..." : "使用 Google 登入"}
+          </button>
+        </div>
       </div>
       <div className="welcome-visual" aria-hidden="true">
         <div className="card-stack card-a">01</div>
@@ -502,6 +537,145 @@ function WelcomePanel({ authError, onLogin, signingIn }) {
         <div className="card-stack card-c">30</div>
       </div>
     </section>
+  );
+}
+
+function AuthDialog({ authError, onClose, onGoogleLogin, signingIn }) {
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [verificationCode, setVerificationCode] = useState("");
+  const [confirmation, setConfirmation] = useState(null);
+  const [phoneBusy, setPhoneBusy] = useState(false);
+  const [phoneError, setPhoneError] = useState("");
+  const recaptchaRef = useRef(null);
+  const recaptchaWidgetIdRef = useRef(null);
+
+  useEffect(
+    () => () => {
+      recaptchaRef.current?.clear();
+      recaptchaRef.current = null;
+      recaptchaWidgetIdRef.current = null;
+    },
+    [],
+  );
+
+  async function getRecaptchaVerifier() {
+    if (!recaptchaRef.current) {
+      recaptchaRef.current = new RecaptchaVerifier(auth, "phone-recaptcha", {
+        size: "invisible",
+      });
+      recaptchaWidgetIdRef.current = await recaptchaRef.current.render();
+    } else if (recaptchaWidgetIdRef.current !== null) {
+      window.grecaptcha?.reset(recaptchaWidgetIdRef.current);
+    }
+
+    return recaptchaRef.current;
+  }
+
+  async function sendPhoneCode(event) {
+    event.preventDefault();
+    setPhoneError("");
+    setPhoneBusy(true);
+
+    try {
+      const normalizedPhone = normalizePhoneNumber(phoneNumber);
+      const verifier = await getRecaptchaVerifier();
+      const result = await signInWithPhoneNumber(auth, normalizedPhone, verifier);
+      setConfirmation(result);
+    } catch (error) {
+      if (recaptchaWidgetIdRef.current !== null) {
+        window.grecaptcha?.reset(recaptchaWidgetIdRef.current);
+      }
+      setPhoneError(getPhoneAuthErrorMessage(error));
+    } finally {
+      setPhoneBusy(false);
+    }
+  }
+
+  async function confirmPhoneCode(event) {
+    event.preventDefault();
+    if (!confirmation) return;
+    setPhoneError("");
+    setPhoneBusy(true);
+
+    try {
+      await confirmation.confirm(verificationCode.trim());
+      onClose();
+    } catch (error) {
+      setPhoneError(getPhoneAuthErrorMessage(error));
+    } finally {
+      setPhoneBusy(false);
+    }
+  }
+
+  return (
+    <div className="auth-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="auth-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="auth-dialog-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <button className="icon-btn auth-dialog-close" type="button" onClick={onClose} aria-label="關閉">
+          <X size={20} />
+        </button>
+        <p className="eyebrow">Account</p>
+        <h2 id="auth-dialog-title">登入 / 註冊</h2>
+        <p className="muted">使用手機號碼接收一次性驗證碼，或使用 Google 帳戶繼續。</p>
+
+        {!confirmation ? (
+          <form className="stack-form" onSubmit={sendPhoneCode}>
+            <label>
+              手機號碼
+              <input
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                value={phoneNumber}
+                onChange={(event) => setPhoneNumber(event.target.value)}
+                placeholder="例如 +852 9123 4567"
+                required
+              />
+            </label>
+            <button className="primary-btn" id="send-phone-code" type="submit" disabled={phoneBusy}>
+              <Smartphone size={18} />
+              {phoneBusy ? "發送中..." : "發送驗證碼"}
+            </button>
+          </form>
+        ) : (
+          <form className="stack-form" onSubmit={confirmPhoneCode}>
+            <label>
+              SMS 驗證碼
+              <input
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                value={verificationCode}
+                onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                placeholder="6 位數字驗證碼"
+                pattern="[0-9]{6}"
+                required
+              />
+            </label>
+            <button className="primary-btn" type="submit" disabled={phoneBusy}>
+              <Check size={18} />
+              {phoneBusy ? "驗證中..." : "確認並登入"}
+            </button>
+            <button className="small-btn" type="button" onClick={() => setConfirmation(null)}>
+              更改手機號碼
+            </button>
+          </form>
+        )}
+
+        <div id="phone-recaptcha" />
+        {(phoneError || authError) && <p className="error-note">{phoneError || authError}</p>}
+        <div className="auth-divider"><span>或</span></div>
+        <button className="ghost-btn auth-google-btn" type="button" onClick={onGoogleLogin} disabled={signingIn}>
+          <LogIn size={18} />
+          {signingIn ? "正在開啟 Google..." : "使用 Google 登入"}
+        </button>
+        <small className="form-note">登入即表示你同意手機號碼由 Google Firebase 用作驗證及防止濫用。</small>
+      </section>
+    </div>
   );
 }
 
@@ -895,6 +1069,8 @@ function DrawCard({ profile }) {
       null
     );
   }, [roomSlug, rooms]);
+  const selectedRoomId = selectedRoom?.id || "";
+  const selectedRoomDefaultRound = getDefaultRoomRound(selectedRoom);
 
   const selectedRoomCards = useMemo(
     () => buildRoomCards(selectedRoom, cardLibrary),
@@ -918,8 +1094,8 @@ function DrawCard({ profile }) {
   useEffect(() => {
     setSelectedCardId("");
     setSelectedSlotNumber(null);
-    setSelectedRound(getDefaultRoomRound(selectedRoom));
-  }, [selectedRoom]);
+    setSelectedRound(selectedRoomDefaultRound);
+  }, [selectedRoomDefaultRound, selectedRoomId]);
 
   useEffect(() => {
     setSelectedSlotNumber(null);
@@ -989,6 +1165,8 @@ function DrawCard({ profile }) {
 
     setBuyingNumber(slot.number);
     try {
+      const claimedUsername = await ensureUsernameClaim(profile.uid, profile.username);
+
       await runTransaction(db, async (transaction) => {
         const userRef = doc(db, "users", profile.uid);
         const slotRef = doc(
@@ -1021,7 +1199,7 @@ function DrawCard({ profile }) {
         transaction.update(slotRef, {
           status: "locked",
           uid: profile.uid,
-          username: profile.username,
+          username: claimedUsername,
           tokenCost,
           targetCardId: selectedTargetCard.id,
           targetCardName: selectedTargetCard.name,
@@ -1032,7 +1210,7 @@ function DrawCard({ profile }) {
         });
         transaction.set(recordRef, {
           uid: profile.uid,
-          username: profile.username,
+          username: claimedUsername,
           drawId: selectedRoom.id,
           drawTitle: selectedRoom.title,
           roomSlug: selectedRoom.slug || selectedRoom.id,
@@ -1235,7 +1413,13 @@ function RoomList({ rooms, error, onOpenRoom }) {
   );
 }
 
-function CardPoolPreview({ draw, cards, cardCategories, selectedCardId, onSelectCard }) {
+const CardPoolPreview = memo(function CardPoolPreview({
+  draw,
+  cards,
+  cardCategories,
+  selectedCardId,
+  onSelectCard,
+}) {
   const [categoryFilter, setCategoryFilter] = useState("全部");
   const categories = useMemo(
     () => getCardCategories(cards, cardCategories),
@@ -1279,7 +1463,13 @@ function CardPoolPreview({ draw, cards, cardCategories, selectedCardId, onSelect
                 onClick={() => onSelectCard(card.id)}
               >
                 {card.imageUrl ? (
-                  <img src={card.imageUrl} alt={card.name} />
+                  <img
+                    src={card.imageUrl}
+                    alt={card.name}
+                    loading="lazy"
+                    decoding="async"
+                    fetchPriority="low"
+                  />
                 ) : (
                   <div className="image-placeholder">
                     <Package size={24} />
@@ -1299,7 +1489,7 @@ function CardPoolPreview({ draw, cards, cardCategories, selectedCardId, onSelect
       )}
     </section>
   );
-}
+});
 
 function NumberGrid({
   draw,
@@ -1440,8 +1630,8 @@ function NumberGrid({
   );
 }
 
-function KickEmbed({ kickUrl, title }) {
-  const embedUrl = toKickEmbedUrl(kickUrl);
+const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
+  const embedUrl = useMemo(() => toKickEmbedUrl(kickUrl), [kickUrl]);
 
   if (!embedUrl) {
     return <div className="stream-fallback">尚未設定 Kick 直播連結</div>;
@@ -1453,10 +1643,11 @@ function KickEmbed({ kickUrl, title }) {
       src={embedUrl}
       title={`${title} Kick stream`}
       allow="autoplay; fullscreen; picture-in-picture"
+      scrolling="no"
       allowFullScreen
     />
   );
-}
+});
 
 function ChatRoom({ drawId, profile }) {
   const [messages, setMessages] = useState([]);
@@ -1468,6 +1659,7 @@ function ChatRoom({ drawId, profile }) {
     const messagesQuery = query(
       collection(db, "draws", drawId, "messages"),
       orderBy("createdAt", "asc"),
+      limitToLast(100),
     );
     const stopMessages = onSnapshot(messagesQuery, (snapshot) => {
       setMessages(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
@@ -1505,6 +1697,8 @@ function ChatRoom({ drawId, profile }) {
 
     setSending(true);
     try {
+      const claimedUsername = await ensureUsernameClaim(profile.uid, profile.username);
+
       await runTransaction(db, async (transaction) => {
         const userRef = doc(db, "users", profile.uid);
         const messageRef = doc(collection(db, "draws", drawId, "messages"));
@@ -1527,7 +1721,7 @@ function ChatRoom({ drawId, profile }) {
           drawId,
           source: "draw",
           uid: profile.uid,
-          username: profile.username,
+          username: claimedUsername,
           text: cleanText.slice(0, 500),
           createdAt: serverTimestamp(),
         });
@@ -1668,6 +1862,7 @@ function TokenRequest({ profile }) {
   const [customHkd, setCustomHkd] = useState("");
   const [proof, setProof] = useState(null);
   const [promoCode, setPromoCode] = useState("");
+  const [fpsIdentifier, setFpsIdentifier] = useState("");
   const [fpsName, setFpsName] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [requests, setRequests] = useState([]);
@@ -1676,7 +1871,7 @@ function TokenRequest({ profile }) {
   const tokenAmount = usingCustomAmount
     ? calculateTokenAmount(hkdAmount)
     : tokenPackages.find((item) => item.hkd === hkdAmount)?.tokens || 0;
-  const baseTokens = Math.max(0, Math.floor(hkdAmount * 2));
+  const baseTokens = Math.max(0, Math.floor(hkdAmount));
   const bonusTokens = Math.max(0, tokenAmount - baseTokens);
   const bonusRate = baseTokens > 0 ? Math.round((bonusTokens / baseTokens) * 100) : 0;
   const approvedDeposit = requests
@@ -1716,13 +1911,15 @@ function TokenRequest({ profile }) {
       alert("請選擇套餐，或輸入最少 HK$500 的自訂金額。");
       return;
     }
-    if (!fpsName.trim()) {
-      alert("請輸入 FPS 轉帳人姓名，方便管理員核對。");
+    if (!fpsIdentifier.trim() || !fpsName.trim()) {
+      alert("請輸入轉數快識別碼及收款人姓名，方便管理員核對。");
       return;
     }
 
     setSubmitting(true);
     try {
+      const claimedUsername = await ensureUsernameClaim(profile.uid, profile.username);
+
       const proofInfo = await createProofInfo({
         proof,
         profile,
@@ -1731,12 +1928,13 @@ function TokenRequest({ profile }) {
 
       await addDoc(collection(db, "tokenRequests"), {
         uid: profile.uid,
-        username: profile.username,
+        username: claimedUsername,
         email: profile.email || "",
         amount: tokenAmount,
         hkdAmount,
         exchangeRate: tokenAmount / hkdAmount,
         packageType: usingCustomAmount ? "custom" : "preset",
+        fpsIdentifier: fpsIdentifier.trim(),
         fpsName: fpsName.trim(),
         ...proofInfo,
         status: "pending",
@@ -1747,6 +1945,7 @@ function TokenRequest({ profile }) {
 
       setProof(null);
       setPromoCode("");
+      setFpsIdentifier("");
       setFpsName("");
       setSelectedPackage(tokenPackages[0].hkd);
       setCustomHkd("");
@@ -1819,15 +2018,24 @@ function TokenRequest({ profile }) {
             <strong><span className="coin-dot">D</span>{formatTokenNumber(tokenAmount)}</strong>
             <small>付款金額 HK${formatTokenNumber(hkdAmount)}</small>
             <p>
-              基本 1:2 = {formatTokenNumber(baseTokens)} 代幣 ＋ 額外 {bonusRate}% = {formatTokenNumber(bonusTokens)} 代幣
+              基本 1:1 = {formatTokenNumber(baseTokens)} 代幣 ＋ 額外 {bonusRate}% = {formatTokenNumber(bonusTokens)} 代幣
             </p>
           </div>
           <label>
-            FPS 轉帳人姓名
+            轉數快識別碼
+            <input
+              value={fpsIdentifier}
+              onChange={(event) => setFpsIdentifier(event.target.value)}
+              placeholder="請輸入 FPS 識別碼"
+              required
+            />
+          </label>
+          <label>
+            收款人姓名
             <input
               value={fpsName}
               onChange={(event) => setFpsName(event.target.value)}
-              placeholder="請填入付款戶口姓名"
+              placeholder="請輸入收款人姓名"
               required
             />
           </label>
@@ -1837,12 +2045,13 @@ function TokenRequest({ profile }) {
             onChange={setProof}
             required
           />
+          <div className="form-or-divider"><span>或</span></div>
           <label>
-            推廣活動邀請碼（選填）
+            推廣活動邀請碼
             <input
               value={promoCode}
               onChange={(event) => setPromoCode(event.target.value)}
-              placeholder="輸入 Giveaway 活動代碼"
+              placeholder="輸入推廣活動邀請碼（選填）"
             />
           </label>
           <p className="form-note">
@@ -1912,7 +2121,8 @@ function RequestList({ requests, adminMode = false, onApprove, onReject }) {
               </strong>
               <span>{formatDate(request.createdAt)}</span>
               {request.hkdAmount && <span>付款金額：HK${formatTokenNumber(request.hkdAmount)}</span>}
-              {request.fpsName && <span>FPS 戶名：{request.fpsName}</span>}
+              {request.fpsIdentifier && <span>FPS 識別碼：{request.fpsIdentifier}</span>}
+              {request.fpsName && <span>收款人：{request.fpsName}</span>}
               {request.promoCode && <span>活動碼：{request.promoCode}</span>}
             </div>
           </div>
@@ -2652,6 +2862,7 @@ function TokenPackageManager({ profile }) {
     try {
       await setDoc(doc(db, "settings", "tokenPackages"), {
         packages,
+        rateVersion: TOKEN_PACKAGE_RATE_VERSION,
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
       });
@@ -4418,7 +4629,14 @@ function useTokenPackages() {
           return;
         }
 
-        const nextPackages = normalizeTokenPackages(snapshot.data().packages);
+        const settings = snapshot.data();
+        const savedPackages = normalizeTokenPackages(settings.packages);
+        const nextPackages = Number(settings.rateVersion || 1) >= TOKEN_PACKAGE_RATE_VERSION
+          ? savedPackages
+          : savedPackages.map((item) => ({
+              ...item,
+              tokens: Math.max(1, Math.round(item.tokens / 2)),
+            }));
         setPackages(nextPackages.length ? nextPackages : TOKEN_PACKAGES);
       },
       (error) => {
@@ -4501,7 +4719,7 @@ function getVipState(tiers, deposit) {
 }
 
 function getTokenBonusRate(tokenPackage) {
-  const baseTokens = Number(tokenPackage?.hkd || 0) * 2;
+  const baseTokens = Number(tokenPackage?.hkd || 0);
   if (!baseTokens) return 0;
   return Math.max(0, Math.round(((Number(tokenPackage?.tokens || 0) - baseTokens) / baseTokens) * 100));
 }
@@ -4564,7 +4782,7 @@ function calculateTokenAmount(hkdAmount) {
     bonusRate = 0.08;
   }
 
-  return Math.floor(amount * 2 * (1 + bonusRate));
+  return Math.floor(amount * (1 + bonusRate));
 }
 
 function normalizeCardCategory(category) {
@@ -4692,6 +4910,34 @@ function rangeNumbers(start, end) {
   const first = Math.round(Number(start) || 1);
   const last = Math.round(Number(end) || first);
   return Array.from({ length: Math.max(0, last - first + 1) }, (_, index) => first + index);
+}
+
+function normalizePhoneNumber(value) {
+  const compact = String(value || "").replace(/[\s()-]/g, "");
+  const normalized = compact.startsWith("+")
+    ? `+${compact.slice(1).replace(/\D/g, "")}`
+    : `+852${compact.replace(/\D/g, "")}`;
+
+  if (!/^\+[1-9]\d{7,14}$/.test(normalized)) {
+    throw new Error("請輸入有效手機號碼，例如 +852 9123 4567。");
+  }
+
+  return normalized;
+}
+
+function getPhoneAuthErrorMessage(error) {
+  const messages = {
+    "auth/invalid-phone-number": "手機號碼格式不正確，請連同國家／地區號碼輸入。",
+    "auth/invalid-verification-code": "驗證碼不正確，請重新輸入。",
+    "auth/code-expired": "驗證碼已過期，請重新發送。",
+    "auth/too-many-requests": "嘗試次數過多，請稍後再試。",
+    "auth/quota-exceeded": "今日 SMS 驗證配額已用完，請使用 Google 登入或稍後再試。",
+    "auth/operation-not-allowed": "手機登入尚未啟用，請聯絡管理員。",
+    "auth/captcha-check-failed": "安全驗證失敗，請重新整理後再試。",
+    "auth/missing-phone-number": "請輸入手機號碼。",
+  };
+
+  return messages[error?.code] || getSafeErrorMessage(error, "手機登入失敗，請稍後再試。");
 }
 
 function getSafeErrorMessage(error, fallback = "操作失敗，請稍後再試。") {
