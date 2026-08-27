@@ -6,14 +6,17 @@ import {
   Clock3,
   Copy,
   CopyCheck,
+  Crown,
   Download,
   ExternalLink,
   FileImage,
   Gavel,
+  Gift,
   ImagePlus,
   ListChecks,
   LogIn,
   LogOut,
+  Lock,
   Menu,
   Package,
   Pencil,
@@ -88,6 +91,7 @@ const statusLabels = {
   shipped: "已寄出",
 };
 
+const ROUND_BUY_LOCKED_LABEL = "本場已停止購買";
 const collectionStatuses = ["pending", "shipping", "shipped"];
 const CONVERSION_RATE = 0.8;
 const CHAT_COOLDOWN_MS = 3000;
@@ -196,12 +200,21 @@ const TOKEN_PACKAGES = [
   { hkd: 30000, tokens: 70200 },
 ];
 
+const DEFAULT_VIP_TIERS = [
+  { id: "vip0", name: "VIP0", threshold: 3000, rewardCardId: "", rewardName: "M2 卡包" },
+  { id: "vip1", name: "VIP1", threshold: 10000, rewardCardId: "", rewardName: "M2A 卡盒" },
+  { id: "vip2", name: "VIP2", threshold: 30000, rewardCardId: "", rewardName: "升級實體卡獎勵" },
+  { id: "vip3", name: "VIP3", threshold: 100000, rewardCardId: "", rewardName: "升級實體卡獎勵" },
+  { id: "vip4", name: "VIP4", threshold: 300000, rewardCardId: "", rewardName: "升級實體卡獎勵" },
+];
+
 const ADMIN_SECTIONS = [
   { id: "rooms", label: "房間管理", eyebrow: "Rooms", icon: Gavel },
   { id: "create-room", label: "建立房間", eyebrow: "New draw", icon: Plus },
   { id: "cards", label: "卡牌庫", eyebrow: "Card library", icon: ImagePlus },
   { id: "requests", label: "代幣審核", eyebrow: "Review queue", icon: BadgeDollarSign },
   { id: "packages", label: "套餐設定", eyebrow: "Token packages", icon: Ticket },
+  { id: "vip", label: "VIP 設定", eyebrow: "VIP program", icon: Crown },
   { id: "records", label: "購買紀錄", eyebrow: "Room records", icon: ListChecks },
 ];
 
@@ -361,7 +374,7 @@ function App() {
       <header className="topbar">
         <a className="brand" href="#top" aria-label="Draw Card home">
           <span className="brand-mark">D!</span>
-          <span>直播抽卡</span>
+          <span>直播抽卡 DRAW GP</span>
         </a>
 
         {authUser && (
@@ -595,6 +608,7 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
       setRecentPicks(
         snapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }))
+          .filter((item) => item.source !== "vip")
           .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt))
           .slice(0, 6),
       );
@@ -646,12 +660,30 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
         type="button"
         onClick={() => openPickRoom(record)}
       >
-        <div>
-          <span>{record.roomSlug || room?.slug || "抽卡房"}</span>
-          <b>#{record.number}</b>
+        <div className="pick-card-main">
+          <span className="pick-card-art">
+            {record.cardImageUrl || record.targetCardImageUrl ? (
+              <img
+                src={record.cardImageUrl || record.targetCardImageUrl}
+                alt={record.cardName || record.targetCardName || "卡牌"}
+              />
+            ) : (
+              <Package size={20} />
+            )}
+          </span>
+          <span className="pick-card-copy">
+            <strong>{room?.title || record.drawTitle || "抽卡房"}</strong>
+            <small>{record.roomSlug || room?.slug || "draw-room"}</small>
+            <span className="pick-number-box">
+              <em>天堂地獄號碼</em>
+              <b>#{record.number}</b>
+            </span>
+          </span>
         </div>
-        <strong>{record.cardName || record.targetCardName || record.drawTitle}</strong>
-        <small>
+        <strong className="pick-card-name">
+          {record.cardName || record.targetCardName || "等待抽卡結果"}
+        </strong>
+        <small className="pick-card-meta">
           {formatRoundLabel(record.round || "round-001")} · {roomStatus}
           {roomIsLive ? " · 點擊返回房間" : ""}
         </small>
@@ -931,6 +963,10 @@ function DrawCard({ profile }) {
     if (!selectedRoom || selectedRoom.status !== "live") return;
     if (activeRoundId !== toRoundId(getRoomCurrentRound(selectedRoom))) {
       alert("此場次已鎖定，請切換到目前場次購買。");
+      return;
+    }
+    if (isRoundBuyingBlocked(selectedRoom, activeRoundId)) {
+      alert("管理員已停止本場購買，不能再鎖定新號碼。");
       return;
     }
     if (!profile?.uid) {
@@ -1294,10 +1330,11 @@ function NumberGrid({
   const activeRoundSort = getRoundSortValue(activeRoundId);
   const currentRoundSort = getRoundSortValue(currentRoundId);
   const roundIsCurrent = activeRoundId === currentRoundId;
+  const buyingBlocked = isRoundBuyingBlocked(draw, activeRoundId);
   const roundLockedReason = activeRoundSort < currentRoundSort ? "已過場" : "未開場";
   const mySlots = slots.filter((slot) => slot.uid === profile?.uid);
   const selectedNumber = selectedSlotNumber || buyingNumber || null;
-  const canPay = Boolean(roundIsCurrent && selectedCard && selectedSlotNumber && !buyingNumber);
+  const canPay = Boolean(roundIsCurrent && !buyingBlocked && selectedCard && selectedSlotNumber && !buyingNumber);
 
   return (
     <section className="panel number-panel">
@@ -1322,6 +1359,8 @@ function NumberGrid({
       <p className="muted number-help">
         {!roundIsCurrent
           ? `${formatRoundLabel(activeRoundId)}${roundLockedReason}，只可以查看紀錄，不能再鎖定號碼。`
+          : buyingBlocked
+          ? `${formatRoundLabel(activeRoundId)}已停止購買，只可以查看紀錄，不能再鎖定號碼。`
           : selectedCard
           ? `已選 ${selectedCard.name}，${formatRoundLabel(activeRoundId)}共 ${draw.cardCount} 個號碼，已被選走的號碼無法重選。`
           : "請先在第一步選擇卡牌，然後才可選號。"}
@@ -1330,7 +1369,7 @@ function NumberGrid({
         {slots.map((slot) => {
           const locked = slot.status !== "available";
           const mine = locked && slot.uid === profile?.uid;
-          const selected = roundIsCurrent && !locked && slot.number === selectedSlotNumber;
+          const selected = roundIsCurrent && !buyingBlocked && !locked && slot.number === selectedSlotNumber;
           return (
             <button
               className={
@@ -1342,7 +1381,7 @@ function NumberGrid({
                       ? "slot selected"
                       : "slot"
               }
-              disabled={!roundIsCurrent || !selectedCard || locked || buyingNumber === slot.number}
+              disabled={!roundIsCurrent || buyingBlocked || !selectedCard || locked || buyingNumber === slot.number}
               key={slot.id}
               type="button"
               onClick={() => onSelectNumber(slot.number)}
@@ -1353,6 +1392,8 @@ function NumberGrid({
                   ? "你的號碼"
                   : !roundIsCurrent
                     ? roundLockedReason
+                  : buyingBlocked
+                    ? "已停止"
                   : locked
                     ? slot.username || "已被選走"
                     : buyingNumber === slot.number
@@ -1388,6 +1429,8 @@ function NumberGrid({
             ? `付款 ⚡ ${formatTokenNumber(selectedCard.tokenValue || draw.tokenCost)} 並鎖定號碼`
             : !roundIsCurrent
               ? roundLockedReason
+            : buyingBlocked
+              ? ROUND_BUY_LOCKED_LABEL
             : selectedCard
               ? "先選擇號碼"
               : "先選擇卡牌"}
@@ -1562,8 +1605,65 @@ function RoomThumbnail({ draw }) {
   );
 }
 
+function VipProgramPanel({ deposit, tiers }) {
+  const vip = getVipState(tiers, deposit);
+
+  return (
+    <section className="vip-program-panel">
+      <div className="vip-program-header">
+        <div>
+          <p className="eyebrow">VIP program</p>
+          <h1>
+            VIP 等級 <span>{vip.currentTier?.name || "未入級"}</span>
+          </h1>
+          <p>
+            累積入金 <strong>HK${formatTokenNumber(deposit)}</strong> · 每次升級即送指定實體卡
+          </p>
+        </div>
+        <div className="vip-next-card">
+          {vip.nextTier ? (
+            <>
+              <span>距離 {vip.nextTier.name}</span>
+              <strong>再入金 HK${formatTokenNumber(vip.remaining)}</strong>
+              <small>升級即獲 {vip.nextTier.rewardName || "指定卡牌"}</small>
+            </>
+          ) : (
+            <>
+              <span>最高級別</span>
+              <strong>所有 VIP 等級已達成</strong>
+              <small>多謝你一直支持直播抽卡。</small>
+            </>
+          )}
+        </div>
+      </div>
+      <div className="vip-tier-grid">
+        {vip.tiers.map((tier, index) => (
+          <article
+            className={`vip-tier-card ${tier.done ? "done" : ""} ${tier.active ? "active" : ""}`}
+            key={tier.id}
+          >
+            <div className="vip-tier-rail">
+              <i style={{ width: `${tier.progress}%` }} />
+            </div>
+            <div className="vip-shield">{index}</div>
+            <div className="vip-tier-state">
+              {tier.done ? "已達成" : tier.active ? `${Math.round(tier.progress)}%` : "未解鎖"}
+            </div>
+            <div className="vip-tier-detail">
+              <strong>{tier.name}</strong>
+              <b>HK${formatTokenNumber(tier.threshold)}</b>
+              <span>{tier.rewardName || "待設定升級獎勵"}</span>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function TokenRequest({ profile }) {
   const tokenPackages = useTokenPackages();
+  const vipTiers = useVipProgram();
   const [selectedPackage, setSelectedPackage] = useState(tokenPackages[0].hkd);
   const [customHkd, setCustomHkd] = useState("");
   const [proof, setProof] = useState(null);
@@ -1576,6 +1676,13 @@ function TokenRequest({ profile }) {
   const tokenAmount = usingCustomAmount
     ? calculateTokenAmount(hkdAmount)
     : tokenPackages.find((item) => item.hkd === hkdAmount)?.tokens || 0;
+  const baseTokens = Math.max(0, Math.floor(hkdAmount * 2));
+  const bonusTokens = Math.max(0, tokenAmount - baseTokens);
+  const bonusRate = baseTokens > 0 ? Math.round((bonusTokens / baseTokens) * 100) : 0;
+  const approvedDeposit = requests
+    .filter((request) => request.status === "approved")
+    .reduce((sum, request) => sum + Number(request.hkdAmount || 0), 0);
+  const cumulativeDeposit = Math.max(Number(profile.totalDeposits || 0), approvedDeposit);
 
   useEffect(() => {
     if (
@@ -1651,8 +1758,10 @@ function TokenRequest({ profile }) {
   }
 
   return (
-    <div className="split-layout">
-      <section className="panel">
+    <div className="token-page">
+      <VipProgramPanel deposit={cumulativeDeposit} tiers={vipTiers} />
+      <div className="split-layout token-request-layout">
+      <section className="panel token-request-panel">
         <div className="section-heading">
           <BadgeDollarSign size={24} />
           <div>
@@ -1672,7 +1781,10 @@ function TokenRequest({ profile }) {
                   onClick={() => setSelectedPackage(item.hkd)}
                 >
                   <strong>HK${formatTokenNumber(item.hkd)}</strong>
-                  <span>⚡ {formatTokenNumber(item.tokens)} 代幣</span>
+                  <span>
+                    ⚡ {formatTokenNumber(item.tokens)}
+                    <em>+{getTokenBonusRate(item)}% 額外</em>
+                  </span>
                 </button>
               ))}
               <button
@@ -1700,9 +1812,15 @@ function TokenRequest({ profile }) {
             </label>
           )}
           <div className="token-preview">
-            <span>申請代幣</span>
-            <strong>⚡ {formatTokenNumber(tokenAmount)}</strong>
+            <div>
+              <span>申請代幣</span>
+              <em>+{bonusRate}% 額外</em>
+            </div>
+            <strong><span className="coin-dot">D</span>{formatTokenNumber(tokenAmount)}</strong>
             <small>付款金額 HK${formatTokenNumber(hkdAmount)}</small>
+            <p>
+              基本 1:2 = {formatTokenNumber(baseTokens)} 代幣 ＋ 額外 {bonusRate}% = {formatTokenNumber(bonusTokens)} 代幣
+            </p>
           </div>
           <label>
             FPS 轉帳人姓名
@@ -1728,7 +1846,7 @@ function TokenRequest({ profile }) {
             />
           </label>
           <p className="form-note">
-            代幣兌換率可由管理員審核。上傳銀行轉帳截圖後，審核完成會自動加到帳戶。
+            基本兌換率 HK$1：2 代幣；入金愈多，額外代幣百分比愈高。審核完成後會自動加入帳戶及 VIP 累積入金。
           </p>
           <button className="primary-btn" type="submit" disabled={submitting}>
             <FileImage size={18} />
@@ -1747,6 +1865,7 @@ function TokenRequest({ profile }) {
         </div>
         <RequestList requests={requests} />
       </section>
+      </div>
     </div>
   );
 }
@@ -2005,7 +2124,7 @@ function CollectionPage({ profile }) {
     if (!skipConfirm) {
       const originalValue = Number(record.cardValue || record.tokenCost || 0);
       const confirmed = window.confirm(
-        `將「${record.cardName}」以 8 折轉回 ${formatTokenNumber(refund)} 代幣？原值 ⚡ ${formatTokenNumber(originalValue)}。`,
+        `將「${record.cardName}」轉回 ${formatTokenNumber(refund)} 代幣？卡牌原值 ⚡ ${formatTokenNumber(originalValue)}。`,
       );
       if (!confirmed) return;
     }
@@ -2055,7 +2174,7 @@ function CollectionPage({ profile }) {
       0,
     );
     const confirmed = window.confirm(
-      `將目前 ${visibleRecords.length} 張卡牌以 8 折轉回 ${formatTokenNumber(totalRefund)} 代幣？`,
+      `將目前 ${visibleRecords.length} 張卡牌按管理員設定價值轉回 ${formatTokenNumber(totalRefund)} 代幣？`,
     );
     if (!confirmed) return;
 
@@ -2098,7 +2217,7 @@ function CollectionPage({ profile }) {
             </strong>
           </div>
           <div>
-            <span>轉點 8 折</span>
+            <span>可轉回代幣</span>
             <strong>⚡ {formatTokenNumber(totalRefundValue)}</strong>
           </div>
           <div>
@@ -2136,7 +2255,7 @@ function CollectionPage({ profile }) {
                     type="button"
                     onClick={() => convertCardToTokens(record)}
                   >
-                    8 折轉回 {formatTokenNumber(getCardConversionRefund(record))} 代幣
+                    轉回 {formatTokenNumber(getCardConversionRefund(record))} 代幣
                   </button>
                 </div>
               </article>
@@ -2164,6 +2283,7 @@ function AdminPanel({ profile }) {
   const [draws, setDraws] = useState([]);
   const [cards, setCards] = useState([]);
   const [records, setRecords] = useState([]);
+  const vipTiers = useVipProgram();
   const activeSection =
     ADMIN_SECTIONS.find((section) => section.id === activeAdminSection) || ADMIN_SECTIONS[0];
   const ActiveIcon = activeSection.icon;
@@ -2201,6 +2321,12 @@ function AdminPanel({ profile }) {
   }, []);
 
   async function approveRequest(request) {
+    const historicalApprovedDeposit = requests
+      .filter(
+        (item) => item.uid === request.uid && item.status === "approved" && item.id !== request.id,
+      )
+      .reduce((sum, item) => sum + Number(item.hkdAmount || 0), 0);
+
     try {
       await runTransaction(db, async (transaction) => {
         const requestRef = doc(db, "tokenRequests", request.id);
@@ -2215,15 +2341,73 @@ function AdminPanel({ profile }) {
           throw new Error("User profile was not found.");
         }
 
+        const requestData = requestSnap.data();
+        const userData = userSnap.data();
+        const previousDeposit = Math.max(
+          Number(userData.totalDeposits || 0),
+          historicalApprovedDeposit,
+        );
+        const totalDeposits = previousDeposit + Number(requestData.hkdAmount || 0);
+        const previousVipLevel = Number(userData.vipLevel ?? -1);
+        const vipState = getVipState(vipTiers, totalDeposits);
+        const attainedTiers = vipTiers.filter(
+          (tier, index) =>
+            index > previousVipLevel &&
+            index <= vipState.currentIndex &&
+            tier.rewardCardId,
+        );
+
         transaction.update(requestRef, {
           status: "approved",
           reviewedAt: serverTimestamp(),
           reviewedBy: profile.uid,
         });
         transaction.update(userRef, {
-          tokens: increment(Number(requestSnap.data().amount || 0)),
+          tokens: increment(Number(requestData.amount || 0)),
           lastTokenGrantRequestId: request.id,
+          totalDeposits,
+          vipLevel: vipState.currentIndex,
+          lastVipRewardTier: attainedTiers.at(-1)?.id || userData.lastVipRewardTier || "",
           updatedAt: serverTimestamp(),
+        });
+
+        attainedTiers.forEach((tier) => {
+          const rewardCard = cards.find((card) => card.id === tier.rewardCardId);
+          const rewardName = rewardCard?.name || tier.rewardName;
+          const rewardImageUrl = rewardCard?.imageUrl || tier.rewardImageUrl || "";
+          const rewardConversionValue = Number(
+            rewardCard?.conversionValue ?? rewardCard?.tokenValue ?? tier.rewardConversionValue ?? 0,
+          );
+          const rewardRef = doc(db, "drawRecords", `vip_${request.uid}_${tier.id}`);
+          transaction.set(rewardRef, {
+            source: "vip",
+            vipTierId: tier.id,
+            uid: request.uid,
+            username: requestData.username || userData.username || "VIP member",
+            drawId: "vip-program",
+            drawTitle: `${tier.name} 升級獎勵`,
+            roomSlug: "vip-program",
+            roomLink: "",
+            round: "vip-reward",
+            roundSort: 0,
+            number: vipTiers.findIndex((item) => item.id === tier.id) + 1,
+            tokenCost: 0,
+            targetCardId: tier.rewardCardId,
+            targetCardName: rewardName,
+            targetCardImageUrl: rewardImageUrl,
+            targetCardValue: rewardConversionValue,
+            cardId: tier.rewardCardId,
+            cardName: rewardName,
+            cardCategory: "VIP 獎勵",
+            cardImageUrl: rewardImageUrl,
+            cardValue: rewardConversionValue,
+            cardConversionValue: rewardConversionValue,
+            collectionStatus: "pending",
+            assignedAt: serverTimestamp(),
+            assignedBy: profile.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
         });
       });
     } catch (error) {
@@ -2310,6 +2494,11 @@ function AdminPanel({ profile }) {
           <TokenPackageManager profile={profile} />
         </div>
       )}
+      {activeAdminSection === "vip" && (
+        <div className="admin-section">
+          <VipProgramManager cards={cards} profile={profile} tiers={vipTiers} />
+        </div>
+      )}
       {activeAdminSection === "requests" && (
         <section className="panel admin-section narrow-admin-section">
           <RequestList
@@ -2344,9 +2533,36 @@ function RoomManagementList({ cards, draws, onCompleteDraw, onCopyRoomLink }) {
     return <p className="muted">暫時未有房間。</p>;
   }
 
+  async function toggleCurrentRoundBuying(draw) {
+    const currentRoundId = toRoundId(getRoomCurrentRound(draw));
+    const blocked = isRoundBuyingBlocked(draw, currentRoundId);
+    const nextBlockedRounds = blocked
+      ? (draw.buyingBlockedRounds || []).filter((roundId) => roundId !== currentRoundId)
+      : [...new Set([...(draw.buyingBlockedRounds || []), currentRoundId])];
+    const confirmText = blocked
+      ? `確認重新開放 ${draw.title} ${formatRoundLabel(currentRoundId)} 購買？`
+      : `確認停止 ${draw.title} ${formatRoundLabel(currentRoundId)} 購買？玩家將不能再買新號碼。`;
+
+    if (!window.confirm(confirmText)) return;
+
+    try {
+      await updateDoc(doc(db, "draws", draw.id), {
+        buyingBlockedRounds: nextBlockedRounds,
+        buyingBlockedRound: !blocked ? currentRoundId : "",
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      showSafeError(error);
+    }
+  }
+
   return (
     <div className="room-manage-list">
-      {draws.map((draw) => (
+      {draws.map((draw) => {
+        const currentRoundId = toRoundId(getRoomCurrentRound(draw));
+        const buyingBlocked = isRoundBuyingBlocked(draw, currentRoundId);
+
+        return (
         <article className="room-manage-card" key={draw.id}>
           <div className="room-manage-summary">
             <div className="room-manage-main">
@@ -2361,6 +2577,9 @@ function RoomManagementList({ cards, draws, onCompleteDraw, onCopyRoomLink }) {
                 <span className={`status-badge ${draw.status}`}>
                   {statusLabels[draw.status] || draw.status}
                 </span>
+                {buyingBlocked && (
+                  <span className="status-badge rejected">{ROUND_BUY_LOCKED_LABEL}</span>
+                )}
               </div>
             </div>
             <div className="record-actions">
@@ -2368,6 +2587,16 @@ function RoomManagementList({ cards, draws, onCompleteDraw, onCopyRoomLink }) {
                 <Copy size={15} />
                 複製連結
               </button>
+              {draw.status === "live" && (
+                <button
+                  className={buyingBlocked ? "small-btn" : "small-btn danger"}
+                  type="button"
+                  onClick={() => toggleCurrentRoundBuying(draw)}
+                >
+                  <Lock size={15} />
+                  {buyingBlocked ? "重開本場購買" : "停止本場購買"}
+                </button>
+              )}
               {draw.status === "live" && (
                 <button className="small-btn" type="button" onClick={() => onCompleteDraw(draw)}>
                   <CopyCheck size={15} />
@@ -2379,7 +2608,8 @@ function RoomManagementList({ cards, draws, onCompleteDraw, onCopyRoomLink }) {
           <RoomRoundSettings draw={draw} />
           <RoomPoolEditor draw={draw} cards={cards} />
         </article>
-      ))}
+      );
+      })}
     </div>
   );
 }
@@ -2495,6 +2725,124 @@ function TokenPackageManager({ profile }) {
   );
 }
 
+function VipProgramManager({ cards, profile, tiers }) {
+  const [drafts, setDrafts] = useState(tiers);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setDrafts(tiers);
+  }, [tiers]);
+
+  function updateTier(index, field, value) {
+    setDrafts((current) =>
+      current.map((tier, tierIndex) =>
+        tierIndex === index ? { ...tier, [field]: value } : tier,
+      ),
+    );
+  }
+
+  function chooseReward(index, cardId) {
+    const card = cards.find((item) => item.id === cardId);
+    updateTier(index, "rewardCardId", cardId);
+    setDrafts((current) =>
+      current.map((tier, tierIndex) =>
+        tierIndex === index
+          ? {
+              ...tier,
+              rewardCardId: cardId,
+              rewardName: card?.name || "待設定升級獎勵",
+              rewardImageUrl: card?.imageUrl || "",
+              rewardConversionValue: Number(card?.conversionValue ?? card?.tokenValue ?? 0),
+            }
+          : tier,
+      ),
+    );
+  }
+
+  async function saveVipProgram() {
+    const normalized = normalizeVipTiers(drafts);
+    if (normalized.some((tier, index) => index > 0 && tier.threshold <= normalized[index - 1].threshold)) {
+      alert("VIP 入金門檻必須逐級增加。");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await setDoc(doc(db, "settings", "vipProgram"), {
+        tiers: normalized,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      });
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="panel vip-manager">
+      <div className="section-heading">
+        <Crown size={24} />
+        <div>
+          <p className="eyebrow">VIP program</p>
+          <h1>VIP 等級及升級贈卡</h1>
+          <p className="muted">設定每級累積入金門檻及指定贈送卡牌；批准入金時系統會自動發放新達成級別的獎勵。</p>
+        </div>
+      </div>
+      <div className="vip-manager-grid">
+        {drafts.map((tier, index) => (
+          <article className="vip-manager-card" key={tier.id}>
+            <div className="vip-manager-title">
+              <span className="vip-shield small">{index}</span>
+              <div>
+                <strong>{tier.name}</strong>
+                <small>第 {index + 1} 級</small>
+              </div>
+            </div>
+            <label>
+              累積入金門檻（HKD）
+              <input
+                type="number"
+                min="1"
+                value={tier.threshold}
+                onChange={(event) => updateTier(index, "threshold", event.target.value)}
+              />
+            </label>
+            <label>
+              升級贈送卡牌
+              <select
+                value={tier.rewardCardId || ""}
+                onChange={(event) => chooseReward(index, event.target.value)}
+              >
+                <option value="">未設定</option>
+                {cards.map((card) => (
+                  <option key={card.id} value={card.id}>{card.name}</option>
+                ))}
+              </select>
+            </label>
+            <div className="vip-reward-preview">
+              {tier.rewardImageUrl ? (
+                <img src={tier.rewardImageUrl} alt={tier.rewardName} />
+              ) : (
+                <Gift size={24} />
+              )}
+              <div>
+                <strong>{tier.rewardName || "待設定升級獎勵"}</strong>
+                <span>可轉回 ⚡ {formatTokenNumber(tier.rewardConversionValue || 0)}</span>
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>
+      <button className="primary-btn vip-save-btn" type="button" onClick={saveVipProgram} disabled={saving}>
+        <Save size={17} />
+        {saving ? "儲存中..." : "儲存 VIP 設定"}
+      </button>
+    </section>
+  );
+}
+
 function AdminRoomRecordsPanel({ cards, records, profile }) {
   const [roomFilter, setRoomFilter] = useState("all");
   const [roundFilter, setRoundFilter] = useState("all");
@@ -2565,6 +2913,7 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
         cardCategory: getCardCategory(card),
         cardImageUrl: card.imageUrl || "",
         cardValue,
+        cardConversionValue: Number(card.conversionValue ?? card.tokenValue ?? 0),
         collectionStatus,
         assignedAt: serverTimestamp(),
         assignedBy: profile.uid,
@@ -2740,6 +3089,7 @@ function CreateCardForm({ cards, profile }) {
   const [newCard, setNewCard] = useState({
     name: "",
     tokenValue: 10,
+    conversionValue: 8,
     category: CARD_CATEGORIES[0],
     imageFile: null,
   });
@@ -2780,6 +3130,7 @@ function CreateCardForm({ cards, profile }) {
       String(draft.name || "") !== String(card.name || "") ||
       String(draft.category || CARD_CATEGORIES[0]) !== getCardCategory(card) ||
       Number(draft.tokenValue || 0) !== Number(card.tokenValue || 0) ||
+      Number(draft.conversionValue || 0) !== Number(card.conversionValue ?? card.tokenValue ?? 0) ||
       Boolean(draft.imageFile)
     );
   }
@@ -2911,6 +3262,10 @@ function CreateCardForm({ cards, profile }) {
       alert("卡牌代幣價值最少為 1。");
       return;
     }
+    if (Number(newCard.conversionValue) < 0) {
+      alert("兌換價值不能少於 0。");
+      return;
+    }
     if (!window.confirm(`確認新增「${cleanName}」到卡牌庫？`)) {
       return;
     }
@@ -2926,13 +3281,14 @@ function CreateCardForm({ cards, profile }) {
         name: cleanName,
         category: newCard.category || CARD_CATEGORIES[0],
         tokenValue: Number(newCard.tokenValue),
+        conversionValue: Number(newCard.conversionValue),
         imageUrl,
         imageMode: "compressed-data-url",
         createdBy: profile.uid,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      setNewCard({ name: "", tokenValue: 10, category: CARD_CATEGORIES[0], imageFile: null });
+      setNewCard({ name: "", tokenValue: 10, conversionValue: 8, category: CARD_CATEGORIES[0], imageFile: null });
     } catch (error) {
       showSafeError(error);
     } finally {
@@ -2944,6 +3300,7 @@ function CreateCardForm({ cards, profile }) {
     const draft = cardDrafts[card.id] || {};
     const cleanName = String(draft.name || "").trim();
     const cleanTokenValue = Number(draft.tokenValue || 0);
+    const cleanConversionValue = Number(draft.conversionValue || 0);
 
     if (!cleanName) {
       alert("請輸入卡牌名稱。");
@@ -2951,6 +3308,10 @@ function CreateCardForm({ cards, profile }) {
     }
     if (cleanTokenValue < 1) {
       alert("卡牌代幣價值最少為 1。");
+      return;
+    }
+    if (cleanConversionValue < 0) {
+      alert("兌換價值不能少於 0。");
       return;
     }
     if (!cardDraftChanged(card, draft)) {
@@ -2967,6 +3328,7 @@ function CreateCardForm({ cards, profile }) {
         name: cleanName,
         category: draft.category || CARD_CATEGORIES[0],
         tokenValue: cleanTokenValue,
+        conversionValue: cleanConversionValue,
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
       };
@@ -2984,6 +3346,7 @@ function CreateCardForm({ cards, profile }) {
         cardName: cleanName,
         cardCategory: draft.category || CARD_CATEGORIES[0],
         cardValue: cleanTokenValue,
+        cardConversionValue: cleanConversionValue,
         ...(updates.imageUrl ? { cardImageUrl: updates.imageUrl } : {}),
         updatedAt: serverTimestamp(),
       });
@@ -2998,6 +3361,7 @@ function CreateCardForm({ cards, profile }) {
           name: cleanName,
           category: draft.category || CARD_CATEGORIES[0],
           tokenValue: cleanTokenValue,
+          conversionValue: cleanConversionValue,
           imageFile: null,
         },
       }));
@@ -3014,9 +3378,10 @@ function CreateCardForm({ cards, profile }) {
       name: card.name || "",
       category: getCardCategory(card),
       tokenValue: Number(card.tokenValue || 0),
+      conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 0),
       imageUrl: card.imageUrl || "",
     }));
-    const csvText = createCsvText(["id", "name", "category", "tokenValue", "imageUrl"], csvRows);
+    const csvText = createCsvText(["id", "name", "category", "tokenValue", "conversionValue", "imageUrl"], csvRows);
     downloadTextFile(`draw-card-library-${new Date().toISOString().slice(0, 10)}.csv`, csvText);
   }
 
@@ -3065,6 +3430,7 @@ function CreateCardForm({ cards, profile }) {
           name: row.name,
           category: row.category || CARD_CATEGORIES[0],
           tokenValue: row.tokenValue,
+          conversionValue: row.conversionValue,
           updatedAt: serverTimestamp(),
           updatedBy: profile.uid,
         };
@@ -3082,6 +3448,7 @@ function CreateCardForm({ cards, profile }) {
             cardName: row.name,
             cardCategory: row.category || CARD_CATEGORIES[0],
             cardValue: row.tokenValue,
+            cardConversionValue: row.conversionValue,
             ...(row.imageUrl ? { cardImageUrl: row.imageUrl } : {}),
             updatedAt: serverTimestamp(),
           });
@@ -3089,6 +3456,7 @@ function CreateCardForm({ cards, profile }) {
             name: row.name,
             category: row.category || CARD_CATEGORIES[0],
             tokenValue: row.tokenValue,
+            conversionValue: row.conversionValue,
           });
           updatedCount += 1;
         } else {
@@ -3096,6 +3464,7 @@ function CreateCardForm({ cards, profile }) {
             name: row.name,
             category: row.category || CARD_CATEGORIES[0],
             tokenValue: row.tokenValue,
+            conversionValue: row.conversionValue,
             imageUrl: row.imageUrl || "",
             imageMode: row.imageUrl
               ? row.imageUrl.startsWith("data:image/")
@@ -3126,7 +3495,7 @@ function CreateCardForm({ cards, profile }) {
         <div>
           <p className="eyebrow">Card library</p>
           <h1>卡牌庫管理</h1>
-          <p className="muted">像表格一樣新增或修改圖片、名稱和代幣價值。</p>
+          <p className="muted">可分開設定抽卡價值及玩家把卡牌轉回代幣的價值。</p>
         </div>
       </div>
 
@@ -3147,7 +3516,7 @@ function CreateCardForm({ cards, profile }) {
           />
         </label>
         <span className="form-note">
-          CSV 欄位：id、name、category、tokenValue、imageUrl。保留 id 可更新現有卡；留空 id 會新增。
+          CSV 欄位：id、name、category、tokenValue、conversionValue、imageUrl。保留 id 可更新現有卡；留空 id 會新增。
         </span>
       </div>
 
@@ -3212,7 +3581,8 @@ function CreateCardForm({ cards, profile }) {
           <span>圖片</span>
           <span>卡牌名稱</span>
           <span>分類</span>
-          <span>代幣價值</span>
+          <span>抽卡價值</span>
+          <span>兌換價值</span>
           <span>操作</span>
         </div>
 
@@ -3246,6 +3616,14 @@ function CreateCardForm({ cards, profile }) {
             onChange={(event) => updateNewCard("tokenValue", event.target.value)}
             required
           />
+          <input
+            type="number"
+            min="0"
+            value={newCard.conversionValue}
+            onChange={(event) => updateNewCard("conversionValue", event.target.value)}
+            aria-label="卡牌兌換代幣價值"
+            required
+          />
           <button className="primary-btn" type="submit" disabled={creating}>
             <Save size={18} />
             {creating ? "建立中..." : "新增"}
@@ -3259,6 +3637,7 @@ function CreateCardForm({ cards, profile }) {
                 name: card.name || "",
                 category: getCardCategory(card),
                 tokenValue: Number(card.tokenValue || 10),
+                conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 10),
                 imageFile: null,
               };
               const changed = cardDraftChanged(card, draft);
@@ -3289,6 +3668,13 @@ function CreateCardForm({ cards, profile }) {
                     min="1"
                     value={draft.tokenValue}
                     onChange={(event) => updateDraft(card.id, "tokenValue", event.target.value)}
+                  />
+                  <input
+                    type="number"
+                    min="0"
+                    value={draft.conversionValue}
+                    onChange={(event) => updateDraft(card.id, "conversionValue", event.target.value)}
+                    aria-label={`${card.name} 兌換代幣價值`}
                   />
                   <div className="card-row-actions">
                     <button
@@ -3842,6 +4228,9 @@ function buildRoomCards(room, cards) {
 
   const libraryCards = new Map(cards.map((card) => [String(card.id), card]));
   const legacyCards = new Map(normalizeRoomCards(room.poolCards).map((card) => [card.id, card]));
+  const roomValues = room?.poolCardValues && typeof room.poolCardValues === "object"
+    ? room.poolCardValues
+    : {};
   const cardIds = getRoomPoolIds(room);
 
   return cardIds
@@ -3849,6 +4238,10 @@ function buildRoomCards(room, cards) {
       const libraryCard = libraryCards.get(cardId);
       const legacyCard = legacyCards.get(cardId);
       const source = libraryCard || legacyCard;
+      const roomValue = Number(roomValues[cardId] || 0);
+      const tokenValue = roomValue > 0
+        ? roomValue
+        : Number(source?.tokenValue || legacyCard?.tokenValue || 0);
 
       if (!source) return null;
 
@@ -3857,7 +4250,7 @@ function buildRoomCards(room, cards) {
         name: String(source.name || legacyCard?.name || ""),
         category: getCardCategory(source || legacyCard),
         imageUrl: String(libraryCard?.imageUrl || legacyCard?.imageUrl || ""),
-        tokenValue: Number(source.tokenValue || legacyCard?.tokenValue || 0),
+        tokenValue,
       };
     })
     .filter((card) => card?.id && card.name);
@@ -3985,6 +4378,9 @@ function normalizeImportedCardRows(rows) {
       const name = String(row.name || row.cardname || row["card name"] || "").trim();
       const category = normalizeCardCategory(row.category || row.cat || row.type || "");
       const tokenValue = Number(row.tokenvalue || row.price || row.token || row.value || 0);
+      const conversionValue = Number(
+        row.conversionvalue || row.refundvalue || row.convertvalue || tokenValue,
+      );
       const imageUrl = String(row.imageurl || row.image || row.photo || row.picture || "").trim();
 
       return {
@@ -3992,6 +4388,7 @@ function normalizeImportedCardRows(rows) {
         name,
         category,
         tokenValue,
+        conversionValue: Math.max(0, conversionValue),
         imageUrl,
       };
     })
@@ -4003,6 +4400,7 @@ function createCardDraft(card) {
     name: card.name || "",
     category: getCardCategory(card),
     tokenValue: Number(card.tokenValue || 10),
+    conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 10),
     imageFile: null,
   };
 }
@@ -4033,6 +4431,79 @@ function useTokenPackages() {
   }, []);
 
   return packages;
+}
+
+function useVipProgram() {
+  const [tiers, setTiers] = useState(DEFAULT_VIP_TIERS);
+
+  useEffect(() => {
+    const settingsRef = doc(db, "settings", "vipProgram");
+    const stopSettings = onSnapshot(
+      settingsRef,
+      (snapshot) => {
+        setTiers(normalizeVipTiers(snapshot.exists() ? snapshot.data().tiers : []));
+      },
+      (error) => {
+        console.error("VIP settings listener failed.", error);
+        setTiers(DEFAULT_VIP_TIERS);
+      },
+    );
+    return stopSettings;
+  }, []);
+
+  return tiers;
+}
+
+function normalizeVipTiers(tiers) {
+  const source = Array.isArray(tiers) && tiers.length ? tiers : DEFAULT_VIP_TIERS;
+  return source
+    .map((tier, index) => ({
+      id: String(tier?.id || `vip${index}`).trim().toLowerCase(),
+      name: String(tier?.name || `VIP${index}`).trim().slice(0, 20),
+      threshold: Math.max(1, Math.round(Number(tier?.threshold || 0))),
+      rewardCardId: String(tier?.rewardCardId || ""),
+      rewardName: String(tier?.rewardName || "待設定升級獎勵").trim().slice(0, 120),
+      rewardImageUrl: String(tier?.rewardImageUrl || ""),
+      rewardConversionValue: Math.max(0, Math.round(Number(tier?.rewardConversionValue || 0))),
+    }))
+    .filter((tier) => tier.id && tier.threshold > 0)
+    .sort((left, right) => left.threshold - right.threshold)
+    .slice(0, 8);
+}
+
+function getVipState(tiers, deposit) {
+  const normalizedTiers = normalizeVipTiers(tiers);
+  const total = Math.max(0, Number(deposit || 0));
+  let currentIndex = -1;
+  normalizedTiers.forEach((tier, index) => {
+    if (total >= tier.threshold) currentIndex = index;
+  });
+  const nextIndex = currentIndex + 1;
+  const nextTier = normalizedTiers[nextIndex] || null;
+
+  return {
+    currentIndex,
+    currentTier: normalizedTiers[currentIndex] || null,
+    nextTier,
+    remaining: nextTier ? Math.max(0, nextTier.threshold - total) : 0,
+    tiers: normalizedTiers.map((tier, index) => {
+      const previousThreshold = index === 0 ? 0 : normalizedTiers[index - 1].threshold;
+      const distance = Math.max(1, tier.threshold - previousThreshold);
+      const progress = Math.max(0, Math.min(100, ((total - previousThreshold) / distance) * 100));
+      return {
+        ...tier,
+        done: total >= tier.threshold,
+        active: index === nextIndex,
+        progress,
+      };
+    }),
+  };
+}
+
+function getTokenBonusRate(tokenPackage) {
+  const baseTokens = Number(tokenPackage?.hkd || 0) * 2;
+  if (!baseTokens) return 0;
+  return Math.max(0, Math.round(((Number(tokenPackage?.tokens || 0) - baseTokens) / baseTokens) * 100));
 }
 
 function useCardCategories(cards = []) {
@@ -4122,6 +4593,9 @@ function getCardCategories(cards, availableCategories = CARD_CATEGORIES) {
 }
 
 function getCardConversionRefund(record) {
+  if (record.cardConversionValue !== undefined && record.cardConversionValue !== null) {
+    return Math.max(0, Math.floor(Number(record.cardConversionValue || 0)));
+  }
   return Math.floor(Number(record.cardValue || record.tokenCost || 0) * CONVERSION_RATE);
 }
 
@@ -4154,6 +4628,14 @@ function toRoundId(roundNumber) {
 function getDefaultRoomRound(room) {
   if (!room) return "";
   return room.status === "live" ? toRoundId(getRoomCurrentRound(room)) : "round-001";
+}
+
+function isRoundBuyingBlocked(room, roundId = toRoundId(getRoomCurrentRound(room))) {
+  if (!room) return false;
+  const blockedRounds = Array.isArray(room.buyingBlockedRounds)
+    ? room.buyingBlockedRounds.map((item) => String(item || ""))
+    : [];
+  return blockedRounds.includes(roundId) || room.buyingBlockedRound === roundId;
 }
 
 function getRoomRoundOptions(room) {

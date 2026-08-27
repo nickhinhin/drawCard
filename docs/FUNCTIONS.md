@@ -25,11 +25,25 @@
 
 ## TokenRequest
 
-- Section: apply for tokens.
+- Section: VIP progress, package selection, bonus breakdown, and token application.
 - Calls: `uploadBytes`, `getDownloadURL`, `addDoc`, `onSnapshot`.
-- Input: token amount and proof image file.
+- Input: package/custom HKD amount, token amount, proof image, approved request history, and VIP settings.
 - Output: image saved under `token-proofs/{uid}/...` and a `tokenRequests` document with `status: "pending"`.
-- Calls other functions: `RequestList` renders the request status list.
+- Calls other functions: `VipProgramPanel`, `useVipProgram`, `getVipState`, and `RequestList`.
+
+## VipProgramPanel
+
+- Section: player VIP progress on the token request page.
+- Calls: `getVipState`.
+- Input: cumulative approved HKD deposits and ordered VIP tiers.
+- Output: current level, next-level amount, progress rails, and the reward card for each level.
+
+## VipProgramManager
+
+- Section: admin VIP configuration tab.
+- Calls: `setDoc` and `normalizeVipTiers`.
+- Input: VIP deposit thresholds plus one reward card selected from the card library for each tier.
+- Output: saves `settings/vipProgram`; new tiers are used immediately by the player page and token approval flow.
 
 ## DrawCard
 
@@ -63,9 +77,9 @@
 ## ChatRoom
 
 - Section: selected room chat.
-- Calls: `onSnapshot`, `addDoc`.
+- Calls: `onSnapshot`, `runTransaction`.
 - Input: current room ID and current user profile.
-- Output: reads and writes messages under `draws/{roomId}/messages`, so every room has separate chat.
+- Output: reads and writes room messages while atomically enforcing the three-second user cooldown.
 
 ## MyRecords
 
@@ -79,14 +93,14 @@
 - Section: player collection.
 - Calls: `onSnapshot`.
 - Input: current user UID.
-- Output: assigned cards filtered from the user's `drawRecords`, including card image and pending/shipping/shipped status.
+- Output: assigned and VIP reward cards, including image, delivery status, and the exact admin-configured token conversion value.
 
 ## AdminPanel
 
 - Section: admin tools.
 - Calls: `onSnapshot`, `runTransaction`, `updateDoc`, `deleteRoomWithChildren`.
 - Input: admin profile.
-- Output: token request approvals, token balance edits through approval transactions, request rejections, room deletion after completion, card library records, and result assignments.
+- Output: token request approvals, VIP deposit/level updates, automatic VIP reward-card records, request rejections, room deletion, card library records, and result assignments.
 - Calls other functions: `RequestList`, `CreateDrawForm`, `CreateCardForm`, `AssignCardsPanel`.
 
 ## CreateDrawForm
@@ -100,8 +114,8 @@
 
 - Section: admin card library.
 - Calls: `addDoc`, `updateDoc`, `updateAssignedRecordsForCard`, `imageFileToCompressedDataUrl`.
-- Input: card name and uploaded card image, or edited card name and optional replacement image.
-- Output: creates or updates one `cards/{id}` document with a compressed image data URL.
+- Input: card name, category, draw value, separate player conversion value, and uploaded/replacement image.
+- Output: creates or updates one `cards/{id}` document and propagates both card value fields to assigned records.
 
 ## AssignCardsPanel
 

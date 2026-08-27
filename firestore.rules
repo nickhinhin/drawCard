@@ -22,6 +22,10 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/draws/$(drawId));
     }
 
+    function cardDoc(cardId) {
+      return get(/databases/$(database)/documents/cards/$(cardId));
+    }
+
     function afterRoundSlotDoc(drawId, roundId, slotId) {
       return getAfter(
         /databases/$(database)/documents/draws/$(drawId)/rounds/$(roundId)/slots/$(slotId)
@@ -108,7 +112,14 @@ service cloud.firestore {
     function isAdminTokenGrant(uid) {
       return isAdmin()
         && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["tokens", "updatedAt", "lastTokenGrantRequestId"])
+          .hasOnly([
+            "tokens",
+            "updatedAt",
+            "lastTokenGrantRequestId",
+            "totalDeposits",
+            "vipLevel",
+            "lastVipRewardTier"
+          ])
         && request.resource.data.lastTokenGrantRequestId is string
         && request.resource.data.lastTokenGrantRequestId.size() > 0
         && request.resource.data.lastTokenGrantRequestId.size() <= 128
@@ -122,7 +133,12 @@ service cloud.firestore {
         && getAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.status == "approved"
         && getAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.reviewedBy == request.auth.uid
         && request.resource.data.tokens == resource.data.tokens
-          + get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount;
+          + get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount
+        && request.resource.data.totalDeposits is number
+        && request.resource.data.totalDeposits >= 0
+        && request.resource.data.vipLevel is int
+        && request.resource.data.vipLevel >= -1
+        && request.resource.data.vipLevel <= 7;
     }
 
     function chatCooldownPassed() {
@@ -160,12 +176,12 @@ service cloud.firestore {
         && getAfter(
           /databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)
         ).data.tokenRefund == request.resource.data.lastConversionAmount
-        && request.resource.data.lastConversionAmount <= cardConversionAmountForRecord(
+        && request.resource.data.lastConversionAmount <= cardConversionRefundForRecord(
           getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)).data
-        ) * 0.8
-        && request.resource.data.lastConversionAmount > cardConversionAmountForRecord(
+        )
+        && request.resource.data.lastConversionAmount > cardConversionRefundForRecord(
           getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)).data
-        ) * 0.8 - 1
+        ) - 1
         && request.resource.data.tokens == resource.data.tokens + request.resource.data.lastConversionAmount;
     }
 
@@ -191,13 +207,33 @@ service cloud.firestore {
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == userDoc(request.auth.uid).data.username
         && request.resource.data.number == resource.data.number
-        && request.resource.data.round == resource.data.round
+        && (!("round" in resource.data) || request.resource.data.round == resource.data.round)
         && request.resource.data.round == drawDoc(drawId).data.round
+        && (
+          !("buyingBlockedRounds" in drawDoc(drawId).data)
+          || !(request.resource.data.round in drawDoc(drawId).data.buyingBlockedRounds)
+        )
+        && (
+          !("buyingBlockedRound" in drawDoc(drawId).data)
+          || drawDoc(drawId).data.buyingBlockedRound != request.resource.data.round
+        )
         && request.resource.data.targetCardId in drawDoc(drawId).data.poolCardIds
         && request.resource.data.targetCardName is string
         && request.resource.data.targetCardImageUrl is string
+        && request.resource.data.tokenCost is number
+        && request.resource.data.tokenCost > 0
         && request.resource.data.targetCardValue == request.resource.data.tokenCost
-        && request.resource.data.tokenCost == drawDoc(drawId).data.poolCardValues[request.resource.data.targetCardId]
+        && (
+          (
+            "poolCardValues" in drawDoc(drawId).data
+            && request.resource.data.tokenCost == drawDoc(drawId).data.poolCardValues[request.resource.data.targetCardId]
+          )
+          || (
+            exists(/databases/$(database)/documents/cards/$(request.resource.data.targetCardId))
+            && cardDoc(request.resource.data.targetCardId).data.tokenValue is number
+            && request.resource.data.tokenCost == cardDoc(request.resource.data.targetCardId).data.tokenValue
+          )
+        )
         && userDoc(request.auth.uid).data.tokens >= request.resource.data.tokenCost
         && afterUserDoc(request.auth.uid).data.tokens ==
           userDoc(request.auth.uid).data.tokens - request.resource.data.tokenCost;
@@ -247,13 +283,25 @@ service cloud.firestore {
         : recordData.tokenCost;
     }
 
+    function cardConversionRefundForRecord(recordData) {
+      return recordData.cardConversionValue is number
+        ? recordData.cardConversionValue
+        : cardConversionAmountForRecord(recordData) * 0.8;
+    }
+
+    function cardConversionRefund() {
+      return resource.data.cardConversionValue is number
+        ? resource.data.cardConversionValue
+        : cardConversionAmount() * 0.8;
+    }
+
     function isCardTokenConversion() {
       return signedIn()
         && resource.data.uid == request.auth.uid
         && resource.data.cardId is string
         && cardConversionAmount() is number
         && cardConversionAmount() > 0
-        && resource.data.convertedToTokens != true
+        && (!("convertedToTokens" in resource.data) || resource.data.convertedToTokens != true)
         && request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly([
             "collectionStatus",
@@ -264,8 +312,9 @@ service cloud.firestore {
           ])
         && request.resource.data.collectionStatus == "converted"
         && request.resource.data.convertedToTokens == true
-        && request.resource.data.tokenRefund <= cardConversionAmount() * 0.8
-        && request.resource.data.tokenRefund > cardConversionAmount() * 0.8 - 1
+        && request.resource.data.tokenRefund is number
+        && request.resource.data.tokenRefund <= cardConversionRefund()
+        && request.resource.data.tokenRefund > cardConversionRefund() - 1
         && request.resource.data.convertedAt == request.time
         && request.resource.data.updatedAt == request.time;
     }
@@ -436,7 +485,7 @@ service cloud.firestore {
 
     match /drawRecords/{recordId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
-      allow create: if isMatchingRoundDrawRecord();
+      allow create: if isAdmin() || isMatchingRoundDrawRecord();
       allow update: if isAdmin() || isCardTokenConversion();
       allow delete: if false;
     }
