@@ -1,7 +1,10 @@
 import { initializeApp } from "firebase/app";
-import { getAnalytics, isSupported } from "firebase/analytics";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
+import {
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+} from "firebase/firestore";
 import { getStorage } from "firebase/storage";
 
 const firebaseConfig = {
@@ -27,9 +30,34 @@ const firebaseConfig = {
 export const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
-export const db = getFirestore(app);
+// Keep confirmed Firestore data across reloads so repeat visits can render immediately.
+export const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({
+    tabManager: persistentMultipleTabManager(),
+  }),
+});
 export const storage = getStorage(app);
 
-export const analyticsPromise = isSupported()
-  .then((supported) => (supported ? getAnalytics(app) : null))
-  .catch(() => null);
+export const analyticsPromise = new Promise((resolve) => {
+  if (import.meta.env.VITE_APP_VARIANT === "beta") {
+    resolve(null);
+    return;
+  }
+
+  const loadAnalytics = () => {
+    import("firebase/analytics")
+      .then(async ({ getAnalytics, isSupported }) => (
+        (await isSupported()) ? getAnalytics(app) : null
+      ))
+      .then(resolve)
+      .catch(() => resolve(null));
+  };
+
+  window.setTimeout(() => {
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(loadAnalytics, { timeout: 5000 });
+    } else {
+      loadAnalytics();
+    }
+  }, 8000);
+});

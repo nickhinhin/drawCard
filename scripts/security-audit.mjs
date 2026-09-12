@@ -1,0 +1,237 @@
+import { initializeApp, deleteApp } from "firebase/app";
+import { getAuth, connectAuthEmulator, createUserWithEmailAndPassword } from "firebase/auth";
+import { getFirestore, connectFirestoreEmulator, doc, setDoc, updateDoc, getDoc, writeBatch, serverTimestamp, terminate } from "firebase/firestore";
+
+// This harness deliberately refuses live projects and non-local endpoints.
+const projectId = "demo-drawcard-security";
+const firestoreHost = process.env.FIRESTORE_EMULATOR_HOST;
+const authHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
+if (firestoreHost !== "127.0.0.1:18080" || authHost !== "127.0.0.1:19099") {
+  throw new Error("Run only through firebase.security-audit.json with local emulators.");
+}
+const app = initializeApp({ projectId, apiKey: "local-security-audit" });
+const auth = getAuth(app);
+const db = getFirestore(app);
+connectAuthEmulator(auth, `http://${authHost}`, { disableWarnings: true });
+connectFirestoreEmulator(db, "127.0.0.1", 18080);
+const { user } = await createUserWithEmailAndPassword(auth, "attacker@example.test", "local-only-password");
+const uid = user.uid;
+const username = "AuditPlayer";
+const userRef = doc(db, "users", uid);
+
+function encode(value) {
+  if (typeof value === "string") return { stringValue: value };
+  if (typeof value === "boolean") return { booleanValue: value };
+  if (typeof value === "number") return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
+  if (Array.isArray(value)) return { arrayValue: { values: value.map(encode) } };
+  return { mapValue: { fields: Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encode(item)])) } };
+}
+
+async function seed(documents) {
+  const response = await fetch(`http://${firestoreHost}/v1/projects/${projectId}/databases/(default)/documents:commit`, {
+    method: "POST",
+    headers: { Authorization: "Bearer owner", "Content-Type": "application/json" },
+    body: JSON.stringify({ writes: Object.entries(documents).map(([path, data]) => ({ update: {
+      name: `projects/${projectId}/databases/(default)/documents/${path}`,
+      fields: encode(data).mapValue.fields,
+    } })) }),
+  });
+  if (!response.ok) throw new Error(await response.text());
+}
+
+const baseUser = { uid, username, email: user.email, role: "user", tokens: 100 };
+const baseSlot = { number: 1, round: "round-001", status: "available" };
+const purchasedSlot = { ...baseSlot, status: "locked", uid, username, tokenCost: 10, targetCardId: "card", targetCardName: "Card", targetCardImageUrl: "", targetCardValue: 10 };
+const baseRecord = { uid, username, drawId: "room", round: "round-001", number: 1, tokenCost: 10, targetCardId: "card", targetCardValue: 10 };
+const assignedRecord = { ...baseRecord, cardId: "card", cardValue: 100, cardConversionValue: 80, collectionStatus: "pending" };
+const results = [];
+let purchaseSequence = 0;
+
+// Construct the same reciprocal purchase writes used by the app.
+function purchaseBatch({ secondSlot = false, cost = 10, extraRecord = {} } = {}) {
+  const batch = writeBatch(db);
+  const recordId = `purchase-${++purchaseSequence}`;
+  const slot = { ...purchasedSlot, tokenCost: cost, targetCardValue: cost, purchaseRecordId: recordId, updatedAt: serverTimestamp() };
+  batch.update(userRef, { tokens: 100 - cost, lastPurchaseRecordId: recordId, updatedAt: serverTimestamp() });
+  batch.update(doc(db, "draws/room/rounds/round-001/slots/1"), slot);
+  batch.set(doc(db, "drawRecords", recordId), { ...baseRecord, slotId: "1", tokenCost: cost, targetCardValue: cost, targetCardName: "Card", targetCardImageUrl: "", createdAt: serverTimestamp(), ...extraRecord });
+  if (secondSlot) batch.update(doc(db, "draws/room/rounds/round-001/slots/2"), { ...slot, number: 2 });
+  return batch;
+}
+
+// Convert an award and its owner's balance atomically.
+function conversionBatch(recordId = "assigned", refund = 80) {
+  const batch = writeBatch(db);
+  batch.update(doc(db, "drawRecords", recordId), { collectionStatus: "converted", convertedToTokens: true, tokenRefund: refund, convertedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+  batch.update(userRef, { tokens: 100 + refund, lastConversionRecordId: recordId, lastConversionAmount: refund, updatedAt: serverTimestamp() });
+  return batch;
+}
+
+const validRequest = {
+  uid, username, email: user.email, amount: 525, hkdAmount: 500, exchangeRate: 1.05, packageType: "preset",
+  proofMode: "storage", proofPath: `token-proofs/${uid}/receipt.jpg`, proofFileName: "receipt.jpg",
+  proofUrl: `https://firebasestorage.googleapis.com/v0/b/demo/o/token-proofs%2F${uid}%2Freceipt.jpg`,
+  promoCode: "", status: "pending", adminNote: "",
+};
+
+
+async function check(name, shouldAllow, action) {
+  await seed({
+    [`users/${uid}`]: baseUser,
+    "usernames/auditplayer": { uid, username },
+    "users/victim": { uid: "victim", role: "user", tokens: 500, email: "victim@example.test" },
+    "draws/room": { status: "live", round: "round-001", poolCardIds: ["card"], poolCardValues: { card: 10 } },
+    "cards/card": { name: "Card", tokenValue: 10 },
+    "draws/room/rounds/round-001/slots/1": baseSlot,
+    "draws/room/rounds/round-001/slots/2": { ...baseSlot, number: 2 },
+    "drawRecords/assigned": assignedRecord,
+  });
+  let allowed = false;
+  try { await action(); allowed = true; } catch (error) {
+    if (error.code !== "permission-denied") throw error;
+  }
+  const result = { name, expected: shouldAllow ? "ALLOW" : "DENY", actual: allowed ? "ALLOW" : "DENY", safe: allowed === shouldAllow };
+  results.push(result);
+  console.log(JSON.stringify(result));
+}
+
+try {
+  await check("Normal single-slot purchase", true, async () => {
+    await purchaseBatch().commit();
+  });
+  await check("Self-promote to administrator", false, () => updateDoc(userRef, { role: "admin" }));
+  await check("Direct balance increase", false, () => updateDoc(userRef, { tokens: 1000000 }));
+  await check("Read another user's profile", false, () => getDoc(doc(db, "users/victim")));
+  await check("Modify platform payment settings", false, () => setDoc(doc(db, "settings/payment"), { fpsIdentifier: "attacker" }));
+  await check("Refund replay without changing the already-converted record", false, async () => {
+    await seed({ "drawRecords/assigned": { ...assignedRecord, convertedToTokens: true, tokenRefund: 80, collectionStatus: "converted" } });
+    for (const tokens of [180, 260]) {
+      await updateDoc(userRef, { tokens, lastConversionRecordId: "assigned", lastConversionAmount: 80, updatedAt: serverTimestamp() });
+    }
+  });
+  await check("Convert an already-shipped card", false, async () => {
+    await seed({ "drawRecords/assigned": { ...assignedRecord, collectionStatus: "shipped" } });
+    const batch = writeBatch(db);
+    batch.update(doc(db, "drawRecords/assigned"), { collectionStatus: "converted", convertedToTokens: true, tokenRefund: 80, convertedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+    batch.update(userRef, { tokens: 180, lastConversionRecordId: "assigned", lastConversionAmount: 80, updatedAt: serverTimestamp() });
+    await batch.commit();
+  });
+  await check("Buy two slots but debit only one slot price", false, async () => {
+    await purchaseBatch({ secondSlot: true }).commit();
+  });
+  await check("Forge awarded card and refund value on a new purchase record", false, async () => {
+    await seed({ "draws/room/rounds/round-001/slots/1": purchasedSlot });
+    const batch = writeBatch(db);
+    batch.set(doc(db, "drawRecords/forged"), { ...baseRecord, cardId: "fake-award", cardValue: 999999, cardConversionValue: 999999, convertedToTokens: true, tokenRefund: 999999 });
+    batch.update(userRef, { tokens: 1000099, lastConversionRecordId: "forged", lastConversionAmount: 999999 });
+    await batch.commit();
+  });
+  await check("Use cheaper global card price instead of room price", false, async () => {
+    await seed({ "draws/room": { status: "live", round: "round-001", poolCardIds: ["card"], poolCardValues: { card: 100 } } });
+    await purchaseBatch().commit();
+  });
+  await check("Submit inflated tokens with an unvalidated promotion code", false, () => setDoc(doc(db, "tokenRequests/inflated"), {
+    uid, username, email: user.email, amount: 1000000, hkdAmount: 500, exchangeRate: 2000, packageType: "preset",
+    proofMode: "promo", proofPath: "", proofFileName: "", proofUrl: "", promoCode: "NOT-A-REAL-CODE",
+    status: "pending", adminNote: "", createdAt: serverTimestamp(),
+  }));
+  await check("Valid pending award conversion", true, () => conversionBatch().commit());
+  await check("Historical pending award conversion", true, async () => {
+    const legacy = { ...assignedRecord };
+    delete legacy.collectionStatus;
+    delete legacy.cardConversionValue;
+    await seed({ "drawRecords/assigned": legacy });
+    await conversionBatch().commit();
+  });
+  await check("Conversion without crediting owner", false, () => updateDoc(doc(db, "drawRecords/assigned"), {
+    collectionStatus: "converted", convertedToTokens: true, tokenRefund: 80, convertedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+  }));
+  await check("Refund exceeds authoritative award", false, () => conversionBatch("assigned", 81).commit());
+  await check("Shipping requested prevents refund", false, async () => {
+    await seed({ "drawRecords/assigned": { ...assignedRecord, shippingRequested: true } });
+    await conversionBatch().commit();
+  });
+  await check("Shipping status prevents refund", false, async () => {
+    await seed({ "drawRecords/assigned": { ...assignedRecord, collectionStatus: "shipping" } });
+    await conversionBatch().commit();
+  });
+  await check("Two awards cannot share one credit", false, async () => {
+    await seed({ "drawRecords/second": assignedRecord });
+    const batch = conversionBatch();
+    batch.update(doc(db, "drawRecords/second"), { collectionStatus: "converted", convertedToTokens: true, tokenRefund: 80, convertedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+    await batch.commit();
+  });
+  await check("Pending card shipping", true, () => updateDoc(doc(db, "drawRecords/assigned"), {
+    collectionStatus: "shipping", shippingRequested: true, shippingRecipient: "Test", shippingPhone: "12345678",
+    shippingMethod: "sf-door", shippingAddress: "Test address", shippingNote: "", shippingRequestedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+  }));
+  await check("Converted card cannot ship", false, async () => {
+    await conversionBatch().commit();
+    await updateDoc(doc(db, "drawRecords/assigned"), { collectionStatus: "shipping", shippingRequested: true, shippingRecipient: "Test", shippingPhone: "12345678", shippingMethod: "sf-door", shippingAddress: "Test address", shippingNote: "", shippingRequestedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+  });
+  await check("Award fields rejected even on a real purchase", false, () => purchaseBatch({ extraRecord: { cardId: "fake", cardConversionValue: 999999 } }).commit());
+  await check("Full authoritative room price", true, async () => {
+    await seed({ "draws/room": { status: "live", round: "round-001", poolCardIds: ["card"], poolCardValues: { card: 100 } } });
+    await purchaseBatch({ cost: 100 }).commit();
+  });
+  await check("Global price fallback when room price absent", true, async () => {
+    await seed({ "draws/room": { status: "live", round: "round-001", poolCardIds: ["card"], poolCardValues: {} } });
+    await purchaseBatch().commit();
+  });
+  await check("Standalone debit rejected", false, () => updateDoc(userRef, { tokens: 90, updatedAt: serverTimestamp() }));
+  await check("Duplicate record for purchased slot rejected", false, async () => {
+    await purchaseBatch().commit();
+    await setDoc(doc(db, "drawRecords/duplicate"), { ...baseRecord, slotId: "1", targetCardName: "Card", targetCardImageUrl: "", createdAt: serverTimestamp() });
+  });
+  await check("Valid paid package application", true, () => setDoc(doc(db, "tokenRequests/valid"), { ...validRequest, createdAt: serverTimestamp() }));
+  await check("Valid custom payment application", true, () => setDoc(doc(db, "tokenRequests/custom"), { ...validRequest, packageType: "custom", hkdAmount: 2000, amount: 2100, createdAt: serverTimestamp() }));
+  await check("Inflated application with receipt rejected", false, () => setDoc(doc(db, "tokenRequests/receipt-inflated"), { ...validRequest, amount: 1000000, exchangeRate: 2000, createdAt: serverTimestamp() }));
+  await check("Code-only application awaits manual review", true, () => setDoc(doc(db, "tokenRequests/promo-only"), { ...validRequest, proofMode: "promo", proofUrl: "", proofPath: "", proofFileName: "", promoCode: "FAKE", createdAt: serverTimestamp() }));
+  await check("Admin assignment still allowed", true, async () => {
+    await seed({ [`users/${uid}`]: { ...baseUser, role: "admin" } });
+    await setDoc(doc(db, "drawRecords/admin-award"), assignedRecord);
+  });
+  // Exercise approval through rules as an administrator, including old forged requests.
+  for (const [label, amount, verified, allow] of [
+    ["Valid verified admin approval", 525, 500, true],
+    ["Legacy inflated request approval rejected", 1000000, 500, false],
+    ["Mismatched verified deposit rejected", 525, 1000, false],
+  ]) {
+    await check(label, allow, async () => {
+      await seed({ [`users/${uid}`]: { ...baseUser, role: "admin" }, "tokenRequests/review": { ...validRequest, amount, exchangeRate: amount / 500 } });
+      const batch = writeBatch(db);
+      batch.update(doc(db, "tokenRequests/review"), { status: "approved", verifiedHkdAmount: verified, reviewedAt: serverTimestamp(), reviewedBy: uid });
+      batch.update(userRef, { tokens: 100 + amount, lastTokenGrantRequestId: "review", totalDeposits: 500, vipLevel: 0, updatedAt: serverTimestamp() });
+      await batch.commit();
+    });
+  }
+  for (const [label, admin, reviewed, deposit, allow] of [
+    ["Admin can approve manually reviewed promotion", true, true, 0, true],
+    ["User cannot approve own promotion", false, true, 0, false],
+    ["Promotion requires explicit admin review", true, false, 0, false],
+    ["Promotion cannot inflate VIP deposits", true, true, 500, false],
+  ]) {
+    await check(label, allow, async () => {
+      await seed({ [`users/${uid}`]: { ...baseUser, role: admin ? "admin" : "user" }, "tokenRequests/promo-review": { ...validRequest, proofMode: "promo", promoCode: "MANUAL", proofUrl: "", proofPath: "", proofFileName: "" } });
+      const batch = writeBatch(db);
+      batch.update(doc(db, "tokenRequests/promo-review"), { status: "approved", promoReviewed: reviewed, verifiedHkdAmount: deposit, reviewedAt: serverTimestamp(), reviewedBy: uid });
+      batch.update(userRef, { tokens: 625, lastTokenGrantRequestId: "promo-review", totalDeposits: deposit, vipLevel: -1, updatedAt: serverTimestamp() });
+      await batch.commit();
+    });
+  }
+  await check("Configured package price accepted", true, async () => {
+    await seed({ "settings/tokenPackages": { rateVersion: 2, packages: [{ hkd: 500, tokens: 600 }] } });
+    await setDoc(doc(db, "tokenRequests/configured"), { ...validRequest, amount: 600, exchangeRate: 1.2, createdAt: serverTimestamp() });
+  });
+  await check("Old default cannot override configured price", false, () => setDoc(doc(db, "tokenRequests/stale"), { ...validRequest, createdAt: serverTimestamp() }));
+  await check("Legacy package rates remain compatible", true, async () => {
+    await seed({ "settings/tokenPackages": { packages: [{ hkd: 500, tokens: 1050 }] } });
+    await setDoc(doc(db, "tokenRequests/legacy-rate"), { ...validRequest, createdAt: serverTimestamp() });
+  });
+  await check("Profile edits remain allowed", true, () => updateDoc(userRef, { displayName: "Audit Player", updatedAt: serverTimestamp() }));
+  if (results.some((item) => !item.safe)) process.exitCode = 1;
+  console.log(`SUMMARY ${results.filter((item) => item.safe).length}/${results.length} passed; ${results.filter((item) => !item.safe).length} unsafe actions accepted.`);
+} finally {
+  await terminate(db);
+  await deleteApp(app);
+}

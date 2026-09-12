@@ -153,8 +153,24 @@ async function run() {
           fields: {
             status: string("live"),
             round: string("round-001"),
+            shareMode: string("1/5"),
+            roundShareModes: map({ "round-001": string("1/5") }),
             poolCardIds: array(["card-1"]),
             poolCardValues: map({ "card-1": integer(10) }),
+          },
+        },
+      },
+      {
+        update: {
+          name: `projects/${projectId}/databases/(default)/documents/cards/card-1`,
+          fields: {
+            name: string("Permission audit card"),
+            tokenValue: integer(10),
+            modePrices: map({
+              half: integer(10),
+              fifth: integer(25),
+              tenth: integer(50),
+            }),
           },
         },
       },
@@ -178,14 +194,19 @@ async function run() {
     await runTransaction(firestore, async (transaction) => {
       const userSnap = await transaction.get(userRef);
       const slotSnap = await transaction.get(slotRef);
-      const tokenCost = 10;
+      const tokenCost = 25;
 
       if (!slotSnap.exists() || slotSnap.data()?.status !== "available") {
         throw new Error("Test slot is not available.");
       }
 
-      transaction.update(userRef, { tokens: userSnap.data().tokens - tokenCost, updatedAt: serverTimestamp() });
+      transaction.update(userRef, {
+        tokens: userSnap.data().tokens - tokenCost,
+        lastPurchaseRecordId: recordRef.id,
+        updatedAt: serverTimestamp(),
+      });
       transaction.update(slotRef, {
+        purchaseRecordId: recordRef.id,
         status: "locked",
         uid,
         username,
@@ -194,10 +215,12 @@ async function run() {
         targetCardName: "Permission audit card",
         targetCardImageUrl: "",
         targetCardValue: tokenCost,
+        shareMode: "1/5",
         round: "round-001",
         updatedAt: serverTimestamp(),
       });
       transaction.set(recordRef, {
+        slotId: "1",
         uid,
         username,
         drawId,
@@ -212,6 +235,7 @@ async function run() {
         targetCardName: "Permission audit card",
         targetCardImageUrl: "",
         targetCardValue: tokenCost,
+        shareMode: "1/5",
         createdAt: serverTimestamp(),
       });
     });
@@ -228,10 +252,11 @@ async function run() {
       uid,
       username,
       email,
-      amount: 1000,
+      amount: 525,
       hkdAmount: 500,
-      exchangeRate: 2,
+      exchangeRate: 1.05,
       packageType: "preset",
+      fpsIdentifier: "0000000",
       fpsName: "Permission audit",
       proofMode: "storage",
       proofPath: `token-proofs/${uid}/proof.jpg`,

@@ -30,5 +30,11 @@ service firebase.storage {
         && isSafeImage();
       allow update, delete: if false;
     }
+
+    match /draw-results/{drawId}/{fileName} {
+      allow read: if signedIn();
+      allow create, update: if isAdmin() && isSafeImage();
+      allow delete: if isAdmin();
+    }
   }
 }

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://drawcard-26e01-beta.web.app/sitemap.xml

@@ -26,10 +26,31 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/cards/$(cardId));
     }
 
-    function afterRoundSlotDoc(drawId, roundId, slotId) {
-      return getAfter(
-        /databases/$(database)/documents/draws/$(drawId)/rounds/$(roundId)/slots/$(slotId)
+    // Resolve the odds configured for the exact round being purchased.
+    function drawRoundShareMode(drawId, roundId) {
+      let draw = drawDoc(drawId).data;
+      return draw.get("roundShareModes", {}).get(
+        roundId,
+        draw.get("shareMode", "1/2")
       );
+    }
+
+    // Cards created before per-odds pricing keep using their original token value.
+    function cardPriceForShareMode(cardId, shareMode) {
+      let card = cardDoc(cardId).data;
+      let prices = card.get("modePrices", {});
+      return shareMode == "1/10"
+        ? prices.get("tenth", card.get("tokenValue", 0))
+        : shareMode == "1/5"
+          ? prices.get("fifth", card.get("tokenValue", 0))
+          : prices.get("half", card.get("tokenValue", 0));
+    }
+
+    // Older cards without this field stay available in all three modes.
+    function cardAllowsShareMode(cardId, shareMode) {
+      let card = cardDoc(cardId).data;
+      return !("allowedShareModes" in card)
+        || shareMode in card.allowedShareModes;
     }
 
     function tokenRequestPath(requestId) {
@@ -83,7 +104,16 @@ service cloud.firestore {
     function isProfileEdit(uid) {
       return isOwner(uid)
         && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["username", "displayName", "photoURL", "updatedAt"])
+          .hasOnly([
+            "username",
+            "displayName",
+            "photoURL",
+            "phoneNumber",
+            "referralCode",
+            "ageConfirmed",
+            "ageConfirmedAt",
+            "updatedAt"
+          ])
         && (
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(["username"])
           || willOwnUsername(request.resource.data.username)
@@ -97,48 +127,55 @@ service cloud.firestore {
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(["photoURL"])
           || (request.resource.data.photoURL is string
             && request.resource.data.photoURL.size() <= 500)
+        )
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["phoneNumber"])
+          || (request.resource.data.phoneNumber is string
+            && request.resource.data.phoneNumber.size() <= 24)
+        )
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["referralCode"])
+          || (request.resource.data.referralCode is string
+            && request.resource.data.referralCode.size() <= 40)
+        )
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["ageConfirmed"])
+          || request.resource.data.ageConfirmed == true
         );
     }
 
+    // Bind each debit to one newly created purchase record and its exact slot.
     function isTokenSpend(uid) {
+      let recordId = request.resource.data.lastPurchaseRecordId;
+      let path = /databases/$(database)/documents/drawRecords/$(recordId);
+      let purchase = getAfter(path).data;
       return isOwner(uid)
         && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["tokens", "updatedAt"])
+          .hasOnly(["tokens", "updatedAt", "lastPurchaseRecordId"])
+        && !exists(path)
+        && purchase.uid == uid
         && request.resource.data.tokens is number
         && request.resource.data.tokens >= 0
-        && request.resource.data.tokens <= resource.data.tokens;
+        && request.resource.data.tokens == resource.data.tokens - purchase.tokenCost
+        && request.resource.data.updatedAt == request.time;
     }
 
+    // Approval and credit are reciprocal, single-use transitions after manual review.
     function isAdminTokenGrant(uid) {
+      let requestId = request.resource.data.lastTokenGrantRequestId;
+      let before = get(tokenRequestPath(requestId)).data;
+      let after = getAfter(tokenRequestPath(requestId)).data;
       return isAdmin()
-        && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly([
-            "tokens",
-            "updatedAt",
-            "lastTokenGrantRequestId",
-            "totalDeposits",
-            "vipLevel",
-            "lastVipRewardTier"
-          ])
-        && request.resource.data.lastTokenGrantRequestId is string
-        && request.resource.data.lastTokenGrantRequestId.size() > 0
-        && request.resource.data.lastTokenGrantRequestId.size() <= 128
-        && exists(tokenRequestPath(request.resource.data.lastTokenGrantRequestId))
-        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.status == "pending"
-        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.uid == uid
-        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount is int
-        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount > 0
-        && get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount <= 1000000
-        && existsAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId))
-        && getAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.status == "approved"
-        && getAfter(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.reviewedBy == request.auth.uid
-        && request.resource.data.tokens == resource.data.tokens
-          + get(tokenRequestPath(request.resource.data.lastTokenGrantRequestId)).data.amount
-        && request.resource.data.totalDeposits is number
-        && request.resource.data.totalDeposits >= 0
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "tokens", "updatedAt", "lastTokenGrantRequestId", "totalDeposits", "vipLevel", "lastVipRewardTier"
+        ])
+        && before.status == "pending" && before.uid == uid
+        && validTokenPricing(before) && validManualReview(before, after)
+        && after.status == "approved" && after.reviewedBy == request.auth.uid
+        && request.resource.data.tokens == resource.data.tokens + before.amount
+        && request.resource.data.totalDeposits == resource.data.get("totalDeposits", 0) + after.verifiedHkdAmount
         && request.resource.data.vipLevel is int
-        && request.resource.data.vipLevel >= -1
-        && request.resource.data.vipLevel <= 7;
+        && request.resource.data.vipLevel >= -1 && request.resource.data.vipLevel <= 7;
     }
 
     function chatCooldownPassed() {
@@ -155,43 +192,47 @@ service cloud.firestore {
         && chatCooldownPassed();
     }
 
+    // A refund requires an existing eligible award to transition in this commit.
     function isCardConversionUserEdit(uid) {
+      let recordId = request.resource.data.lastConversionRecordId;
+      let path = /databases/$(database)/documents/drawRecords/$(recordId);
+      let before = get(path).data;
+      let after = getAfter(path).data;
       return isOwner(uid)
         && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly([
-            "tokens",
-            "updatedAt",
-            "lastConversionRecordId",
-            "lastConversionAmount"
-          ])
-        && request.resource.data.lastConversionRecordId is string
-        && request.resource.data.lastConversionAmount is number
+          .hasOnly(["tokens", "updatedAt", "lastConversionRecordId", "lastConversionAmount"])
+        && conversionEligible(before)
+        && before.uid == uid
+        && after.uid == uid
+        && after.convertedToTokens == true
+        && after.collectionStatus == "converted"
+        && after.convertedAt == request.time
+        && after.updatedAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.lastConversionAmount == after.tokenRefund
         && request.resource.data.lastConversionAmount > 0
-        && getAfter(
-          /databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)
-        ).data.uid == uid
-        && getAfter(
-          /databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)
-        ).data.convertedToTokens == true
-        && getAfter(
-          /databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)
-        ).data.tokenRefund == request.resource.data.lastConversionAmount
-        && request.resource.data.lastConversionAmount <= cardConversionRefundForRecord(
-          getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)).data
-        )
-        && request.resource.data.lastConversionAmount > cardConversionRefundForRecord(
-          getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.lastConversionRecordId)).data
-        ) - 1
+        && request.resource.data.lastConversionAmount == math.floor(cardConversionRefundForRecord(before))
         && request.resource.data.tokens == resource.data.tokens + request.resource.data.lastConversionAmount;
     }
 
-    function isValidSlotPurchase(drawId) {
+    // Historical awards without a status are pending, unless shipping has started.
+    function conversionEligible(record) {
+      return record.get("collectionStatus", "pending") == "pending"
+        && record.get("convertedToTokens", false) == false
+        && record.get("shippingRequested", false) == false
+        && !("shippedAt" in record)
+        && !("shippingRequestedAt" in record)
+        && record.cardId is string;
+    }
+
+    function isValidSlotPurchase(drawId, roundId, slotId) {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
         && drawDoc(drawId).data.status == "live"
         && request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly([
             "status",
+            "purchaseRecordId",
             "uid",
             "username",
             "tokenCost",
@@ -199,16 +240,25 @@ service cloud.firestore {
             "targetCardName",
             "targetCardImageUrl",
             "targetCardValue",
+            "shareMode",
             "round",
             "updatedAt"
           ])
+        && request.resource.data.purchaseRecordId == afterUserDoc(request.auth.uid).data.lastPurchaseRecordId
+        && !exists(/databases/$(database)/documents/drawRecords/$(request.resource.data.purchaseRecordId))
+        && getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.purchaseRecordId)).data.drawId == drawId
+        && getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.purchaseRecordId)).data.round == roundId
+        && getAfter(/databases/$(database)/documents/drawRecords/$(request.resource.data.purchaseRecordId)).data.slotId == slotId
+        && request.resource.data.round == roundId
         && resource.data.status == "available"
         && request.resource.data.status == "locked"
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == userDoc(request.auth.uid).data.username
         && request.resource.data.number == resource.data.number
         && (!("round" in resource.data) || request.resource.data.round == resource.data.round)
-        && request.resource.data.round == drawDoc(drawId).data.round
+        && get(
+          /databases/$(database)/documents/draws/$(drawId)/rounds/$(roundId)
+        ).data.roundNumber >= drawDoc(drawId).data.currentRound
         && (
           !("buyingBlockedRounds" in drawDoc(drawId).data)
           || !(request.resource.data.round in drawDoc(drawId).data.buyingBlockedRounds)
@@ -220,18 +270,26 @@ service cloud.firestore {
         && request.resource.data.targetCardId in drawDoc(drawId).data.poolCardIds
         && request.resource.data.targetCardName is string
         && request.resource.data.targetCardImageUrl is string
+        && request.resource.data.shareMode in ["1/2", "1/5", "1/10"]
+        && request.resource.data.shareMode == drawRoundShareMode(drawId, roundId)
+        && exists(/databases/$(database)/documents/cards/$(request.resource.data.targetCardId))
+        && cardAllowsShareMode(request.resource.data.targetCardId, request.resource.data.shareMode)
         && request.resource.data.tokenCost is number
         && request.resource.data.tokenCost > 0
         && request.resource.data.targetCardValue == request.resource.data.tokenCost
         && (
           (
-            "poolCardValues" in drawDoc(drawId).data
+            request.resource.data.shareMode == "1/2"
+            && "poolCardValues" in drawDoc(drawId).data
+            && request.resource.data.targetCardId in drawDoc(drawId).data.poolCardValues
             && request.resource.data.tokenCost == drawDoc(drawId).data.poolCardValues[request.resource.data.targetCardId]
           )
           || (
             exists(/databases/$(database)/documents/cards/$(request.resource.data.targetCardId))
-            && cardDoc(request.resource.data.targetCardId).data.tokenValue is number
-            && request.resource.data.tokenCost == cardDoc(request.resource.data.targetCardId).data.tokenValue
+            && request.resource.data.tokenCost == cardPriceForShareMode(
+              request.resource.data.targetCardId,
+              request.resource.data.shareMode
+            )
           )
         )
         && userDoc(request.auth.uid).data.tokens >= request.resource.data.tokenCost
@@ -239,66 +297,67 @@ service cloud.firestore {
           userDoc(request.auth.uid).data.tokens - request.resource.data.tokenCost;
     }
 
-    function isMatchingRoundDrawRecord() {
+    // Players may create only purchase metadata, never award or fulfillment fields.
+    function isMatchingRoundDrawRecord(recordId) {
+      let data = request.resource.data;
+      let path = /databases/$(database)/documents/draws/$(data.drawId)/rounds/$(data.round)/slots/$(data.slotId);
+      let slot = getAfter(path).data;
       return signedIn()
-        && ownsUsername(userDoc(request.auth.uid).data.username)
-        && request.resource.data.uid == request.auth.uid
-        && request.resource.data.round is string
-        && afterRoundSlotDoc(
-          request.resource.data.drawId,
-          request.resource.data.round,
-          request.resource.data.number
-        ).data.uid == request.auth.uid
-        && afterRoundSlotDoc(
-          request.resource.data.drawId,
-          request.resource.data.round,
-          request.resource.data.number
-        ).data.username == request.resource.data.username
-        && afterRoundSlotDoc(
-          request.resource.data.drawId,
-          request.resource.data.round,
-          request.resource.data.number
-        ).data.tokenCost == request.resource.data.tokenCost
-        && afterRoundSlotDoc(
-          request.resource.data.drawId,
-          request.resource.data.round,
-          request.resource.data.number
-        ).data.targetCardId == request.resource.data.targetCardId
-        && afterRoundSlotDoc(
-          request.resource.data.drawId,
-          request.resource.data.round,
-          request.resource.data.number
-        ).data.targetCardValue == request.resource.data.targetCardValue;
+        && data.keys().hasOnly([
+          "uid", "username", "drawId", "drawTitle", "roomSlug", "roomLink",
+          "round", "roundSort", "slotId", "number", "tokenCost", "targetCardId",
+          "targetCardName", "targetCardImageUrl", "targetCardValue", "shareMode", "createdAt"
+        ])
+        && data.uid == request.auth.uid
+        && data.slotId is string
+        && get(path).data.status == "available"
+        && slot.status == "locked"
+        && slot.purchaseRecordId == recordId
+        && afterUserDoc(request.auth.uid).data.lastPurchaseRecordId == recordId
+        && slot.uid == data.uid
+        && slot.username == data.username
+        && slot.number == data.number
+        && slot.tokenCost == data.tokenCost
+        && slot.targetCardId == data.targetCardId
+        && slot.targetCardName == data.targetCardName
+        && slot.targetCardImageUrl == data.targetCardImageUrl
+        && slot.targetCardValue == data.targetCardValue
+        && slot.shareMode == data.shareMode
+        && data.createdAt == request.time;
     }
 
     function cardConversionAmount() {
-      return resource.data.cardValue is number
+      return resource.data.get("cardValue", null) is number
         ? resource.data.cardValue
         : resource.data.tokenCost;
     }
 
     function cardConversionAmountForRecord(recordData) {
-      return recordData.cardValue is number
+      return recordData.get("cardValue", null) is number
         ? recordData.cardValue
         : recordData.tokenCost;
     }
 
     function cardConversionRefundForRecord(recordData) {
-      return recordData.cardConversionValue is number
+      return recordData.get("cardConversionValue", null) is number
         ? recordData.cardConversionValue
         : cardConversionAmountForRecord(recordData) * 0.8;
     }
 
     function cardConversionRefund() {
-      return resource.data.cardConversionValue is number
+      return resource.data.get("cardConversionValue", null) is number
         ? resource.data.cardConversionValue
         : cardConversionAmount() * 0.8;
     }
 
-    function isCardTokenConversion() {
+    function isCardTokenConversion(recordId) {
       return signedIn()
         && resource.data.uid == request.auth.uid
         && resource.data.cardId is string
+        && conversionEligible(resource.data)
+        && afterUserDoc(request.auth.uid).data.lastConversionRecordId == recordId
+        && afterUserDoc(request.auth.uid).data.lastConversionAmount == request.resource.data.tokenRefund
+        && afterUserDoc(request.auth.uid).data.tokens == userDoc(request.auth.uid).data.tokens + request.resource.data.tokenRefund
         && cardConversionAmount() is number
         && cardConversionAmount() > 0
         && (!("convertedToTokens" in resource.data) || resource.data.convertedToTokens != true)
@@ -316,6 +375,43 @@ service cloud.firestore {
         && request.resource.data.tokenRefund <= cardConversionRefund()
         && request.resource.data.tokenRefund > cardConversionRefund() - 1
         && request.resource.data.convertedAt == request.time
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    function isShippingRequest() {
+      return signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.cardId is string
+        && (!("convertedToTokens" in resource.data) || resource.data.convertedToTokens != true)
+        && (resource.data.collectionStatus == "pending" || !("collectionStatus" in resource.data))
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            "collectionStatus",
+            "shippingRequested",
+            "shippingRecipient",
+            "shippingPhone",
+            "shippingMethod",
+            "shippingAddress",
+            "shippingNote",
+            "shippingRequestedAt",
+            "updatedAt"
+          ])
+        && request.resource.data.collectionStatus == "shipping"
+        && request.resource.data.shippingRequested == true
+        && request.resource.data.shippingRecipient is string
+        && request.resource.data.shippingRecipient.size() > 0
+        && request.resource.data.shippingRecipient.size() <= 80
+        && request.resource.data.shippingPhone is string
+        && request.resource.data.shippingPhone.size() > 0
+        && request.resource.data.shippingPhone.size() <= 30
+        && request.resource.data.shippingMethod is string
+        && request.resource.data.shippingMethod in ["sf-door", "sf-pickup"]
+        && request.resource.data.shippingAddress is string
+        && request.resource.data.shippingAddress.size() > 0
+        && request.resource.data.shippingAddress.size() <= 500
+        && request.resource.data.shippingNote is string
+        && request.resource.data.shippingNote.size() <= 500
+        && request.resource.data.shippingRequestedAt == request.time
         && request.resource.data.updatedAt == request.time;
     }
 
@@ -353,33 +449,105 @@ service cloud.firestore {
         );
     }
 
+    // Preset rates come from protected settings; custom rates use the published tiers.
+    function validTokenPricing(data) {
+      let settingsPath = /databases/$(database)/documents/settings/tokenPackages;
+      let settings = exists(settingsPath) ? get(settingsPath).data : {};
+      let packages = settings.get("packages", [
+        {"hkd": 500, "tokens": 525}, {"hkd": 1000, "tokens": 1050},
+        {"hkd": 3000, "tokens": 3240}, {"hkd": 10000, "tokens": 11000},
+        {"hkd": 30000, "tokens": 35100}
+      ]);
+      let rateVersion = settings.get("rateVersion", exists(settingsPath) ? 1 : 2);
+      let rate = data.hkdAmount >= 30000 ? 1.17 : data.hkdAmount >= 10000 ? 1.1 : data.hkdAmount >= 3000 ? 1.08 : 1.05;
+      return data.hkdAmount is int && data.hkdAmount >= 500 && data.hkdAmount <= 1000000
+        && data.amount is int && data.amount > 0 && data.amount <= 1000000
+        && data.exchangeRate == float(data.amount) / data.hkdAmount
+        && (
+          (data.packageType == "custom" && data.amount == math.floor(data.hkdAmount * rate))
+          || (data.packageType == "preset" && (
+            (rateVersion >= 2 && {"hkd": data.hkdAmount, "tokens": data.amount} in packages)
+            || (rateVersion < 2 && (
+              {"hkd": data.hkdAmount, "tokens": data.amount * 2} in packages
+              || {"hkd": data.hkdAmount, "tokens": data.amount * 2 - 1} in packages
+            ))
+          ))
+        );
+    }
+
+    // A reviewed promotion is a grant, not a bank deposit or VIP deposit credit.
+    function validManualReview(before, after) {
+      return (before.proofMode == "storage" && after.verifiedHkdAmount == before.hkdAmount)
+        || (before.proofMode == "promo" && before.promoCode is string
+          && before.promoCode.size() > 0 && after.promoReviewed == true
+          && after.verifiedHkdAmount == 0);
+    }
+
     function isValidTokenRequestCreate() {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
+        && request.resource.data.keys().hasOnly([
+          "uid",
+          "username",
+          "email",
+          "amount",
+          "hkdAmount",
+          "exchangeRate",
+          "packageType",
+          "fpsIdentifier",
+          "fpsName",
+          "proofMode",
+          "proofPath",
+          "proofFileName",
+          "proofUrl",
+          "status",
+          "adminNote",
+          "promoCode",
+          "createdAt"
+        ])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == userDoc(request.auth.uid).data.username
         && request.resource.data.email == userDoc(request.auth.uid).data.email
+        && validTokenPricing(request.resource.data)
         && request.resource.data.amount is int
         && request.resource.data.amount > 0
         && request.resource.data.amount <= 1000000
         && request.resource.data.status == "pending"
         && request.resource.data.adminNote == ""
-        && request.resource.data.proofMode == "storage"
-        && request.resource.data.proofPath is string
-        && request.resource.data.proofPath.matches("token-proofs/" + request.auth.uid + "/[^/]+")
-        && request.resource.data.proofFileName is string
-        && request.resource.data.proofFileName.size() > 0
-        && request.resource.data.proofFileName.size() <= 200
-        && isSafeStorageProofUrl(request.resource.data.proofUrl, request.auth.uid)
+        && request.resource.data.promoCode is string
+        && request.resource.data.promoCode.size() <= 80
+        && (
+          (
+            request.resource.data.proofMode == "storage"
+            && request.resource.data.proofPath is string
+            && request.resource.data.proofPath.matches("token-proofs/" + request.auth.uid + "/[^/]+")
+            && request.resource.data.proofFileName is string
+            && request.resource.data.proofFileName.size() > 0
+            && request.resource.data.proofFileName.size() <= 200
+            && isSafeStorageProofUrl(request.resource.data.proofUrl, request.auth.uid)
+          )
+          || (request.resource.data.proofMode == "promo"
+            && request.resource.data.promoCode.size() > 0
+            && request.resource.data.proofPath == ""
+            && request.resource.data.proofFileName == ""
+            && request.resource.data.proofUrl == "")
+        )
         && request.resource.data.createdAt == request.time;
     }
 
-    function isValidTokenRequestReview() {
+    function isValidTokenRequestReview(requestId) {
       return isAdmin()
         && resource.data.status == "pending"
         && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["status", "adminNote", "reviewedAt", "reviewedBy"])
+          .hasOnly(["status", "adminNote", "reviewedAt", "reviewedBy", "verifiedHkdAmount", "promoReviewed"])
         && request.resource.data.status in ["approved", "rejected"]
+        && request.resource.data.reviewedAt == request.time
+        && (request.resource.data.status == "rejected" || (
+          validTokenPricing(resource.data)
+          && validManualReview(resource.data, request.resource.data)
+          && afterUserDoc(resource.data.uid).data.lastTokenGrantRequestId == requestId
+          && afterUserDoc(resource.data.uid).data.tokens == userDoc(resource.data.uid).data.tokens + resource.data.amount
+        ))
         && request.resource.data.reviewedBy == request.auth.uid
         && request.resource.data.adminNote is string
         && request.resource.data.adminNote.size() <= 500;
@@ -390,7 +558,8 @@ service cloud.firestore {
       allow create: if isOwner(uid)
         && request.resource.data.keys().hasOnly([
           "uid", "email", "displayName", "photoURL", "username", "tokens",
-          "role", "createdAt", "updatedAt"
+          "role", "phoneNumber", "referralCode", "ageConfirmed", "ageConfirmedAt",
+          "createdAt", "updatedAt"
         ])
         && request.resource.data.uid == request.auth.uid
         && (
@@ -403,11 +572,25 @@ service cloud.firestore {
         && request.resource.data.displayName is string
         && request.resource.data.displayName.size() <= 80
         && request.resource.data.photoURL is string
-        && request.resource.data.photoURL.size() <= 500;
+        && request.resource.data.photoURL.size() <= 500
+        && (
+          !("phoneNumber" in request.resource.data)
+          || (request.resource.data.phoneNumber is string
+            && request.resource.data.phoneNumber.size() <= 24)
+        )
+        && (
+          !("referralCode" in request.resource.data)
+          || (request.resource.data.referralCode is string
+            && request.resource.data.referralCode.size() <= 40)
+        )
+        && (
+          !("ageConfirmed" in request.resource.data)
+          || request.resource.data.ageConfirmed == true
+        );
       allow update: if isProfileEdit(uid) ||
-        isTokenSpend(uid) ||
-        isCardConversionUserEdit(uid) ||
-        isAdminTokenGrant(uid) ||
+        ("lastPurchaseRecordId" in request.resource.data && isTokenSpend(uid)) ||
+        ("lastConversionRecordId" in request.resource.data && isCardConversionUserEdit(uid)) ||
+        ("lastTokenGrantRequestId" in request.resource.data && isAdminTokenGrant(uid)) ||
         isChatRateLimitUpdate(uid);
     }
 
@@ -437,7 +620,7 @@ service cloud.firestore {
     match /tokenRequests/{requestId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
       allow create: if isValidTokenRequestCreate();
-      allow update: if isValidTokenRequestReview();
+      allow update: if isValidTokenRequestReview(requestId);
       allow delete: if false;
     }
 
@@ -449,7 +632,7 @@ service cloud.firestore {
       match /slots/{slotId} {
         allow read: if true;
         allow create: if isAdmin();
-        allow update: if isAdmin() || isValidSlotPurchase(drawId);
+        allow update: if false;
         allow delete: if isAdmin();
       }
 
@@ -460,7 +643,7 @@ service cloud.firestore {
         match /slots/{slotId} {
           allow read: if true;
           allow create: if isAdmin();
-          allow update: if isAdmin() || isValidSlotPurchase(drawId);
+          allow update: if isAdmin() || isValidSlotPurchase(drawId, roundId, slotId);
           allow delete: if isAdmin();
         }
       }
@@ -469,13 +652,19 @@ service cloud.firestore {
         allow read: if signedIn();
         allow create: if isValidRoomMessage(drawId)
           && request.resource.data.source == "draw";
-        allow update: if false;
+        allow update: if isAdmin();
         allow delete: if isAdmin();
       }
     }
 
     match /cards/{cardId} {
       allow read: if signedIn();
+      allow create, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /publicCardShowcase/{cardId} {
+      allow read: if true;
       allow create, update: if isAdmin();
       allow delete: if false;
     }
@@ -488,8 +677,8 @@ service cloud.firestore {
 
     match /drawRecords/{recordId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
-      allow create: if isAdmin() || isMatchingRoundDrawRecord();
-      allow update: if isAdmin() || isCardTokenConversion();
+      allow create: if isAdmin() || isMatchingRoundDrawRecord(recordId);
+      allow update: if isAdmin() || isCardTokenConversion(recordId) || isShippingRequest();
       allow delete: if false;
     }
   }

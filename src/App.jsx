@@ -1,23 +1,29 @@
 import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   BadgeDollarSign,
+  Bell,
   Boxes,
   Check,
+  ChevronLeft,
   Clock3,
   Copy,
-  CopyCheck,
   Crown,
   Download,
   ExternalLink,
+  Maximize2,
+  Minimize2,
   FileImage,
   Gavel,
   Gift,
+  Hash,
+  Headphones,
   ImagePlus,
   ListChecks,
   LogIn,
   LogOut,
   Lock,
   Menu,
+  MessageCircle,
   Package,
   Pencil,
   Plus,
@@ -28,14 +34,22 @@ import {
   Smartphone,
   Send,
   Ticket,
+  Trash2,
+  Truck,
   Upload,
   UserRoundPlus,
+  Volume2,
+  VolumeX,
   X,
+  Zap,
 } from "lucide-react";
 import {
   RecaptchaVerifier,
+  browserLocalPersistence,
+  browserSessionPersistence,
   getRedirectResult,
   onAuthStateChanged,
+  setPersistence,
   signInWithPopup,
   signInWithPhoneNumber,
   signInWithRedirect,
@@ -46,6 +60,7 @@ import {
   addDoc,
   collection,
   doc,
+  getDoc,
   getDocs,
   increment,
   limitToLast,
@@ -61,15 +76,18 @@ import {
 } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { auth, db, googleProvider, storage } from "./firebase";
+import { SF_PICKUP_POINTS, SF_PICKUP_POINTS_UPDATED_AT } from "./sfPickupPoints";
 
 const DEFAULT_DRAW = {
   title: "Tonight Live Card Draw",
   slug: "tonight-live-draw",
-  kickUrl: "https://kick.com/",
+  kickUrl: "",
   cardCount: 30,
   tokenCost: 10,
   totalRounds: 1,
   currentRound: 1,
+  shareMode: "1/2",
+  firstRoundAt: "",
   status: "live",
   poolText: "",
   thumbnailUrl: "",
@@ -82,6 +100,13 @@ const CARD_IMAGE_COMPRESSION = {
   minQuality: 0.58,
   targetBytes: 180 * 1024,
 };
+
+const LIVE_SNAPSHOT_OPTIONS = { includeMetadataChanges: true };
+
+// Show useful cached data immediately, but keep loading when the cache is empty until the server confirms it.
+function isSnapshotReady(snapshot) {
+  return !snapshot.metadata.fromCache || !snapshot.empty;
+}
 
 const statusLabels = {
   pending: "待審核",
@@ -97,8 +122,68 @@ const statusLabels = {
 
 const ROUND_BUY_LOCKED_LABEL = "本場已停止購買";
 const collectionStatuses = ["pending", "shipping", "shipped"];
+const betaCollectionStatuses = ["pending", "shipping", "shipped", "converted"];
 const CONVERSION_RATE = 0.8;
 const CHAT_COOLDOWN_MS = 3000;
+const PUBLIC_CARD_SHOWCASE_LIMIT = 12;
+
+function TokenAmount({ value, suffix = "", className = "" }) {
+  return (
+    <span className={`token-amount ${className}`.trim()}>
+      <span className="token-lightning" aria-hidden="true"><Zap size={12} /></span>
+      <span>{formatTokenNumber(value)}</span>
+      {suffix && <span className="token-suffix">{suffix}</span>}
+    </span>
+  );
+}
+
+function getRoomShareMode(room, roundId = "") {
+  const roundValue = roundId && room?.roundShareModes?.[roundId];
+  const value = String(roundValue || room?.shareMode || room?.drawMode || "");
+  if (value.includes("1/10") || value.includes("十分之一")) return "1/10";
+  if (value.includes("1/5") || value.includes("五分之一")) return "1/5";
+  return "1/2";
+}
+
+function getBlindBoxOdds(shareMode) {
+  if (shareMode === "1/10") return { label: "十分之一", heavenRate: 10, hellRate: 90 };
+  if (shareMode === "1/5") return { label: "五份之一", heavenRate: 20, hellRate: 80 };
+  return { label: "二份之一", heavenRate: 50, hellRate: 50 };
+}
+
+const SHARE_MODE_PRICE_KEYS = {
+  "1/2": "half",
+  "1/5": "fifth",
+  "1/10": "tenth",
+};
+const SHARE_MODES = Object.keys(SHARE_MODE_PRICE_KEYS);
+
+// Cards without an explicit setting predate this feature and remain available in every odds mode.
+function getCardAllowedShareModes(card) {
+  if (!Array.isArray(card?.allowedShareModes)) return [...SHARE_MODES];
+  return SHARE_MODES.filter((mode) => card.allowedShareModes.includes(mode));
+}
+
+function cardAllowsShareMode(card, shareMode) {
+  return getCardAllowedShareModes(card).includes(shareMode);
+}
+
+// Return the card price for the room's odds, while keeping old single-price cards compatible.
+function getCardTokenValue(card, shareMode = "1/2") {
+  const key = SHARE_MODE_PRICE_KEYS[shareMode] || SHARE_MODE_PRICE_KEYS["1/2"];
+  const modeValue = Number(card?.modePrices?.[key]);
+  return modeValue > 0 ? modeValue : Number(card?.tokenValue || 0);
+}
+
+// Normalize all three prices so cards created before this feature use their existing price by default.
+function getCardModePrices(card) {
+  const fallback = Math.max(1, Number(card?.tokenValue || 10));
+  return {
+    half: Math.max(1, Number(card?.modePrices?.half || fallback)),
+    fifth: Math.max(1, Number(card?.modePrices?.fifth || fallback)),
+    tenth: Math.max(1, Number(card?.modePrices?.tenth || fallback)),
+  };
+}
 
 function normalizeUsername(value) {
   return String(value || "")
@@ -235,15 +320,152 @@ const ADMIN_SECTIONS = [
   { id: "packages", label: "套餐設定", eyebrow: "Token packages", icon: Ticket },
   { id: "vip", label: "VIP 設定", eyebrow: "VIP program", icon: Crown },
   { id: "records", label: "購買紀錄", eyebrow: "Room records", icon: ListChecks },
+  { id: "shipping", label: "配送需求", eyebrow: "Shipping requests", icon: Truck },
 ];
 
+const BETA_PAYMENT_SECTION = {
+  id: "payment",
+  label: "付款設定",
+  eyebrow: "Payment settings",
+  icon: Copy,
+};
+
+const BETA_DEMO_SESSION_KEY = "livedraw-beta-demo";
+const BETA_DUMMY_PAYMENT_SETTINGS = {
+  fpsIdentifier: "0000000",
+  fpsName: "LiveDraw Demo（測試）",
+  isDummy: true,
+};
+const EMPTY_PAYMENT_SETTINGS = {
+  fpsIdentifier: "",
+  fpsName: "",
+  isDummy: false,
+};
+const BETA_DEMO_PROFILE = {
+  uid: "beta-demo-local",
+  username: "DemoPlayer",
+  displayName: "Demo Player",
+  email: "demo@beta.local",
+  tokens: 25000,
+  role: "user",
+  totalDeposits: 1000,
+  isDemo: true,
+};
+const BETA_DEMO_RECORDS = [
+  {
+    id: "demo-active",
+    uid: BETA_DEMO_PROFILE.uid,
+    drawId: "demo-live-room",
+    drawTitle: "Beta Live Card Draw",
+    roomSlug: "beta-live-card-draw",
+    round: "round-002",
+    number: 17,
+    tokenCost: 1200,
+    targetCardName: "Pikachu VMAX",
+  },
+  {
+    id: "demo-complete",
+    uid: BETA_DEMO_PROFILE.uid,
+    drawId: "demo-complete-room",
+    drawTitle: "Weekend Card Break",
+    roomSlug: "weekend-card-break",
+    round: "round-001",
+    number: 8,
+    tokenCost: 800,
+    targetCardName: "Charizard ex",
+    cardId: "demo-card-charizard",
+    cardName: "Charizard ex",
+  },
+];
+const BETA_DEMO_COLLECTION = [
+  {
+    ...BETA_DEMO_RECORDS[1],
+    id: "demo-card-pending",
+    cardId: "demo-card-charizard",
+    cardName: "Charizard ex",
+    cardValue: 800,
+    collectionStatus: "pending",
+  },
+  {
+    id: "demo-card-shipping",
+    uid: BETA_DEMO_PROFILE.uid,
+    drawTitle: "Sunday Live Draw",
+    roomSlug: "sunday-live-draw",
+    round: "round-003",
+    number: 21,
+    cardId: "demo-card-mew",
+    cardName: "Mew VMAX",
+    cardValue: 650,
+    collectionStatus: "shipping",
+    trackingNumber: "DEMO123456789",
+  },
+  {
+    id: "demo-card-processed",
+    uid: BETA_DEMO_PROFILE.uid,
+    drawTitle: "Friday Night Draw",
+    roomSlug: "friday-night-draw",
+    round: "round-001",
+    number: 5,
+    cardId: "demo-card-lugia",
+    cardName: "Lugia V",
+    cardValue: 500,
+    collectionStatus: "shipped",
+  },
+];
+
+function useBetaDemoCards(enabled) {
+  const [cards, setCards] = useState([]);
+
+  useEffect(() => {
+    if (!enabled) {
+      setCards([]);
+      return undefined;
+    }
+
+    const showcaseQuery = query(
+      collection(db, "publicCardShowcase"),
+      where("active", "==", true),
+    );
+    return onSnapshot(showcaseQuery, (snapshot) => {
+      setCards(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+    });
+  }, [enabled]);
+
+  return cards;
+}
+
+function enrichDemoRecords(records, cards) {
+  const cardsWithImages = cards.filter((card) => card.imageUrl);
+  if (!cardsWithImages.length) return records;
+
+  return records.map((record, index) => {
+    const card = cardsWithImages[index % cardsWithImages.length];
+    return {
+      ...record,
+      targetCardName: card.name || record.targetCardName,
+      targetCardImageUrl: card.imageUrl,
+      ...(record.cardId
+        ? {
+            cardName: card.name || record.cardName,
+            cardImageUrl: card.imageUrl,
+          }
+        : {}),
+    };
+  });
+}
+
 function App() {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const [demoMode, setDemoMode] = useState(
+    () => isBeta && window.sessionStorage.getItem(BETA_DEMO_SESSION_KEY) === "1",
+  );
   const [authUser, setAuthUser] = useState(null);
   const [profile, setProfile] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState("");
   const [signingIn, setSigningIn] = useState(false);
   const [authDialogOpen, setAuthDialogOpen] = useState(false);
+  const googleSignInPendingRef = useRef(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("draw");
   const [usernameConflict, setUsernameConflict] = useState(false);
@@ -307,7 +529,7 @@ function App() {
         role: "user",
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
+      }, { merge: true });
     });
 
     return stopProfile;
@@ -334,10 +556,12 @@ function App() {
   }, [authUser, profile?.username]);
 
   const isAdmin = profile?.role === "admin";
+  const signedIn = Boolean(authUser || demoMode);
+  const activeProfile = demoMode ? BETA_DEMO_PROFILE : profile;
   const needsUsername = Boolean(
-    authUser && profile && (!profile.username || usernameConflict),
+    authUser && !demoMode && profile && (!profile.username || usernameConflict),
   );
-  const isProfileLoading = Boolean(authUser && !profile);
+  const isProfileLoading = Boolean(authUser && !demoMode && !profile);
 
   const tabs = useMemo(
     () => [
@@ -345,12 +569,17 @@ function App() {
       { id: "tokens", label: "申請代幣", icon: BadgeDollarSign },
       { id: "history", label: "我的紀錄", icon: ListChecks },
       { id: "collection", label: "我的卡牌", icon: Boxes },
-      ...(isAdmin ? [{ id: "admin", label: "管理後台", icon: Shield }] : []),
+      ...(isAdmin || (isBeta && !signedIn)
+        ? [{ id: "admin", label: "管理後台", icon: Shield }]
+        : []),
     ],
-    [isAdmin],
+    [isAdmin, isBeta, signedIn],
   );
 
   async function handleLogin() {
+    if (googleSignInPendingRef.current) return;
+
+    googleSignInPendingRef.current = true;
     setAuthError("");
     setSigningIn(true);
     try {
@@ -358,59 +587,100 @@ function App() {
       await signInWithPopup(auth, googleProvider);
       setAuthDialogOpen(false);
     } catch (error) {
-      const popupFallbackCodes = new Set([
+      const productionRedirectCodes = new Set([
         "auth/popup-blocked",
         "auth/popup-closed-by-user",
         "auth/operation-not-supported-in-this-environment",
       ]);
 
-      if (popupFallbackCodes.has(error?.code)) {
+      if (!isBeta && productionRedirectCodes.has(error?.code)) {
         try {
           await signInWithRedirect(auth, googleProvider);
           return;
         } catch (redirectError) {
           setAuthError(getSafeErrorMessage(redirectError, "Google 登入失敗，請再試一次。"));
         }
+      } else if (error?.code === "auth/popup-blocked") {
+        setAuthError("瀏覽器已封鎖 Google 登入視窗，請允許彈出式視窗後再試。");
+      } else if (error?.code === "auth/popup-closed-by-user") {
+        setAuthError("Google 登入視窗已關閉，請再試一次。");
       } else if (error?.code === "auth/cancelled-popup-request") {
         setAuthError("上一個 Google 登入視窗已取消，請再試一次。");
       } else {
         setAuthError(getSafeErrorMessage(error, "Google 登入失敗，請再試一次。"));
       }
-
+    } finally {
+      googleSignInPendingRef.current = false;
       setSigningIn(false);
     }
   }
 
   async function handleLogout() {
+    if (demoMode) {
+      window.sessionStorage.removeItem(BETA_DEMO_SESSION_KEY);
+      setDemoMode(false);
+      setActiveTab("draw");
+      return;
+    }
     await signOut(auth);
     setActiveTab("draw");
   }
 
-  if (!authReady) {
+  function handleDemoLogin() {
+    if (!isBeta) return;
+    window.sessionStorage.setItem(BETA_DEMO_SESSION_KEY, "1");
+    setDemoMode(true);
+    setAuthDialogOpen(false);
+    setActiveTab("draw");
+  }
+
+  function handleBrandHome(event) {
+    event.preventDefault();
+    const homeUrl = `${window.location.origin}${window.location.pathname}`;
+    window.history.pushState({}, "", homeUrl);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    setActiveTab("draw");
+    setMobileOpen(false);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  if (!authReady && !isBeta) {
     return <LoadingScreen />;
   }
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <a className="brand" href="#top" aria-label="Draw Card home">
-          <span className="brand-mark">D!</span>
-          <span>直播抽卡 DRAW GP</span>
+        <a className="brand" href="#top" aria-label="LiveDraw TCG home" onClick={handleBrandHome}>
+          {isBeta ? (
+            <img
+              className="beta-brand-logo"
+              src="/livedraw-logo.svg"
+              alt="LiveDraw TCG"
+              width="430"
+              height="112"
+            />
+          ) : (
+            <>
+              <span className="brand-mark">D!</span>
+              <span>直播抽卡 DRAW GP</span>
+            </>
+          )}
         </a>
 
-        {authUser && (
+        {(signedIn || isBeta) && (
           <button
             className="icon-btn menu-toggle"
             type="button"
             onClick={() => setMobileOpen((open) => !open)}
-            aria-label="Toggle menu"
+            aria-label={mobileOpen ? "關閉選單" : "開啟選單"}
           >
             {mobileOpen ? <X size={20} /> : <Menu size={20} />}
           </button>
         )}
 
         <nav className={mobileOpen ? "nav nav-open" : "nav"}>
-          {authUser &&
+          {(signedIn || isBeta) &&
             tabs.map((tab) => {
               const Icon = tab.icon;
               return (
@@ -431,13 +701,18 @@ function App() {
         </nav>
 
         <div className="auth-actions">
-          {authUser ? (
+          {signedIn ? (
             <>
-              <div className="token-pill">
-                <Ticket size={16} />
-                {profile?.tokens ?? 0}
-              </div>
-              <button className="ghost-btn" type="button" onClick={handleLogout}>
+              {isBeta && (
+                <span className="beta-player-name">
+                  {activeProfile?.username || authUser?.displayName || "玩家"}
+                </span>
+              )}
+              <button className="token-pill token-pill-button" type="button" onClick={() => { setActiveTab("tokens"); setMobileOpen(false); }} aria-label="前往申請代幣">
+                <Zap size={16} />
+                {formatTokenBalance(activeProfile?.tokens)}
+              </button>
+              <button className="ghost-btn" type="button" onClick={handleLogout} aria-label="登出">
                 <LogOut size={17} />
                 <span>登出</span>
               </button>
@@ -455,14 +730,28 @@ function App() {
         </div>
       </header>
 
-      <main id="top" className="main-grid">
-        {!authUser ? (
-          <WelcomePanel
-            authError={authError}
-            onGoogleLogin={handleLogin}
-            onPhoneLogin={() => setAuthDialogOpen(true)}
-            signingIn={signingIn}
-          />
+      <main id="top" className={isBeta ? "main-grid beta-main-grid" : "main-grid"}>
+        {!signedIn ? (
+          isBeta ? (
+            <section className="workspace beta-public-workspace">
+              {activeTab === "draw" ? (
+                <DrawCard profile={null} />
+              ) : (
+                <BetaGuestGate
+                  activeTab={activeTab}
+                  authError={authError}
+                  onLogin={() => setAuthDialogOpen(true)}
+                />
+              )}
+            </section>
+          ) : (
+            <WelcomePanel
+              authError={authError}
+              onGoogleLogin={handleLogin}
+              onPhoneLogin={() => setAuthDialogOpen(true)}
+              signingIn={signingIn}
+            />
+          )
         ) : isProfileLoading ? (
           <LoadingScreen />
         ) : needsUsername ? (
@@ -473,26 +762,166 @@ function App() {
           />
         ) : (
           <>
-            <AccountPanel authUser={authUser} profile={profile} isAdmin={isAdmin} setActiveTab={setActiveTab} />
+            {!isBeta && (
+              <AccountPanel authUser={authUser} profile={profile} isAdmin={isAdmin} setActiveTab={setActiveTab} />
+            )}
             <section className="workspace">
-              {activeTab === "draw" && <DrawCard profile={profile} />}
-              {activeTab === "tokens" && <TokenRequest profile={profile} />}
-              {activeTab === "history" && <MyRecords profile={profile} />}
-              {activeTab === "collection" && <CollectionPage profile={profile} />}
-              {activeTab === "admin" && isAdmin && <AdminPanel profile={profile} />}
+              {activeTab === "draw" && <DrawCard profile={activeProfile} />}
+              {activeTab === "tokens" && <TokenRequest profile={activeProfile} />}
+              {activeTab === "history" && <MyRecords profile={activeProfile} />}
+              {activeTab === "collection" && <CollectionPage profile={activeProfile} />}
+              {activeTab === "admin" && isAdmin && <AdminPanel profile={activeProfile} />}
             </section>
           </>
         )}
       </main>
-      {authDialogOpen && !authUser && (
+      {isBeta && <BetaFooter onNavigate={setActiveTab} />}
+      {authDialogOpen && !signedIn && (
         <AuthDialog
           authError={authError}
+          isBeta={isBeta}
           onClose={() => setAuthDialogOpen(false)}
           onGoogleLogin={handleLogin}
+          onDemoLogin={handleDemoLogin}
           signingIn={signingIn}
         />
       )}
     </div>
+  );
+}
+
+function BetaGuestGate({ activeTab, authError, onLogin }) {
+  const labels = {
+    tokens: "申請代幣",
+    history: "我的紀錄",
+    collection: "我的卡牌",
+    admin: "管理後台",
+  };
+
+  return (
+    <section className="panel beta-guest-gate">
+      <span className="beta-slash-mark" aria-hidden="true" />
+
+      <h1>{labels[activeTab] || "會員專區"}</h1>
+      <p>登入後即可查看個人資料及使用完整功能。</p>
+      {authError && <p className="error-note">{authError}</p>}
+      <button className="primary-btn large" type="button" onClick={onLogin}>
+        <LogIn size={18} />
+        登入 / 註冊
+      </button>
+    </section>
+  );
+}
+
+const FOOTER_PAGES = {
+  company: {
+    title: "公司簡介",
+    eyebrow: "ABOUT LIVEDRAW",
+    body: [
+      "LiveDraw TCG 是專為卡牌收藏家而設的直播抽卡平台，整合直播房間、選卡選號、購買紀錄及配送管理。",
+      "平台以公開流程記錄每次抽卡，讓玩家可以隨時查閱房間、場次、號碼及卡牌處理狀態。",
+    ],
+  },
+  terms: {
+    title: "服務條款",
+    eyebrow: "TERMS OF SERVICE",
+    body: [
+      "使用平台前，請確認帳戶資料正確並已年滿 18 歲。代幣只可用於平台指定服務，不能視作銀行存款或法定貨幣。",
+      "抽卡結果以房間直播及平台紀錄為準。玩家提交配送資料前應再次核對，因資料錯誤引致的延誤需由玩家承擔。",
+    ],
+  },
+  privacy: {
+    title: "隱私條款",
+    eyebrow: "PRIVACY",
+    body: [
+      "平台只會收集登入、交易審核、抽卡紀錄及配送所需資料，並使用 Firebase 服務保存及處理。",
+      "配送資料只用於完成相關申請。請勿在聊天室公開電話、地址或其他敏感資料。",
+    ],
+  },
+  process: {
+    title: "抽盲盒流程",
+    eyebrow: "HOW IT WORKS",
+    body: [
+      "1. 登入帳戶並申請代幣。",
+      "2. 進入直播房間，先選擇想要的卡牌，再選擇場次及未被鎖定的號碼。",
+      "3. 確認付款後號碼才會鎖定；完成開卡後可在「我的紀錄」及「我的卡牌」查看結果。",
+      "4. 可按卡牌狀態申請配送，或把合資格卡牌轉回代幣。",
+    ],
+  },
+  faq: {
+    title: "常見問題",
+    eyebrow: "FAQ",
+    body: [
+      "代幣申請會在管理員核對付款證明後入帳；處理時間會按申請量而不同。",
+      "號碼只有在最後確認購買後才會扣除代幣及鎖定。如同一號碼同時被其他玩家購入，系統會要求重新選擇。",
+      "配送進度及順豐運單號會顯示在「我的卡牌」。",
+    ],
+  },
+  support: {
+    title: "聯絡客服",
+    eyebrow: "SUPPORT",
+    body: [
+      "查詢時請準備帳戶顯示名稱、房間名稱、場次、號碼及相關申請時間，以便客服核對。",
+      "請使用平台官方客服渠道聯絡，切勿向非官方帳戶提供驗證碼、付款資料或配送地址。",
+    ],
+  },
+};
+
+function BetaFooter({ onNavigate }) {
+  const [activePage, setActivePage] = useState("");
+  const page = FOOTER_PAGES[activePage];
+
+  useEffect(() => {
+    function openSupport() {
+      setActivePage("support");
+    }
+
+    window.addEventListener("beta-open-support", openSupport);
+    return () => window.removeEventListener("beta-open-support", openSupport);
+  }, []);
+
+  return (
+    <>
+      <footer className="beta-footer">
+        <div className="beta-footer-cut" />
+        <div className="beta-footer-inner">
+          <div className="beta-footer-brand">
+            <img src="/livedraw-logo.svg" alt="LiveDraw TCG" width="430" height="112" />
+            <p>專為卡牌收藏家而設的直播抽卡平台。</p>
+          </div>
+          <div>
+            <h2>關於平台</h2>
+            <button type="button" onClick={() => setActivePage("company")}>公司簡介</button>
+            <button type="button" onClick={() => setActivePage("terms")}>服務條款</button>
+            <button type="button" onClick={() => setActivePage("privacy")}>隱私條款</button>
+          </div>
+          <div>
+            <h2>買家指南</h2>
+            <button type="button" onClick={() => setActivePage("process")}>抽盲盒流程</button>
+            <button type="button" onClick={() => setActivePage("faq")}>常見問題</button>
+            <button type="button" onClick={() => setActivePage("support")}>聯絡客服</button>
+          </div>
+        </div>
+        <p className="beta-copyright">© 2026 LiveDraw TCG. All rights reserved.</p>
+      </footer>
+      {page && (
+        <div className="modal-backdrop footer-page-backdrop" role="presentation" onMouseDown={() => setActivePage("")}>
+          <section className="modal footer-page-modal" role="dialog" aria-modal="true" aria-labelledby="footer-page-title" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="icon-btn modal-close" type="button" onClick={() => setActivePage("")} aria-label="關閉內容頁"><X size={19} /></button>
+
+            <h2 id="footer-page-title">{page.title}</h2>
+            <div className="footer-page-copy">
+              {page.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
+            </div>
+            {activePage === "process" && (
+              <button className="primary-btn" type="button" onClick={() => { onNavigate("draw"); setActivePage(""); window.scrollTo({ top: 0, behavior: "smooth" }); }}>
+                開始選擇房間
+              </button>
+            )}
+          </section>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -505,11 +934,20 @@ function LoadingScreen() {
   );
 }
 
+function InlineLoading({ label = "資料載入中..." }) {
+  return (
+    <div className="inline-loading" role="status" aria-live="polite">
+      <RefreshCcw className="spin" size={22} aria-hidden="true" />
+      <span>{label}</span>
+    </div>
+  );
+}
+
 function WelcomePanel({ authError, onGoogleLogin, onPhoneLogin, signingIn }) {
   return (
     <section className="welcome">
       <div>
-        <p className="eyebrow">Live stream card draw</p>
+
         <h1>直播抽卡，選號入場，結果即時記錄。</h1>
         <p className="welcome-copy">
           使用手機號碼或 Google 登入後申請代幣，進入直播房間選擇抽卡號碼，所有購買紀錄、結果與配送狀態都會保存在 Firebase。
@@ -540,14 +978,21 @@ function WelcomePanel({ authError, onGoogleLogin, onPhoneLogin, signingIn }) {
   );
 }
 
-function AuthDialog({ authError, onClose, onGoogleLogin, signingIn }) {
+function AuthDialog({ authError, isBeta = false, onClose, onDemoLogin, onGoogleLogin, signingIn }) {
+  const [accountAction, setAccountAction] = useState(isBeta ? "" : "login");
+  const [authMethod, setAuthMethod] = useState(isBeta ? "" : "phone");
   const [phoneNumber, setPhoneNumber] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [referralCode, setReferralCode] = useState("");
+  const [ageConfirmed, setAgeConfirmed] = useState(false);
+  const [rememberMe, setRememberMe] = useState(true);
   const [verificationCode, setVerificationCode] = useState("");
   const [confirmation, setConfirmation] = useState(null);
   const [phoneBusy, setPhoneBusy] = useState(false);
   const [phoneError, setPhoneError] = useState("");
   const recaptchaRef = useRef(null);
   const recaptchaWidgetIdRef = useRef(null);
+  const isRegistration = accountAction === "register";
 
   useEffect(
     () => () => {
@@ -577,6 +1022,13 @@ function AuthDialog({ authError, onClose, onGoogleLogin, signingIn }) {
     setPhoneBusy(true);
 
     try {
+      if (isBeta && isRegistration && !ageConfirmed) {
+        throw new Error("請確認你已年滿 18 歲。 ");
+      }
+      await setPersistence(
+        auth,
+        rememberMe ? browserLocalPersistence : browserSessionPersistence,
+      );
       const normalizedPhone = normalizePhoneNumber(phoneNumber);
       const verifier = await getRecaptchaVerifier();
       const result = await signInWithPhoneNumber(auth, normalizedPhone, verifier);
@@ -598,13 +1050,65 @@ function AuthDialog({ authError, onClose, onGoogleLogin, signingIn }) {
     setPhoneBusy(true);
 
     try {
-      await confirmation.confirm(verificationCode.trim());
+      const credential = await confirmation.confirm(verificationCode.trim());
+      if (isBeta && isRegistration) {
+        const username = normalizeUsername(displayName);
+        const betaProfileRef = doc(db, "users", credential.user.uid);
+        await runTransaction(db, async (transaction) => {
+          const profileSnapshot = await transaction.get(betaProfileRef);
+          const betaFields = {
+            displayName: displayName.trim().slice(0, 80),
+            phoneNumber: credential.user.phoneNumber || normalizePhoneNumber(phoneNumber),
+            referralCode: referralCode.trim().slice(0, 40),
+            ageConfirmed: true,
+            ageConfirmedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          };
+
+          if (profileSnapshot.exists()) {
+            transaction.update(betaProfileRef, betaFields);
+          } else {
+            transaction.set(betaProfileRef, {
+              uid: credential.user.uid,
+              email: credential.user.email || "",
+              photoURL: credential.user.photoURL || "",
+              username: "",
+              tokens: 0,
+              role: "user",
+              createdAt: serverTimestamp(),
+              ...betaFields,
+            });
+          }
+        });
+        if (username.length >= 3) {
+          await ensureUsernameClaim(credential.user.uid, username);
+        }
+      }
       onClose();
     } catch (error) {
       setPhoneError(getPhoneAuthErrorMessage(error));
     } finally {
       setPhoneBusy(false);
     }
+  }
+
+  function goBack() {
+    setPhoneError("");
+    if (confirmation) {
+      setConfirmation(null);
+    } else if (authMethod) {
+      setAuthMethod("");
+    } else {
+      setAccountAction("");
+    }
+  }
+
+  async function continueWithGoogle() {
+    await setPersistence(
+      auth,
+      rememberMe ? browserLocalPersistence : browserSessionPersistence,
+    );
+    onGoogleLogin();
   }
 
   return (
@@ -619,61 +1123,139 @@ function AuthDialog({ authError, onClose, onGoogleLogin, signingIn }) {
         <button className="icon-btn auth-dialog-close" type="button" onClick={onClose} aria-label="關閉">
           <X size={20} />
         </button>
-        <p className="eyebrow">Account</p>
-        <h2 id="auth-dialog-title">登入 / 註冊</h2>
-        <p className="muted">使用手機號碼接收一次性驗證碼，或使用 Google 帳戶繼續。</p>
+        {isBeta && (accountAction || authMethod || confirmation) && (
+          <button className="auth-back-btn" type="button" onClick={goBack}>
+            <ChevronLeft size={18} />
+            返回
+          </button>
+        )}
 
-        {!confirmation ? (
-          <form className="stack-form" onSubmit={sendPhoneCode}>
-            <label>
-              手機號碼
-              <input
-                type="tel"
-                inputMode="tel"
-                autoComplete="tel"
-                value={phoneNumber}
-                onChange={(event) => setPhoneNumber(event.target.value)}
-                placeholder="例如 +852 9123 4567"
-                required
-              />
-            </label>
-            <button className="primary-btn" id="send-phone-code" type="submit" disabled={phoneBusy}>
-              <Smartphone size={18} />
-              {phoneBusy ? "發送中..." : "發送驗證碼"}
-            </button>
-          </form>
+        {!accountAction ? (
+          <>
+
+            <h2 id="auth-dialog-title">歡迎來到 LiveDraw</h2>
+            <p className="muted">請先選擇登入現有帳戶，或建立新帳戶。</p>
+            <div className="auth-entry-grid">
+              <button className="auth-choice-card primary" type="button" onClick={() => setAccountAction("login")}>
+                <LogIn size={24} />
+                <span><strong>登入</strong><small>已有 LiveDraw 帳戶</small></span>
+              </button>
+              <button className="auth-choice-card" type="button" onClick={() => setAccountAction("register")}>
+                <UserRoundPlus size={24} />
+                <span><strong>註冊</strong><small>建立新的玩家帳戶</small></span>
+              </button>
+            </div>
+          </>
+        ) : !authMethod ? (
+          <>
+
+            <h2 id="auth-dialog-title">{isRegistration ? "註冊" : "登入"}</h2>
+            <p className="muted">請選擇使用手機號碼或 Google {isRegistration ? "建立帳戶" : "繼續"}。</p>
+            <div className="auth-method-grid">
+              <button className="auth-choice-card primary" type="button" onClick={() => setAuthMethod("phone")}>
+                <Smartphone size={24} />
+                <span><strong>手機號碼</strong><small>使用 SMS 一次性驗證碼</small></span>
+              </button>
+              <button className="auth-choice-card" type="button" onClick={continueWithGoogle} disabled={signingIn}>
+                <LogIn size={24} />
+                <span><strong>Google</strong><small>{signingIn ? "正在開啟..." : `使用 Google ${isRegistration ? "註冊" : "登入"}`}</small></span>
+              </button>
+            </div>
+            {isBeta && (
+              <label className="check-option auth-remember-option">
+                <input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} />
+                <span>記住我</span>
+              </label>
+            )}
+            {isBeta && (
+              <>
+          <div className="auth-divider"><span>測試預覽</span></div>
+                <button className="ghost-btn beta-demo-login" type="button" onClick={onDemoLogin}>
+                  <UserRoundPlus size={18} />
+                  使用 Demo Account
+                </button>
+            <small className="form-note beta-demo-note">測試帳戶只供預覽，不會寫入資料或影響正式版。</small>
+              </>
+            )}
+          </>
         ) : (
-          <form className="stack-form" onSubmit={confirmPhoneCode}>
-            <label>
-              SMS 驗證碼
-              <input
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                value={verificationCode}
-                onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
-                placeholder="6 位數字驗證碼"
-                pattern="[0-9]{6}"
-                required
-              />
-            </label>
-            <button className="primary-btn" type="submit" disabled={phoneBusy}>
-              <Check size={18} />
-              {phoneBusy ? "驗證中..." : "確認並登入"}
-            </button>
-            <button className="small-btn" type="button" onClick={() => setConfirmation(null)}>
-              更改手機號碼
-            </button>
-          </form>
+          <>
+
+            <h2 id="auth-dialog-title">{isBeta ? `手機號碼${isRegistration ? "註冊" : "登入"}` : "登入 / 註冊"}</h2>
+            <p className="muted">{confirmation ? "輸入已發送到你手機的 6 位數字驗證碼。" : isBeta ? "輸入手機號碼以接收一次性驗證碼。" : "使用手機號碼接收一次性驗證碼，或使用 Google 帳戶繼續。"}</p>
+
+            {!confirmation ? (
+              <form className="stack-form" onSubmit={sendPhoneCode}>
+                {isBeta && isRegistration && (
+                  <>
+                    <label>
+                      顯示名稱
+                      <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="其他玩家會看到的名稱" minLength={3} maxLength={24} required />
+                    </label>
+                    <label>
+                      推薦碼（選填）
+                      <input value={referralCode} onChange={(event) => setReferralCode(event.target.value)} placeholder="輸入推薦碼" maxLength={40} />
+                    </label>
+                  </>
+                )}
+                <label>
+                  手機號碼
+                  <input type="tel" inputMode="tel" autoComplete="tel" value={phoneNumber} onChange={(event) => setPhoneNumber(event.target.value)} placeholder="例如 +852 9123 4567" required />
+                </label>
+                {isBeta && (
+                  <div className="auth-options">
+                    {isRegistration && (
+                      <label className="check-option">
+                        <input type="checkbox" checked={ageConfirmed} onChange={(event) => setAgeConfirmed(event.target.checked)} required />
+                        <span>本人確認已年滿 18 歲</span>
+                      </label>
+                    )}
+                    <label className="check-option">
+                      <input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} />
+                      <span>記住我</span>
+                    </label>
+                    {!isRegistration && (
+                      <button className="auth-forgot-link" type="button" onClick={() => alert("手機號碼帳戶不設密碼，請重新接收 SMS 驗證碼登入。")}>
+                        忘記密碼？
+                      </button>
+                    )}
+                  </div>
+                )}
+                <button className="primary-btn" id="send-phone-code" type="submit" disabled={phoneBusy}>
+                  <Smartphone size={18} />
+                  {phoneBusy ? "發送中..." : "發送驗證碼"}
+                </button>
+              </form>
+            ) : (
+              <form className="stack-form" onSubmit={confirmPhoneCode}>
+                <label>
+                  SMS 驗證碼
+                  <input inputMode="numeric" autoComplete="one-time-code" value={verificationCode} onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位數字驗證碼" pattern="[0-9]{6}" required />
+                </label>
+                <button className="primary-btn" type="submit" disabled={phoneBusy}>
+                  <Check size={18} />
+                  {phoneBusy ? "驗證中..." : `確認並${isRegistration ? "註冊" : "登入"}`}
+                </button>
+                <button className="small-btn" type="button" onClick={() => setConfirmation(null)}>更改手機號碼</button>
+              </form>
+            )}
+          </>
         )}
 
         <div id="phone-recaptcha" />
         {(phoneError || authError) && <p className="error-note">{phoneError || authError}</p>}
-        <div className="auth-divider"><span>或</span></div>
-        <button className="ghost-btn auth-google-btn" type="button" onClick={onGoogleLogin} disabled={signingIn}>
-          <LogIn size={18} />
-          {signingIn ? "正在開啟 Google..." : "使用 Google 登入"}
-        </button>
-        <small className="form-note">登入即表示你同意手機號碼由 Google Firebase 用作驗證及防止濫用。</small>
+        {!isBeta && (
+          <>
+            <div className="auth-divider"><span>或</span></div>
+            <button className="ghost-btn auth-google-btn" type="button" onClick={continueWithGoogle} disabled={signingIn}>
+              <LogIn size={18} />
+              {signingIn ? "正在開啟 Google..." : "使用 Google 登入"}
+            </button>
+          </>
+        )}
+        {authMethod === "phone" && (
+          <small className="form-note">{isRegistration ? "註冊" : "登入"}即表示你同意手機號碼由 Google Firebase 用作驗證及防止濫用。</small>
+        )}
       </section>
     </div>
   );
@@ -702,7 +1284,7 @@ function UsernameGate({ authUser, profile, conflict = false }) {
       <div className="section-heading">
         <UserRoundPlus size={24} />
         <div>
-          <p className="eyebrow">One more step</p>
+
           <h1>{conflict ? "選擇新的玩家名稱" : "設定玩家名稱"}</h1>
         </div>
       </div>
@@ -735,7 +1317,9 @@ function UsernameGate({ authUser, profile, conflict = false }) {
 
 function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
   const [recentPicks, setRecentPicks] = useState([]);
+  const [recentPicksLoading, setRecentPicksLoading] = useState(true);
   const [roomsById, setRoomsById] = useState({});
+  const [accountRoomsLoading, setAccountRoomsLoading] = useState(true);
   const [username, setUsername] = useState(profile?.username || "");
   const [savingUsername, setSavingUsername] = useState(false);
   const [usernameSaved, setUsernameSaved] = useState(false);
@@ -778,7 +1362,7 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
       collection(db, "drawRecords"),
       where("uid", "==", profile.uid),
     );
-    const stopRecords = onSnapshot(recordsQuery, (snapshot) => {
+    const stopRecords = onSnapshot(recordsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setRecentPicks(
         snapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }))
@@ -786,6 +1370,10 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
           .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt))
           .slice(0, 6),
       );
+      if (isSnapshotReady(snapshot)) setRecentPicksLoading(false);
+    }, (error) => {
+      console.error("Account record listener failed.", error);
+      setRecentPicksLoading(false);
     });
 
     return stopRecords;
@@ -793,10 +1381,14 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
 
   useEffect(() => {
     const roomsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
-    const stopRooms = onSnapshot(roomsQuery, (snapshot) => {
+    const stopRooms = onSnapshot(roomsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setRoomsById(
         Object.fromEntries(snapshot.docs.map((item) => [item.id, { id: item.id, ...item.data() }])),
       );
+      if (isSnapshotReady(snapshot)) setAccountRoomsLoading(false);
+    }, (error) => {
+      console.error("Account room listener failed.", error);
+      setAccountRoomsLoading(false);
     });
 
     return stopRooms;
@@ -836,9 +1428,9 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
       >
         <div className="pick-card-main">
           <span className="pick-card-art">
-            {record.cardImageUrl || record.targetCardImageUrl ? (
+            {record.targetCardImageUrl || record.cardImageUrl ? (
               <img
-                src={record.cardImageUrl || record.targetCardImageUrl}
+                src={record.targetCardImageUrl || record.cardImageUrl}
                 alt={record.cardName || record.targetCardName || "卡牌"}
               />
             ) : (
@@ -855,7 +1447,7 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
           </span>
         </div>
         <strong className="pick-card-name">
-          {record.cardName || record.targetCardName || "等待抽卡結果"}
+          所屬盲盒：{record.targetCardName || "未選卡牌"}
         </strong>
         <small className="pick-card-meta">
           {formatRoundLabel(record.round || "round-001")} · {roomStatus}
@@ -907,10 +1499,7 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
 
       <div className="wallet-card">
         <span>代幣</span>
-        <strong>
-          <span className="coin-dot">⚡</span>
-          {profile?.tokens ?? 0}
-        </strong>
+        <strong><TokenAmount value={roundTokenBalance(profile?.tokens)} /></strong>
         <button className="primary-btn side-cta" type="button" onClick={() => setActiveTab("tokens")}>
           申請代幣
         </button>
@@ -918,7 +1507,9 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
 
       <div className="current-picks">
         <strong>正在抽卡</strong>
-        {recentPicks.length ? (
+        {recentPicksLoading || accountRoomsLoading ? (
+          <InlineLoading label="正在載入抽卡紀錄..." />
+        ) : recentPicks.length ? (
           <>
             <PickSection
               count={activePicks.length}
@@ -967,7 +1558,7 @@ function isActivePickRecord(record, room) {
   return !record.cardId && room?.status === "live";
 }
 
-function FileUpload({ id, label, file, onChange, required = false }) {
+function FileUpload({ id, label, file, onChange, required = false, disabled = false }) {
   const generatedId = useId();
   const inputId = id || generatedId;
 
@@ -981,6 +1572,7 @@ function FileUpload({ id, label, file, onChange, required = false }) {
           accept="image/*"
           onChange={(event) => onChange(event.target.files?.[0] || null)}
           required={required}
+          disabled={disabled}
         />
         <span className="file-upload-button">
           <FileImage size={17} />
@@ -995,16 +1587,26 @@ function FileUpload({ id, label, file, onChange, required = false }) {
 }
 
 function DrawCard({ profile }) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
   const [rooms, setRooms] = useState([]);
+  const [roomsLoading, setRoomsLoading] = useState(true);
   const [roomsError, setRoomsError] = useState("");
   const [cardLibrary, setCardLibrary] = useState([]);
-  const cardCategories = useCardCategories(cardLibrary);
+  const [cardsLoading, setCardsLoading] = useState(true);
+  const shouldLoadPrivateCardData =
+    import.meta.env.VITE_APP_VARIANT !== "beta" || Boolean(profile?.uid && !profile?.isDemo);
+  const cardCategories = useCardCategories(cardLibrary, shouldLoadPrivateCardData);
   const [roomSlug, setRoomSlug] = useState(getRoomSlugFromUrl);
   const [slots, setSlots] = useState([]);
+  const [slotsLoading, setSlotsLoading] = useState(false);
   const [buyingNumber, setBuyingNumber] = useState(null);
+  const [pendingPurchase, setPendingPurchase] = useState(null);
+  const [purchaseStage, setPurchaseStage] = useState("confirm");
+  const purchaseInFlightRef = useRef(false);
   const [selectedCardId, setSelectedCardId] = useState("");
   const [selectedSlotNumber, setSelectedSlotNumber] = useState(null);
   const [selectedRound, setSelectedRound] = useState("");
+  const [purchaseStep, setPurchaseStep] = useState(1);
 
   useEffect(() => {
     const drawsQuery = query(
@@ -1013,10 +1615,12 @@ function DrawCard({ profile }) {
     );
     const stopDraws = onSnapshot(
       drawsQuery,
+      LIVE_SNAPSHOT_OPTIONS,
       (snapshot) => {
         const allDraws = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
         setRooms(allDraws);
         setRoomsError("");
+        if (isSnapshotReady(snapshot)) setRoomsLoading(false);
       },
       async (error) => {
         console.error("Room list listener failed.", error);
@@ -1030,6 +1634,8 @@ function DrawCard({ profile }) {
         } catch (fallbackError) {
           console.error("Room list fallback failed.", fallbackError);
           setRoomsError(getSafeErrorMessage(fallbackError, "未能載入房間。"));
+        } finally {
+          setRoomsLoading(false);
         }
       },
     );
@@ -1038,19 +1644,27 @@ function DrawCard({ profile }) {
   }, []);
 
   useEffect(() => {
-    const cardsQuery = query(collection(db, "cards"), orderBy("createdAt", "desc"));
+    setCardsLoading(true);
+    const cardsQuery = shouldLoadPrivateCardData
+      ? query(collection(db, "cards"), orderBy("createdAt", "desc"))
+      : query(collection(db, "publicCardShowcase"), where("active", "==", true));
     const stopCards = onSnapshot(
       cardsQuery,
+      LIVE_SNAPSHOT_OPTIONS,
       (snapshot) => {
-        setCardLibrary(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+        setCardLibrary(snapshot.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .filter((card) => !card.archived));
+        if (isSnapshotReady(snapshot)) setCardsLoading(false);
       },
       (error) => {
         console.error("Card library listener failed.", error);
+        setCardsLoading(false);
       },
     );
 
     return stopCards;
-  }, []);
+  }, [shouldLoadPrivateCardData]);
 
   useEffect(() => {
     function handleRouteChange() {
@@ -1062,39 +1676,63 @@ function DrawCard({ profile }) {
   }, []);
 
   const selectedRoom = useMemo(() => {
-    if (!roomSlug) return null;
-    return (
-      rooms.find((room) => room.id === roomSlug) ||
-      rooms.find((room) => room.slug === roomSlug) ||
-      null
-    );
-  }, [roomSlug, rooms]);
+    if (isBeta) {
+      const requestedRoom = roomSlug
+        ? rooms.find((room) => room.id === roomSlug) || rooms.find((room) => room.slug === roomSlug)
+        : null;
+      const currentLive = rooms.find((room) => room.status === "live")
+        || rooms.find((room) => room.status === "draft");
+      return requestedRoom || currentLive || rooms[0] || null;
+    }
+    const requestedRoom = roomSlug
+      ? rooms.find((room) => room.id === roomSlug) ||
+        rooms.find((room) => room.slug === roomSlug)
+      : null;
+    if (requestedRoom) return requestedRoom;
+    return null;
+  }, [isBeta, roomSlug, rooms]);
   const selectedRoomId = selectedRoom?.id || "";
+  const currentBetaLive = isBeta
+    ? rooms.find((room) => room.status === "live") || rooms.find((room) => room.status === "draft") || null
+    : null;
+  const archivedBetaRooms = isBeta
+    ? rooms.filter((room) => room.id !== currentBetaLive?.id && room.status === "completed")
+    : [];
+  const viewingArchivedBetaRoom = Boolean(isBeta && selectedRoom?.status === "completed");
   const selectedRoomDefaultRound = getDefaultRoomRound(selectedRoom);
 
+  const roundOptions = useMemo(() => getRoomRoundOptions(selectedRoom), [selectedRoom]);
+  const activeRoundId = useMemo(
+    () => selectedRound || getDefaultRoomRound(selectedRoom),
+    [selectedRoom, selectedRound],
+  );
   const selectedRoomCards = useMemo(
-    () => buildRoomCards(selectedRoom, cardLibrary),
-    [selectedRoom, cardLibrary],
+    () => buildRoomCards(selectedRoom, cardLibrary, activeRoundId),
+    [activeRoundId, selectedRoom, cardLibrary],
   );
 
   const selectedTargetCard = useMemo(
     () => selectedRoomCards.find((card) => card.id === selectedCardId) || null,
     [selectedCardId, selectedRoomCards],
   );
-  const roundOptions = useMemo(() => getRoomRoundOptions(selectedRoom), [selectedRoom]);
-  const activeRoundId = useMemo(
-    () => selectedRound || getDefaultRoomRound(selectedRoom),
-    [selectedRoom, selectedRound],
-  );
   const selectedSlot = useMemo(
     () => slots.find((slot) => slot.number === selectedSlotNumber) || null,
     [selectedSlotNumber, slots],
+  );
+  const myActiveRoundNumbers = useMemo(
+    () => slots
+      .filter((slot) => slot.uid === profile?.uid && slot.status !== "available")
+      .map((slot) => Number(slot.number))
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right),
+    [profile?.uid, slots],
   );
 
   useEffect(() => {
     setSelectedCardId("");
     setSelectedSlotNumber(null);
     setSelectedRound(selectedRoomDefaultRound);
+    setPurchaseStep(1);
   }, [selectedRoomDefaultRound, selectedRoomId]);
 
   useEffect(() => {
@@ -1104,25 +1742,40 @@ function DrawCard({ profile }) {
   useEffect(() => {
     if (!selectedRoom?.id || !activeRoundId) {
       setSlots([]);
+      setSlotsLoading(false);
       return undefined;
     }
+
+    setSlotsLoading(true);
 
     const slotsQuery = query(
       collection(db, "draws", selectedRoom.id, "rounds", activeRoundId, "slots"),
       orderBy("number", "asc"),
     );
-    const stopSlots = onSnapshot(slotsQuery, async (snapshot) => {
-      const roundSlots = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-      if (roundSlots.length || activeRoundId !== "round-001") {
-        setSlots(roundSlots);
-        return;
-      }
+    const stopSlots = onSnapshot(
+      slotsQuery,
+      LIVE_SNAPSHOT_OPTIONS,
+      async (snapshot) => {
+        try {
+          const roundSlots = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+          if (roundSlots.length || activeRoundId !== "round-001") {
+            setSlots(roundSlots);
+            return;
+          }
 
-      const legacySnapshot = await getDocs(
-        query(collection(db, "draws", selectedRoom.id, "slots"), orderBy("number", "asc")),
-      );
-      setSlots(legacySnapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-    });
+          const legacySnapshot = await getDocs(
+            query(collection(db, "draws", selectedRoom.id, "slots"), orderBy("number", "asc")),
+          );
+          setSlots(legacySnapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+        } finally {
+          if (isSnapshotReady(snapshot)) setSlotsLoading(false);
+        }
+      },
+      (error) => {
+        console.error("Room slots listener failed.", error);
+        setSlotsLoading(false);
+      },
+    );
 
     return stopSlots;
   }, [activeRoundId, selectedRoom?.id]);
@@ -1135,10 +1788,10 @@ function DrawCard({ profile }) {
     }
   }, [profile?.uid, selectedSlotNumber, slots]);
 
-  async function buySlot(slot) {
+  function openPurchaseConfirmation(slot) {
     if (!selectedRoom || selectedRoom.status !== "live") return;
-    if (activeRoundId !== toRoundId(getRoomCurrentRound(selectedRoom))) {
-      alert("此場次已鎖定，請切換到目前場次購買。");
+    if (getRoundSortValue(activeRoundId) < getRoomCurrentRound(selectedRoom)) {
+      alert("此場次已完結，不能再購買號碼。");
       return;
     }
     if (isRoundBuyingBlocked(selectedRoom, activeRoundId)) {
@@ -1146,7 +1799,11 @@ function DrawCard({ profile }) {
       return;
     }
     if (!profile?.uid) {
-      alert("玩家資料仍在載入，請稍後再試。");
+      alert("請先登入／註冊，再付款鎖定號碼。");
+      return;
+    }
+    if (profile.isDemo) {
+      alert("測試帳戶只供預覽，不會購買號碼或扣除代幣。");
       return;
     }
     if (!selectedTargetCard) {
@@ -1158,12 +1815,38 @@ function DrawCard({ profile }) {
       return;
     }
 
-    const confirmed = window.confirm(
-      `確認用 ${formatTokenNumber(selectedTargetCard.tokenValue || selectedRoom.tokenCost)} 代幣鎖定 #${slot.number}？`,
-    );
-    if (!confirmed) return;
+    setPendingPurchase({
+      slot,
+      roomId: selectedRoom.id,
+      roomTitle: selectedRoom.title,
+      roomSlug: selectedRoom.slug || selectedRoom.id,
+      roundId: activeRoundId,
+      shareMode: getRoomShareMode(selectedRoom, activeRoundId),
+      card: selectedTargetCard,
+      hellCardName: cardLibrary.find((card) => card.id ===
+        cardLibrary.find((card) => card.id === selectedTargetCard.id)?.hellCardId,
+      )?.name || "未設定地獄對應卡",
+      tokenCost: Number(selectedTargetCard.tokenValue || selectedRoom.tokenCost || 10),
+    });
+    setPurchaseStage("confirm");
+  }
 
-    setBuyingNumber(slot.number);
+  function closePurchaseConfirmation() {
+    if (purchaseStage === "generating") return;
+    const purchaseCompleted = purchaseStage === "complete";
+    setPendingPurchase(null);
+    setPurchaseStage("confirm");
+    if (purchaseCompleted) goToCardStep();
+  }
+
+  async function confirmBlindBoxPurchase() {
+    if (!pendingPurchase || purchaseInFlightRef.current) return;
+
+    const purchase = pendingPurchase;
+    const animationStartedAt = Date.now();
+    purchaseInFlightRef.current = true;
+    setPurchaseStage("generating");
+    setBuyingNumber(purchase.slot.number);
     try {
       const claimedUsername = await ensureUsernameClaim(profile.uid, profile.username);
 
@@ -1172,17 +1855,17 @@ function DrawCard({ profile }) {
         const slotRef = doc(
           db,
           "draws",
-          selectedRoom.id,
+          purchase.roomId,
           "rounds",
-          activeRoundId,
+          purchase.roundId,
           "slots",
-          String(slot.number),
+          String(purchase.slot.number),
         );
         const recordRef = doc(collection(db, "drawRecords"));
         const userSnap = await transaction.get(userRef);
         const slotSnap = await transaction.get(slotRef);
         const currentTokens = Number(userSnap.data()?.tokens || 0);
-        const tokenCost = Number(selectedTargetCard.tokenValue || selectedRoom.tokenCost || 10);
+        const tokenCost = purchase.tokenCost;
 
         if (!slotSnap.exists() || slotSnap.data().status !== "available") {
           throw new Error("這個號碼已被選走。");
@@ -1194,43 +1877,57 @@ function DrawCard({ profile }) {
 
         transaction.update(userRef, {
           tokens: currentTokens - tokenCost,
+          lastPurchaseRecordId: recordRef.id,
           updatedAt: serverTimestamp(),
         });
         transaction.update(slotRef, {
+          purchaseRecordId: recordRef.id,
           status: "locked",
           uid: profile.uid,
           username: claimedUsername,
           tokenCost,
-          targetCardId: selectedTargetCard.id,
-          targetCardName: selectedTargetCard.name,
-          targetCardImageUrl: selectedTargetCard.imageUrl || "",
+          targetCardId: purchase.card.id,
+          targetCardName: purchase.card.name,
+          targetCardImageUrl: purchase.card.imageUrl || "",
           targetCardValue: tokenCost,
-          round: activeRoundId,
+          shareMode: purchase.shareMode,
+          round: purchase.roundId,
           updatedAt: serverTimestamp(),
         });
         transaction.set(recordRef, {
+          slotId: String(purchase.slot.number),
           uid: profile.uid,
           username: claimedUsername,
-          drawId: selectedRoom.id,
-          drawTitle: selectedRoom.title,
-          roomSlug: selectedRoom.slug || selectedRoom.id,
-          roomLink: makeRoomLink(selectedRoom.id),
-          round: activeRoundId,
-          roundSort: getRoundSortValue(activeRoundId),
-          number: slot.number,
+          drawId: purchase.roomId,
+          drawTitle: purchase.roomTitle,
+          roomSlug: purchase.roomSlug,
+          roomLink: makeRoomLink(purchase.roomId),
+          round: purchase.roundId,
+          roundSort: getRoundSortValue(purchase.roundId),
+          number: purchase.slot.number,
           tokenCost,
-          targetCardId: selectedTargetCard.id,
-          targetCardName: selectedTargetCard.name,
-          targetCardImageUrl: selectedTargetCard.imageUrl || "",
+          targetCardId: purchase.card.id,
+          targetCardName: purchase.card.name,
+          targetCardImageUrl: purchase.card.imageUrl || "",
           targetCardValue: tokenCost,
+          shareMode: purchase.shareMode,
           createdAt: serverTimestamp(),
         });
       });
+
+      const remainingAnimation = 1700 - (Date.now() - animationStartedAt);
+      if (remainingAnimation > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remainingAnimation));
+      }
+      setPurchaseStage("complete");
+      setSelectedSlotNumber(null);
     } catch (error) {
+      setPurchaseStage("confirm");
+      setPendingPurchase(null);
       showSafeError(error);
     } finally {
+      purchaseInFlightRef.current = false;
       setBuyingNumber(null);
-      setSelectedSlotNumber(null);
     }
   }
 
@@ -1249,76 +1946,779 @@ function DrawCard({ profile }) {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  if (!roomSlug) {
-    return <RoomList rooms={rooms} error={roomsError} onOpenRoom={openRoom} />;
+  function goToNumberStep() {
+    if (!selectedTargetCard) return;
+    setPurchaseStep(2);
+    window.requestAnimationFrame(() => {
+      document.getElementById("number-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
+  function openNumberOccupancy() {
+    setPurchaseStep(2);
+    window.requestAnimationFrame(() => {
+      document.getElementById("number-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
+  function goToCardStep() {
+    setSelectedSlotNumber(null);
+    setPurchaseStep(1);
+    window.requestAnimationFrame(() => {
+      document.getElementById("card-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
+  if (!isBeta && !roomSlug) {
+    return (
+      <RoomList
+        rooms={rooms}
+        cards={cardLibrary}
+        error={roomsError}
+        loading={roomsLoading}
+        onOpenRoom={openRoom}
+        profile={profile}
+      />
+    );
+  }
+
+  if (roomsLoading) {
+    return <InlineLoading label="正在載入房間..." />;
   }
 
   if (!selectedRoom) {
     return (
       <section className="panel empty-state">
         <Gavel size={36} />
-        <h2>找不到房間</h2>
-        <p className="muted">這個房間連結暫時沒有可用資料。</p>
-        <button className="primary-btn" type="button" onClick={backToRooms}>
-          返回房間列表
-        </button>
+        <h2>{isBeta ? "暫時未有直播" : "找不到房間"}</h2>
+        <p className="muted">{roomsError || (isBeta ? "直播資料準備中，請稍後再試。" : "這個房間連結暫時沒有可用資料。")}</p>
+        {!isBeta && <button className="primary-btn" type="button" onClick={backToRooms}>返回房間列表</button>}
       </section>
+    );
+  }
+
+  if (viewingArchivedBetaRoom) {
+    return (
+      <ArchivedLiveRoom
+        activeRoundId={activeRoundId}
+        loading={slotsLoading}
+        onBack={() => currentBetaLive ? openRoom(currentBetaLive) : backToRooms()}
+        onRoundChange={setSelectedRound}
+        profile={profile}
+        room={selectedRoom}
+        roundOptions={roundOptions}
+        slots={slots}
+      />
     );
   }
 
   return (
     <>
-      <button className="small-btn back-link" type="button" onClick={backToRooms}>
-        返回房間列表
-      </button>
-      <div className="draw-layout">
-        <section className="panel">
+      {isBeta && (
+        <BetaSingleHallIntro
+          cards={cardLibrary}
+          rooms={[selectedRoom]}
+          onOpenRoom={openRoom}
+          onSelectCard={(card) => {
+            const matchingCard = selectedRoomCards.find((item) =>
+              String(item.id || "") === String(card.id || "")
+              || String(item.name || "").trim().toLowerCase() === String(card.name || "").trim().toLowerCase(),
+            );
+            setPurchaseStep(1);
+            setSelectedSlotNumber(null);
+            setSelectedCardId(matchingCard?.id || "");
+            window.requestAnimationFrame(() => {
+              document.getElementById("card-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+            });
+          }}
+        />
+      )}
+      {isBeta && profile?.uid && (
+        <RoomRecordsDrawer currentRoomId={selectedRoom.id} profile={profile} />
+      )}
+      {isBeta && archivedBetaRooms.length > 0 && (
+        <LiveArchiveList rooms={archivedBetaRooms} onOpenRoom={openRoom} />
+      )}
+      {!isBeta && <button className="small-btn back-link" type="button" onClick={backToRooms}>返回房間列表</button>}
+      <div className={`draw-layout purchase-step-${purchaseStep}`}>
+        <section className="panel room-stream-panel">
           <div className="section-heading">
             <Gavel size={24} />
             <div>
-              <p className="eyebrow">Live room</p>
-              <h1>{selectedRoom.title}</h1>
+              {isBeta && <span className="beta-live-label">直播中</span>}
+              <h1>{isBeta ? <><em>LIVE</em> 抽卡大廳</> : selectedRoom.title}</h1>
+              {isBeta && myActiveRoundNumbers.length > 0 && (
+                <span className="beta-my-live-numbers">
+                  已買：{myActiveRoundNumbers.map((number) => `#${number}`).join("、")}
+                </span>
+              )}
             </div>
           </div>
           <KickEmbed kickUrl={selectedRoom.kickUrl} title={selectedRoom.title} />
-          <div className="draw-meta">
-            <span>{selectedRoom.cardCount} 張卡</span>
-            <span>{formatRoundLabel(activeRoundId)}</span>
-            <span>⚡ {selectedTargetCard?.tokenValue || selectedRoom.tokenCost} 入場</span>
-            <span>{statusLabels[selectedRoom.status] || selectedRoom.status}</span>
-            <span>房間：{selectedRoom.title}</span>
-          </div>
+          {!isBeta && (
+            <div className="draw-meta">
+              <span>{selectedRoom.cardCount} 張卡</span>
+              <span>{formatRoundLabel(activeRoundId)}</span>
+              <span>玩法：{getRoomShareMode(selectedRoom, activeRoundId)}</span>
+              <span>{statusLabels[selectedRoom.status] || selectedRoom.status}</span>
+              <span>房間：{selectedRoom.title}</span>
+            </div>
+          )}
         </section>
-        <CardPoolPreview
-          draw={selectedRoom}
-          cards={selectedRoomCards}
-          cardCategories={cardCategories}
-          selectedCardId={selectedCardId}
-          onSelectCard={setSelectedCardId}
-        />
-
-        <NumberGrid
-          draw={selectedRoom}
-          slots={slots}
-          profile={profile}
-          selectedCard={selectedTargetCard}
-          activeRoundId={activeRoundId}
-          roundOptions={roundOptions}
-          selectedSlotNumber={selectedSlotNumber}
-          buyingNumber={buyingNumber}
-          onRoundChange={setSelectedRound}
-          onSelectNumber={setSelectedSlotNumber}
-          onBuy={() => buySlot(selectedSlot)}
-        />
-        {selectedRoom.status === "live" && (
-          <ChatRoom drawId={selectedRoom.id} profile={profile} />
+        {isBeta && (
+          <RoomRoundOverview
+            draw={selectedRoom}
+            activeRoundId={activeRoundId}
+            roundOptions={roundOptions}
+            onRoundChange={(roundId) => {
+              setSelectedRound(roundId);
+              if (getRoundDisplayStatus(selectedRoom, roundId).key !== "upcoming") {
+                setPurchaseStep(2);
+              }
+            }}
+          />
         )}
+        {isBeta && purchaseStep === 1 && (
+          <DesktopNumberOccupancy
+            activeRoundId={activeRoundId}
+            loading={slotsLoading}
+            profile={profile}
+            slots={slots}
+          />
+        )}
+        {purchaseStep === 1 ? (
+          <CardPoolPreview
+            draw={selectedRoom}
+            cards={selectedRoomCards}
+            loading={cardsLoading}
+            cardCategories={cardCategories}
+            selectedCardId={selectedCardId}
+            selectedCard={selectedTargetCard}
+            onSelectCard={setSelectedCardId}
+            onContinue={goToNumberStep}
+          />
+        ) : (
+          <NumberGrid
+            draw={selectedRoom}
+            slots={slots}
+            loading={slotsLoading}
+            profile={profile}
+            selectedCard={selectedTargetCard}
+            activeRoundId={activeRoundId}
+            roundOptions={roundOptions}
+            selectedSlotNumber={selectedSlotNumber}
+            buyingNumber={buyingNumber}
+            onBack={goToCardStep}
+            onRoundChange={setSelectedRound}
+            onSelectNumber={setSelectedSlotNumber}
+            onBuy={() => openPurchaseConfirmation(selectedSlot)}
+          />
+        )}
+        {selectedRoom.status === "live" &&
+          (profile?.uid && !profile?.isDemo ? (
+            <div id="hall-chat" className="hall-chat-anchor"><ChatRoom drawId={selectedRoom.id} profile={profile} /></div>
+          ) : (
+            <section id="hall-chat" className="panel chat-panel guest-chat-panel">
+              <div className="section-heading compact beta-live-chat-heading">
+                <div><span>LIVE CHAT</span><h2>大廳聊天</h2></div>
+              </div>
+              <p className="muted">登入後即可查看及參與大廳聊天。</p>
+            </section>
+          ))}
       </div>
+      {isBeta && (
+        <BetaStickyControls
+          onOpenNumbers={openNumberOccupancy}
+          profile={profile}
+        />
+      )}
+      {pendingPurchase && (
+        <BlindBoxPurchaseModal
+          purchase={pendingPurchase}
+          stage={purchaseStage}
+          onCancel={closePurchaseConfirmation}
+          onConfirm={confirmBlindBoxPurchase}
+        />
+      )}
     </>
   );
 }
 
-function RoomList({ rooms, error, onOpenRoom }) {
+function BetaRecentRecords({ profile }) {
+  const [records, setRecords] = useState([]);
+  const [recordsLoading, setRecordsLoading] = useState(Boolean(profile));
+  const demoCards = useBetaDemoCards(Boolean(profile?.isDemo));
+
+  useEffect(() => {
+    if (profile?.isDemo) {
+      setRecords(enrichDemoRecords(BETA_DEMO_RECORDS, demoCards));
+      setRecordsLoading(false);
+      return undefined;
+    }
+    if (!profile?.uid) {
+      setRecords([]);
+      setRecordsLoading(false);
+      return undefined;
+    }
+
+    setRecordsLoading(true);
+
+    const recordsQuery = query(
+      collection(db, "drawRecords"),
+      where("uid", "==", profile.uid),
+    );
+    return onSnapshot(recordsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+      setRecords(
+        snapshot.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt))
+          .slice(0, 6),
+      );
+      if (isSnapshotReady(snapshot)) setRecordsLoading(false);
+    }, (error) => {
+      console.error("Home record listener failed.", error);
+      setRecordsLoading(false);
+    });
+  }, [demoCards, profile?.isDemo, profile?.uid]);
+
+  return (
+    <aside className="beta-home-records">
+      <div className="beta-home-records-heading">
+        <h2>我的紀錄</h2>
+        <span>{profile ? `${records.length} / 20` : "-- / 20"}</span>
+      </div>
+      {profile ? (
+        recordsLoading ? (
+          <InlineLoading label="正在載入我的紀錄..." />
+        ) : records.length ? (
+          records.map((record) => (
+            <article className="beta-home-record" key={record.id}>
+              <div className="beta-home-record-body">
+                {record.targetCardImageUrl || record.cardImageUrl ? (
+                  <img
+                    src={record.targetCardImageUrl || record.cardImageUrl}
+                    alt={record.targetCardName || record.cardName || "目標卡牌"}
+                  />
+                ) : (
+                  <span className="beta-home-record-image"><Package size={18} /></span>
+                )}
+                <div>
+                  <div className="beta-home-record-title">
+                    <strong>{record.drawTitle || record.roomSlug || "抽卡房"}</strong>
+                    <span>#{record.number || "--"}</span>
+                  </div>
+                  <p>所屬盲盒：{record.targetCardName || "未選卡牌"}</p>
+                </div>
+              </div>
+              <footer>
+                <b><TokenAmount value={record.tokenCost || 0} /></b>
+                <span className={record.cardId ? `complete ${record.resultSide === "hell" ? "hell" : "heaven"}` : "pending"}>
+                  {record.cardId
+                    ? `已完成 · ${getResultSideLabel(record.resultSide)}`
+                    : "待開"}
+                </span>
+              </footer>
+            </article>
+          ))
+        ) : (
+          <p className="beta-home-records-empty">暫時未有抽卡紀錄。</p>
+        )
+      ) : (
+        <div className="beta-home-records-login">
+          <ListChecks size={24} />
+          <strong>登入查看紀錄</strong>
+          <span>最近購買的房間及號碼會顯示在這裡。</span>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function BetaSingleHallIntro({ cards, rooms, onOpenRoom, onSelectCard }) {
+  return (
+    <section className="panel beta-single-hall-intro">
+      <div className="beta-announcements" aria-label="最新公告">
+        <div className="beta-announcements-track">
+          {[false, true].map((duplicate) => (
+            <div
+              aria-hidden={duplicate || undefined}
+              className="beta-announcements-group"
+              key={duplicate ? "duplicate" : "primary"}
+            >
+              <strong>最新公告</strong>
+              <span><b>最新</b> 二份之一賽道限量開放。</span>
+              <span><b>活動</b> 首次申請代幣滿指定金額送免費抽選。</span>
+              <span><b>公告</b> 系統維護時間請留意最新消息。</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="banner-slot" />
+      <BetaPsaCarousel cards={cards} rooms={rooms} onOpenRoom={onOpenRoom} onSelectCard={onSelectCard} />
+    </section>
+  );
+}
+
+// Lists completed live sessions without exposing private purchase records.
+function LiveArchiveList({ rooms, onOpenRoom }) {
+  return (
+    <section className="panel live-archive-list" aria-labelledby="live-archive-title">
+      <div className="live-archive-heading">
+        <div>
+          <p className="eyebrow">直播紀錄</p>
+          <h2 id="live-archive-title">過往直播及賽果</h2>
+        </div>
+        <span>{rooms.length} 個已封存直播</span>
+      </div>
+      <div className="live-archive-strip">
+        {rooms.map((room) => {
+          const resultCount = Object.values(room.roundResultImages || {}).filter(Boolean).length;
+          return (
+            <button type="button" key={room.id} onClick={() => onOpenRoom(room)}>
+              <Clock3 size={18} />
+              <span>
+                <strong>{room.title || "過往直播"}</strong>
+                <small>{getRoomRoundCount(room)} 場 · {resultCount} 個賽果 · {formatDate(room.archivedAt || room.updatedAt || room.createdAt)}</small>
+              </span>
+              <b>查看</b>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+// Shows an archived session as read-only history for every visitor.
+function ArchivedLiveRoom({ activeRoundId, loading, onBack, onRoundChange, profile, room, roundOptions, slots }) {
+  const occupiedCount = slots.filter((slot) => slot.status !== "available").length;
+
+  return (
+    <div className="archived-live-page">
+      <button className="small-btn back-link" type="button" onClick={onBack}>
+        <ChevronLeft size={17} />返回目前直播
+      </button>
+      <section className="panel archived-live-header">
+        <div>
+          <p className="eyebrow">已封存直播</p>
+          <h1>{room.title || "過往直播"}</h1>
+          <span>所有場次、號碼及賽果均為唯讀紀錄。</span>
+        </div>
+        <b>{getRoomRoundCount(room)} 場</b>
+      </section>
+      <RoomRoundOverview
+        draw={room}
+        activeRoundId={activeRoundId}
+        roundOptions={roundOptions}
+        onRoundChange={onRoundChange}
+      />
+      <section className="panel archived-number-records" aria-label={`${formatRoundLabel(activeRoundId)}號碼紀錄`}>
+        <header>
+          <div><h2>{formatRoundLabel(activeRoundId)}號碼紀錄</h2><span>{occupiedCount} / {slots.length || room.cardCount || 20} 已選</span></div>
+          <small>唯讀</small>
+        </header>
+        <div className="archive-slot-grid">
+          {loading ? <InlineLoading label="正在載入號碼紀錄..." /> : slots.map((slot) => {
+            const occupied = slot.status !== "available";
+            const mine = occupied && slot.uid === profile?.uid;
+            return (
+              <div className={mine ? "mine" : occupied ? "occupied" : ""} key={slot.id}>
+                <strong>{slot.number}</strong>
+                <small>{mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選"}</small>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function BetaStickyControls({ onOpenNumbers, profile }) {
+  function scrollToChat() {
+    document.getElementById("hall-chat")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function openRecords() {
+    if (!profile?.uid) {
+      alert("登入後即可查看我的紀錄。");
+      return;
+    }
+    window.dispatchEvent(new CustomEvent("beta-open-room-records"));
+  }
+
+  return (
+    <>
+      <nav className="beta-desktop-sticky-controls" aria-label="桌面直播快捷功能">
+        <button className="support" type="button" onClick={() => window.dispatchEvent(new CustomEvent("beta-open-support"))}>
+          <Headphones size={17} /><span>聯絡客服</span>
+        </button>
+        <button className="records" type="button" onClick={openRecords}>
+          <ListChecks size={17} /><span>我的紀錄</span>
+        </button>
+      </nav>
+      <nav className="beta-mobile-sticky-controls" aria-label="直播快捷功能">
+      <button className="support" type="button" onClick={() => window.dispatchEvent(new CustomEvent("beta-open-support"))}>
+        <Headphones size={15} /><span>聯絡客服</span>
+      </button>
+      <button className="numbers" type="button" onClick={onOpenNumbers}>
+        <Hash size={15} /><span>號碼使用情況</span>
+      </button>
+      <button className="chat" type="button" onClick={scrollToChat}>
+        <MessageCircle size={15} /><span>大廳聊天</span>
+      </button>
+      <button className="records" type="button" onClick={openRecords}>
+        <ListChecks size={15} /><span>我的紀錄</span>
+      </button>
+      </nav>
+    </>
+  );
+}
+
+// Keeps the current round's number usage visible beside the card list on desktop.
+function DesktopNumberOccupancy({ activeRoundId, loading, profile, slots }) {
+  const occupiedCount = slots.filter((slot) => slot.status !== "available").length;
+
+  return (
+    <aside className="desktop-number-occupancy" aria-label="天堂地獄號碼使用情況">
+      <header>
+        <div>
+          <strong>天堂地獄號碼</strong>
+          <small>{formatRoundLabel(activeRoundId)} · 即時更新</small>
+        </div>
+        <span>{occupiedCount} / {slots.length || 20} 已選</span>
+      </header>
+      <div className="desktop-number-grid">
+        {loading ? (
+          <InlineLoading label="正在載入號碼..." />
+        ) : slots.map((slot) => {
+          const occupied = slot.status !== "available";
+          const mine = occupied && slot.uid === profile?.uid;
+          return (
+            <button
+              className={mine ? "mine" : occupied ? "occupied" : ""}
+              disabled
+              key={slot.id}
+              type="button"
+            >
+              <strong>{slot.number}</strong>
+              <small>{mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選"}</small>
+            </button>
+          );
+        })}
+      </div>
+      <div className="desktop-number-legend">
+        <span><i />未選</span>
+        <span><i />已被選</span>
+        <span><i />我的號碼</span>
+      </div>
+    </aside>
+  );
+}
+
+function RoomRecordsDrawer({ currentRoomId, profile }) {
+  const [open, setOpen] = useState(false);
+  const [records, setRecords] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    if (profile.isDemo) {
+      setRecords(BETA_DEMO_RECORDS);
+      setLoading(false);
+      return undefined;
+    }
+
+    setLoading(true);
+    const recordsQuery = query(collection(db, "drawRecords"), where("uid", "==", profile.uid));
+    return onSnapshot(recordsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+      setRecords(
+        snapshot.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .filter((item) => item.source !== "vip")
+          .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt))
+          .slice(0, 20),
+      );
+      if (isSnapshotReady(snapshot)) setLoading(false);
+    }, (error) => {
+      console.error("Room record drawer listener failed.", error);
+      setLoading(false);
+    });
+  }, [open, profile.isDemo, profile.uid]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [open]);
+
+  useEffect(() => {
+    function openFromShortcut() {
+      setOpen(true);
+    }
+
+    window.addEventListener("beta-open-room-records", openFromShortcut);
+    return () => window.removeEventListener("beta-open-room-records", openFromShortcut);
+  }, []);
+
+  return (
+    <>
+      <button
+        className={open ? "room-records-toggle open" : "room-records-toggle"}
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        aria-expanded={open}
+        aria-controls="room-records-drawer"
+        aria-label={open ? "收起我的紀錄" : "開啟我的紀錄"}
+      >
+        <ListChecks size={18} />
+      </button>
+      {open && (
+        <div className="room-records-drawer-layer">
+          <button className="room-records-scrim" type="button" onClick={() => setOpen(false)} aria-label="收起我的紀錄" />
+          <aside id="room-records-drawer" className="room-records-drawer" aria-label="我的紀錄">
+            <header>
+              <div><h2>我的紀錄</h2></div>
+              <button className="icon-btn" type="button" onClick={() => setOpen(false)} aria-label="收起我的紀錄"><ChevronLeft size={20} /></button>
+            </header>
+            <p className="room-records-drawer-count">最近 {records.length} / 20 筆</p>
+            {loading ? (
+              <InlineLoading label="正在載入我的紀錄..." />
+            ) : records.length ? (
+              <div className="room-records-drawer-list">
+                {records.map((record) => {
+                  const resultClass = record.cardId
+                    ? record.resultSide === "hell" ? "hell" : "heaven"
+                    : "pending";
+                  return (
+                    <article className="room-records-drawer-item" key={record.id}>
+                      <div className="room-records-drawer-main">
+                        {record.targetCardImageUrl || record.cardImageUrl ? (
+                          <img src={record.targetCardImageUrl || record.cardImageUrl} alt={record.targetCardName || record.cardName || "目標卡牌"} />
+                        ) : <span className="room-records-drawer-image"><Package size={17} /></span>}
+                        <div>
+                          <strong>{record.drawTitle || record.roomSlug || "抽卡房"}</strong>
+                          <span>{formatRoundLabel(record.round)} · #{record.number || "--"}</span>
+                          <span>所屬盲盒：{record.targetCardName || "未選卡牌"}</span>
+                        </div>
+                      </div>
+                      <footer>
+                        <TokenAmount value={record.tokenCost || 0} />
+                        {record.drawId === currentRoomId && <b>本直播</b>}
+                        <span className={`room-record-result ${resultClass}`}>
+                          {record.cardId ? getResultSideLabel(record.resultSide) : "待開"}
+                        </span>
+                      </footer>
+                    </article>
+                  );
+                })}
+              </div>
+            ) : <p className="empty-state compact-empty">暫時未有抽卡紀錄。</p>}
+          </aside>
+        </div>
+      )}
+    </>
+  );
+}
+
+// Keeps purchase review, payment progress, and completion feedback in one focused flow.
+function BlindBoxPurchaseModal({ purchase, stage, onCancel, onConfirm }) {
+  const isGenerating = stage === "generating";
+  const isComplete = stage === "complete";
+  const odds = getBlindBoxOdds(purchase.shareMode);
+
+  return (
+    <div
+      className="modal-backdrop blind-box-backdrop"
+      role="presentation"
+      onMouseDown={isGenerating ? undefined : onCancel}
+    >
+      <section
+        className={`modal blind-box-modal ${stage}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="blind-box-title"
+        aria-live="polite"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        {stage === "confirm" && (
+          <>
+            <button className="icon-btn modal-close" type="button" onClick={onCancel} aria-label="取消生成盲盒"><X size={19} /></button>
+            <div className="blind-box-visual confirm-visual"><Gift size={48} /></div>
+
+            <h2 id="blind-box-title">確認生成盲盒</h2>
+            <p className="blind-box-copy">確認後會扣除代幣並鎖定號碼，盲盒將會加入你的抽卡紀錄。</p>
+            <section className="blind-box-rules" aria-label="天堂地獄玩法及中獎機率">
+              <div className="blind-box-odds-heading">
+                <span>{odds.label}玩法</span>
+                <strong>盲盒抽中機率 {odds.heavenRate}%</strong>
+              </div>
+              <div className="blind-box-outcome heaven">
+                <span>天堂 · {odds.heavenRate}%</span>
+                <strong>{purchase.card.name}</strong>
+                <small>抽中並獲得所選目標卡</small>
+              </div>
+              <div className="blind-box-outcome hell">
+                <span>地獄 · {odds.hellRate}%</span>
+                <strong>{purchase.hellCardName}</strong>
+                <small>未抽中目標卡時獲得的對應卡牌</small>
+              </div>
+            </section>
+            <div className="blind-box-order">
+              <div><span>房間</span><strong>{purchase.roomTitle}</strong></div>
+              <div><span>場次</span><strong>{formatRoundLabel(purchase.roundId)}</strong></div>
+              <div><span>盲盒號碼</span><strong>#{purchase.slot.number}</strong></div>
+              <div><span>所需代幣</span><strong><TokenAmount value={purchase.tokenCost} /></strong></div>
+            </div>
+            <div className="blind-box-actions">
+              <button className="small-btn" type="button" onClick={onCancel}>返回修改</button>
+              <button className="primary-btn" type="button" onClick={onConfirm}>確認生成盲盒</button>
+            </div>
+          </>
+        )}
+        {isGenerating && (
+          <div className="blind-box-generating">
+            <div className="blind-box-animation" aria-hidden="true">
+              <span className="blind-box-glow" />
+              {Array.from({ length: 10 }, (_, index) => (
+                <span className={`blind-box-card blind-box-card-${index + 1}`} key={index} />
+              ))}
+              <span className="blind-box-cube"><Gift size={54} /></span>
+              <i /><i /><i /><i />
+            </div>
+
+            <h2 id="blind-box-title">正在生成盲盒</h2>
+            <p>正在鎖定 #{purchase.slot.number}，請勿關閉頁面。</p>
+          </div>
+        )}
+        {isComplete && (
+          <div className="blind-box-complete">
+            <div className="blind-box-visual complete-visual"><Check size={48} /></div>
+
+            <h2 id="blind-box-title">盲盒生成完成</h2>
+            <p><strong>#{purchase.slot.number}</strong> 已成功加入你的抽卡紀錄。</p>
+            <button className="primary-btn" type="button" onClick={onCancel}>返回揀卡</button>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function BetaPsaCarousel({ cards, rooms, onOpenRoom, onSelectCard }) {
+  const featuredCards = useMemo(() => {
+    const roomCards = rooms.flatMap((room) => normalizeRoomCards(room.poolCards));
+    const uniqueCards = new Map();
+
+    [...cards, ...roomCards].forEach((card) => {
+      const key = String(card.id || card.name || "").trim();
+      const value = Number(card.tokenValue || 0);
+      if (!key || !card.name || !card.imageUrl || value <= 0 || uniqueCards.has(key)) return;
+      uniqueCards.set(key, { ...card, tokenValue: value });
+    });
+
+    return [...uniqueCards.values()]
+      .sort((left, right) => right.tokenValue - left.tokenValue)
+      .slice(0, 12);
+  }, [cards, rooms]);
+
+  if (!featuredCards.length) return null;
+
+  function openLiveRoom(card) {
+    const liveRooms = rooms.filter((room) => room.status === "live");
+    const cardId = String(card.id || "");
+    const cardName = String(card.name || "").trim().toLowerCase();
+    const matchingRoom = liveRooms.find((room) => {
+      const roomCardIds = getRoomPoolIds(room);
+      const roomCards = normalizeRoomCards(room.poolCards);
+      return (cardId && roomCardIds.includes(cardId)) || roomCards.some((roomCard) =>
+        (cardId && String(roomCard.id || "") === cardId)
+        || String(roomCard.name || "").trim().toLowerCase() === cardName,
+      );
+    });
+    const destinationRoom = matchingRoom || liveRooms[0];
+
+    if (!destinationRoom) {
+      alert("目前暫時未有直播中房間，請稍後再試。");
+      return;
+    }
+    if (onSelectCard) onSelectCard(card);
+    else onOpenRoom(destinationRoom);
+  }
+
+  return (
+    <section className="beta-psa-carousel" aria-labelledby="beta-psa-title">
+      <div className="beta-psa-heading">
+        <div>
+          <h2 id="beta-psa-title">即時直播盲盒抽卡</h2>
+        </div>
+      </div>
+      <div className="beta-psa-viewport" tabIndex="0" aria-label="PSA10 卡牌走馬燈">
+        <div className="beta-psa-track">
+          {[false, true].map((duplicate) => (
+            <div
+              aria-hidden={duplicate || undefined}
+              className="beta-psa-group"
+              key={duplicate ? "duplicate" : "primary"}
+            >
+              {featuredCards.map((card) => (
+                <button
+                  className="beta-psa-card"
+                  key={`${duplicate ? "copy" : "card"}-${card.id || card.name}`}
+                  type="button"
+                  tabIndex={duplicate ? -1 : 0}
+                  onClick={() => openLiveRoom(card)}
+                  aria-label={`進入直播中房間抽 ${card.name}`}
+                >
+                  <span className="beta-psa-badge">PSA 10</span>
+                  <img src={card.imageUrl} alt={card.name} loading="lazy" />
+                  <strong title={card.name}>{card.name}</strong>
+                  <div className="beta-psa-price">
+                    <del><TokenAmount value={card.tokenValue} /></del>
+                    <b><TokenAmount value={Math.max(1, Math.round(card.tokenValue / 10))} /></b>
+                  </div>
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function RoomList({ rooms, cards = [], error, loading, onOpenRoom, profile }) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const [betaFilter, setBetaFilter] = useState("live");
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const betaFilters = [
+    { id: "live", label: "直播中", sublabel: "" },
+    { id: "draft", label: "即將開", sublabel: "" },
+    { id: "half", label: "二份之一", sublabel: "1/2" },
+    { id: "fifth", label: "五份之一", sublabel: "1/5" },
+    { id: "tenth", label: "十分之一", sublabel: "1/10" },
+  ];
+  const visibleRooms = useMemo(() => {
+    if (!isBeta) return rooms;
+    if (betaFilter === "live") return rooms.filter((room) => room.status === "live");
+    if (betaFilter === "draft") return rooms.filter((room) => room.status === "draft");
+    const shareText = { half: "1/2", fifth: "1/5", tenth: "1/10" }[betaFilter];
+    return rooms.filter((room) =>
+      String(room.shareMode || room.drawMode || room.poolText || "").includes(shareText),
+    );
+  }, [betaFilter, isBeta, rooms]);
+
+  if (loading) {
+    return (
+      <section className="panel">
+        <InlineLoading label="正在載入房間..." />
+      </section>
+    );
+  }
+
   if (error && !rooms.length) {
     return (
       <section className="panel empty-state">
@@ -1329,7 +2729,7 @@ function RoomList({ rooms, error, onOpenRoom }) {
     );
   }
 
-  if (!rooms.length) {
+  if (!rooms.length && !isBeta) {
     return (
       <section className="panel empty-state">
         <Gavel size={36} />
@@ -1340,33 +2740,68 @@ function RoomList({ rooms, error, onOpenRoom }) {
   }
 
   return (
-    <section className="panel">
-      <div className="banner-slot">Banner 位置</div>
+    <section className={isBeta ? "panel beta-room-list-panel" : "panel"}>
+      {isBeta && (
+        <div className="beta-announcements" aria-label="最新公告">
+          <div className="beta-announcements-track">
+            {[false, true].map((duplicate) => (
+              <div
+                aria-hidden={duplicate || undefined}
+                className="beta-announcements-group"
+                key={duplicate ? "duplicate" : "primary"}
+              >
+                <strong>最新公告</strong>
+                <span><b>最新</b> 二份之一賽道限量開放。</span>
+                <span><b>活動</b> 首次申請代幣滿指定金額送免費抽選。</span>
+                <span><b>公告</b> 系統維護時間請留意最新消息。</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="banner-slot">
+
+      </div>
+      {isBeta && <BetaPsaCarousel cards={cards} rooms={rooms} onOpenRoom={onOpenRoom} />}
+      {isBeta && (
+        <div className="beta-room-filters" aria-label="房間篩選">
+          {betaFilters.map((filter) => (
+            <button
+              className={betaFilter === filter.id ? "active" : ""}
+              key={filter.id}
+              type="button"
+              onClick={() => setBetaFilter(filter.id)}
+            >
+              {filter.sublabel && <b>{filter.sublabel}</b>}
+              <span>{filter.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
       <div className="section-heading">
         <Gavel size={24} />
         <div>
-          <p className="eyebrow">Rooms</p>
-          <h1>抽卡房間</h1>
+
+          <h1>{isBeta ? "所有房間" : "抽卡房間"}</h1>
         </div>
-        <button className="small-btn" type="button">
-          玩法介紹
-        </button>
+        {isBeta ? (
+          <div className="beta-room-heading-actions">
+            <span className="beta-room-count">
+              {visibleRooms.length} 間 · {rooms.filter((room) => room.status === "live").length} 直播中
+            </span>
+            <button className="small-btn" type="button" onClick={() => setRulesOpen(true)}>
+              玩法介紹
+            </button>
+          </div>
+        ) : (
+          <button className="small-btn" type="button">玩法介紹</button>
+        )}
       </div>
       {error && <p className="form-note">Live room refresh warning: {error}</p>}
-      <div className="room-list-grid">
-        {rooms.map((room, index) => {
-          const roomCards = normalizeRoomCards(room.poolCards);
-          const roomValues = roomCards
-            .map((card) => Number(card.tokenValue || 0))
-            .filter((value) => value > 0);
-          const minValue = roomValues.length ? Math.min(...roomValues) : Number(room.tokenCost || 0);
-          const maxValue = roomValues.length ? Math.max(...roomValues) : Number(room.tokenCost || 0);
-          const priceText =
-            minValue === maxValue
-              ? formatTokenNumber(minValue)
-              : `${formatTokenNumber(minValue)}-${formatTokenNumber(maxValue)}`;
-
-          return (
+      <div className={isBeta ? "beta-home-room-layout" : undefined}>
+        <div className="room-list-grid">
+          {visibleRooms.map((room) => {
+            return (
             <button
               className="room-card"
               key={room.id}
@@ -1386,29 +2821,41 @@ function RoomList({ rooms, error, onOpenRoom }) {
                 </span>
               </div>
               <div className="room-card-body">
-                <strong>{String(index + 7).padStart(2, "0")} 號房</strong>
-                <div className="room-price-row">
-                  <span>入場價</span>
-                  <b>⚡ {priceText}</b>
-                </div>
-                <div className="room-progress">
-                  <span style={{ width: `${room.status === "live" ? 55 : 14}%` }} />
-                </div>
-                <div className="room-sub-row">
-                  <span>中卡率 50%</span>
-                  <span>{room.status === "live" ? "18:42 後開播" : "22:00 開播"}</span>
-                </div>
-                <span>
-                  {room.title} · {formatRoundLabel(toRoundId(getRoomCurrentRound(room)))} / 共 {getRoomRoundCount(room)} 場 · {room.cardCount} 個號碼
-                </span>
-                <span className="room-cta">
-                  {room.status === "live" ? "確認入場" : "查看房間"}
+                <strong>{room.title}</strong>
+                <span>{formatRoundLabel(toRoundId(getRoomCurrentRound(room)))} / 共 {getRoomRoundCount(room)} 場</span>
+                <span className="beta-room-start-time">
+                  開場時間：{formatRoundSchedule(room, toRoundId(getRoomCurrentRound(room)))}
                 </span>
               </div>
             </button>
-          );
-        })}
+            );
+          })}
+          {!visibleRooms.length && (
+            <div className="empty-state compact-empty room-filter-empty">
+              <Gavel size={28} />
+              <p className="muted">呢個分類暫時未有房間。</p>
+            </div>
+          )}
+        </div>
+        {isBeta && <BetaRecentRecords profile={profile} />}
       </div>
+      {isBeta && rulesOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setRulesOpen(false)}>
+          <section className="modal beta-rules-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="icon-btn modal-close" type="button" onClick={() => setRulesOpen(false)} aria-label="關閉玩法介紹">
+              <X size={18} />
+            </button>
+
+            <h2>抽卡玩法</h2>
+            <ol>
+              <li>進入直播房間，先選擇想抽中的目標卡牌。</li>
+              <li>選擇場次及未被鎖定的天堂地獄號碼。</li>
+              <li>確認付款後扣除代幣並鎖定號碼，等待直播開牌。</li>
+              <li>結果分配後可在「我的卡牌」申請配送或轉回代幣。</li>
+            </ol>
+          </section>
+        </div>
+      )}
     </section>
   );
 }
@@ -1417,10 +2864,15 @@ const CardPoolPreview = memo(function CardPoolPreview({
   draw,
   cards,
   cardCategories,
+  loading,
   selectedCardId,
+  selectedCard,
   onSelectCard,
+  onContinue,
 }) {
   const [categoryFilter, setCategoryFilter] = useState("全部");
+  const [priceSort, setPriceSort] = useState("high");
+  const cardGridRef = useRef(null);
   const categories = useMemo(
     () => getCardCategories(cards, cardCategories),
     [cardCategories, cards],
@@ -1429,32 +2881,70 @@ const CardPoolPreview = memo(function CardPoolPreview({
     () =>
       cards
         .filter((card) => categoryFilter === "全部" || getCardCategory(card) === categoryFilter)
-        .sort((a, b) => Number(b.tokenValue || 0) - Number(a.tokenValue || 0)),
-    [cards, categoryFilter],
+        .sort((a, b) =>
+          priceSort === "high"
+            ? Number(b.tokenValue || 0) - Number(a.tokenValue || 0)
+            : Number(a.tokenValue || 0) - Number(b.tokenValue || 0),
+        ),
+    [cards, categoryFilter, priceSort],
   );
 
+  useEffect(() => {
+    cardGridRef.current?.scrollTo({ left: 0, top: 0, behavior: "smooth" });
+  }, [categoryFilter, priceSort]);
+
   return (
-    <section className="panel card-pool-preview">
+    <section id="card-selection" className="panel card-pool-preview">
       <div>
         <p className="eyebrow">第一步</p>
-        <h2>先選您想要的PSA10卡</h2>
+        <h2>選擇卡牌</h2>
       </div>
       <span>共 {cards.length || draw.cardCount || 0} 張可選</span>
-      {cards.length ? (
+      {loading ? (
+        <InlineLoading label="正在載入房間卡池..." />
+      ) : cards.length ? (
         <>
-          <div className="category-filter">
-            {categories.map((category) => (
+          <div className="card-pool-toolbar">
+            <div className="category-filter">
+              {categories.map((category) => (
+                <button
+                  className={categoryFilter === category ? "active" : ""}
+                  key={category}
+                  type="button"
+                  onClick={() => setCategoryFilter(category)}
+                >
+                  {category}
+                </button>
+              ))}
+            </div>
+            <div className="price-sort-filter" aria-label="卡牌價格排序">
               <button
-                className={categoryFilter === category ? "active" : ""}
-                key={category}
+                className={priceSort === "high" ? "active" : ""}
                 type="button"
-                onClick={() => setCategoryFilter(category)}
+                onClick={() => setPriceSort("high")}
               >
-                {category}
+                價高
               </button>
-            ))}
+              <button
+                className={priceSort === "low" ? "active" : ""}
+                type="button"
+                onClick={() => setPriceSort("low")}
+              >
+                價低
+              </button>
+            </div>
           </div>
-          <div className="pool-card-grid">
+          <div className="card-step-action">
+            <div>
+              <span>已選卡牌</span>
+              <strong>{selectedCard?.name || "請先選擇卡牌"}</strong>
+              {selectedCard && <TokenAmount value={selectedCard.tokenValue} />}
+            </div>
+            <button className="primary-btn" type="button" disabled={!selectedCard} onClick={onContinue}>
+              確定 · 選擇號碼
+            </button>
+          </div>
+          <div className="pool-card-grid" ref={cardGridRef}>
             {visibleCards.map((card) => (
               <button
                 className={selectedCardId === card.id ? "pool-card selected" : "pool-card"}
@@ -1468,7 +2958,6 @@ const CardPoolPreview = memo(function CardPoolPreview({
                     alt={card.name}
                     loading="lazy"
                     decoding="async"
-                    fetchPriority="low"
                   />
                 ) : (
                   <div className="image-placeholder">
@@ -1477,7 +2966,7 @@ const CardPoolPreview = memo(function CardPoolPreview({
                 )}
                 <strong>{card.name}</strong>
                 <small>{getCardCategory(card)}</small>
-                <span>⚡ {formatTokenNumber(card.tokenValue)}</span>
+                <TokenAmount value={card.tokenValue} />
               </button>
             ))}
           </div>
@@ -1491,19 +2980,85 @@ const CardPoolPreview = memo(function CardPoolPreview({
   );
 });
 
+// Keeps every live date and round visible beneath the stream, matching the single-hall layout.
+function RoomRoundOverview({ draw, activeRoundId, roundOptions, onRoundChange }) {
+  const groups = getRoundsByDate(draw, roundOptions);
+  const activeGroup = groups.find((group) => group.rounds.includes(activeRoundId)) || groups[0];
+  const activeRoundStatus = getRoundDisplayStatus(draw, activeRoundId);
+  const activeResultImage = draw.roundResultImages?.[activeRoundId] || "";
+
+  return (
+    <section className="room-round-overview" aria-label="抽卡場次">
+      <div className="room-round-date-navigation">
+        <strong>按日期查看場次／過往賽果</strong>
+        <div className="room-round-date-tabs" aria-label="選擇直播日期">
+          {groups.map((group) => (
+            <button
+              className={group.key === activeGroup?.key ? "active" : ""}
+              key={group.key}
+              type="button"
+              onClick={() => onRoundChange(group.rounds[0])}
+            >
+              {group.fullLabel}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="room-round-card-strip">
+        {(activeGroup?.rounds || roundOptions).map((roundId) => {
+          const roundStatus = getRoundDisplayStatus(draw, roundId);
+          return (
+            <button
+              className={activeRoundId === roundId ? "active" : ""}
+              key={roundId}
+              type="button"
+              onClick={() => onRoundChange(roundId)}
+            >
+              <span className={`round-status ${roundStatus.key}`}>{roundStatus.label}</span>
+              <strong>{formatRoundLabel(roundId)}</strong>
+              <small>盲盒機率：{getBlindBoxOdds(getRoomShareMode(draw, roundId)).label}</small>
+              <time>{formatRoundSchedule(draw, roundId)}</time>
+            </button>
+          );
+        })}
+      </div>
+      {activeRoundStatus.key === "completed" && (
+        <section className="round-overview-result" aria-label={`${formatRoundLabel(activeRoundId)}過往賽果`}>
+          <div>
+            <FileImage size={17} />
+            <span><strong>{formatRoundLabel(activeRoundId)}賽果</strong><small>{activeGroup?.fullLabel || "過往場次"}</small></span>
+          </div>
+          {activeResultImage ? (
+            <a href={activeResultImage} target="_blank" rel="noreferrer" aria-label={`放大查看${formatRoundLabel(activeRoundId)}賽果`}>
+              <img src={activeResultImage} alt={`${formatRoundLabel(activeRoundId)}正式賽果`} />
+              <span>按圖放大查看</span>
+            </a>
+          ) : (
+            <p>呢一場已完結，賽果相片整理中。</p>
+          )}
+        </section>
+      )}
+    </section>
+  );
+}
+
 function NumberGrid({
   draw,
   slots,
+  loading,
   profile,
   selectedCard,
   activeRoundId,
   roundOptions,
   selectedSlotNumber,
   buyingNumber,
+  onBack,
   onRoundChange,
   onSelectNumber,
   onBuy,
 }) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+
   if (draw.status !== "live") {
     return (
       <section className="panel empty-state compact-empty">
@@ -1519,47 +3074,90 @@ function NumberGrid({
   const currentRoundId = toRoundId(getRoomCurrentRound(draw));
   const activeRoundSort = getRoundSortValue(activeRoundId);
   const currentRoundSort = getRoundSortValue(currentRoundId);
-  const roundIsCurrent = activeRoundId === currentRoundId;
+  const roundHasEnded = activeRoundSort < currentRoundSort;
+  const roundIsPurchasable = activeRoundSort >= currentRoundSort;
   const buyingBlocked = isRoundBuyingBlocked(draw, activeRoundId);
-  const roundLockedReason = activeRoundSort < currentRoundSort ? "已過場" : "未開場";
+  const roundResultImage = draw.roundResultImages?.[activeRoundId] || "";
+  const roundOutcomeDescription = {
+    "1/2": "開牌後，將會有10張開出天堂，10張開出地獄。（二份之一）",
+    "1/10": "開牌後，將會有2張開出天堂，另外有18張開出地獄。（十份之一）",
+    "1/5": "開牌後，將會有4張開出天堂，另外有16張開出地獄。（五份之一）",
+  }[getRoomShareMode(draw, activeRoundId)];
+  const roundsByDate = getRoundsByDate(draw, roundOptions);
+  const activeDateGroup = roundsByDate.find((group) => group.rounds.includes(activeRoundId));
+  const visibleRoundOptions = activeDateGroup?.rounds || roundOptions;
   const mySlots = slots.filter((slot) => slot.uid === profile?.uid);
   const selectedNumber = selectedSlotNumber || buyingNumber || null;
-  const canPay = Boolean(roundIsCurrent && !buyingBlocked && selectedCard && selectedSlotNumber && !buyingNumber);
+  const canPay = Boolean(roundIsPurchasable && !buyingBlocked && selectedCard && selectedSlotNumber && !buyingNumber);
 
   return (
-    <section className="panel number-panel">
+    <section id="number-selection" className="panel number-panel">
       <div className="section-heading compact number-heading">
         <div>
           <p className="eyebrow">第二步</p>
-          <h2>選擇天堂地獄號碼</h2>
+          <h2>選擇號碼</h2>
+          <p className="number-outcome-description">{roundOutcomeDescription}</p>
         </div>
+        <button className="small-btn number-step-back" type="button" onClick={onBack}>
+          <ChevronLeft size={17} />上一步 · 重新揀牌
+        </button>
       </div>
-      <div className="round-selector" aria-label="選擇場次">
-        {roundOptions.map((roundId) => (
-          <button
-            className={activeRoundId === roundId ? "active" : ""}
-            key={roundId}
-            type="button"
-            onClick={() => onRoundChange(roundId)}
-          >
-            {formatRoundLabel(roundId)}
-          </button>
-        ))}
+      {!isBeta && <aside className="round-stage-list" aria-label="場次列表">
+        <header><span>場次列表</span><small>共 {roundOptions.length} 場</small></header>
+        <div className="round-date-bar" aria-label="按日期查看過往賽果">
+          {roundsByDate.map((group) => (
+            <button
+              className={group.key === activeDateGroup?.key ? "active" : ""}
+              key={group.key}
+              type="button"
+              onClick={() => onRoundChange(group.rounds[0])}
+            >
+              {group.label}
+            </button>
+          ))}
+        </div>
+        <div className="round-selector">
+          {visibleRoundOptions.map((roundId) => {
+            const roundStatus = getRoundDisplayStatus(draw, roundId);
+            return (
+              <button
+                className={activeRoundId === roundId ? "active" : ""}
+                key={roundId}
+                type="button"
+                onClick={() => onRoundChange(roundId)}
+              >
+                <strong>{formatRoundLabel(roundId)}</strong>
+                <small>{formatRoundSchedule(draw, roundId)} · {getRoomShareMode(draw, roundId)}</small>
+                <em className={`round-status ${roundStatus.key}`}>{roundStatus.label}</em>
+              </button>
+            );
+          })}
+        </div>
+      </aside>}
+      <div className="round-time-summary">
+        <Clock3 size={16} />
+        <span>預計開卡：{formatRoundSchedule(draw, activeRoundId)}</span>
       </div>
-      <p className="muted number-help">
-        {!roundIsCurrent
-          ? `${formatRoundLabel(activeRoundId)}${roundLockedReason}，只可以查看紀錄，不能再鎖定號碼。`
+      {(roundHasEnded || buyingBlocked || selectedCard) && <p className="muted number-help">
+        {roundHasEnded
+          ? `${formatRoundLabel(activeRoundId)}已過場，只可以查看紀錄，不能再鎖定號碼。`
           : buyingBlocked
           ? `${formatRoundLabel(activeRoundId)}已停止購買，只可以查看紀錄，不能再鎖定號碼。`
-          : selectedCard
-          ? `已選 ${selectedCard.name}，${formatRoundLabel(activeRoundId)}共 ${draw.cardCount} 個號碼，已被選走的號碼無法重選。`
-          : "請先在第一步選擇卡牌，然後才可選號。"}
-      </p>
-      <div className="slot-grid">
-        {slots.map((slot) => {
+          : `已選 ${selectedCard.name}，${formatRoundLabel(activeRoundId)}共 ${draw.cardCount} 個號碼，已被選走的號碼無法重選。`}
+      </p>}
+      {!selectedCard && (
+        <div className="number-card-gate" role="status">
+          <Package size={23} />
+          <div><strong>號碼使用情況</strong><span>你可以先查看哪些號碼已被選走；如要購買，請返回上一步選擇卡牌。</span></div>
+        </div>
+      )}
+      <div className={selectedCard ? "slot-grid" : "slot-grid card-required"}>
+        {loading ? (
+          <InlineLoading label="正在載入可選號碼..." />
+        ) : slots.map((slot) => {
           const locked = slot.status !== "available";
           const mine = locked && slot.uid === profile?.uid;
-          const selected = roundIsCurrent && !buyingBlocked && !locked && slot.number === selectedSlotNumber;
+          const selected = roundIsPurchasable && !buyingBlocked && !locked && slot.number === selectedSlotNumber;
           return (
             <button
               className={
@@ -1571,7 +3169,7 @@ function NumberGrid({
                       ? "slot selected"
                       : "slot"
               }
-              disabled={!roundIsCurrent || buyingBlocked || !selectedCard || locked || buyingNumber === slot.number}
+              disabled={!roundIsPurchasable || buyingBlocked || !selectedCard || locked || buyingNumber === slot.number}
               key={slot.id}
               type="button"
               onClick={() => onSelectNumber(slot.number)}
@@ -1580,12 +3178,12 @@ function NumberGrid({
               <small>
                 {mine
                   ? "你的號碼"
-                  : !roundIsCurrent
-                    ? roundLockedReason
-                  : buyingBlocked
-                    ? "已停止"
                   : locked
                     ? slot.username || "已被選走"
+                  : roundHasEnded
+                    ? "已過場"
+                  : buyingBlocked
+                    ? "已停止"
                     : buyingNumber === slot.number
                       ? "購買中..."
                       : selected
@@ -1602,6 +3200,20 @@ function NumberGrid({
         <span><i />我的號碼</span>
       </div>
       <div className="number-divider" />
+      {(roundHasEnded || draw.status === "completed") && roundResultImage && (
+        <section className="room-round-result after-grid" aria-label={`${formatRoundLabel(activeRoundId)}賽果相片`}>
+          <div className="room-round-result-heading">
+            <FileImage size={18} />
+            <div>
+              <strong>{formatRoundLabel(activeRoundId)}正式賽果</strong>
+              <span>點擊圖片可以放大查看</span>
+            </div>
+          </div>
+          <a href={roundResultImage} target="_blank" rel="noreferrer" aria-label={`放大查看${formatRoundLabel(activeRoundId)}賽果`}>
+            <img src={roundResultImage} alt={`${formatRoundLabel(activeRoundId)}賽果`} />
+          </a>
+        </section>
+      )}
       <div className="selected-number-row">
         <span>
           你在{formatRoundLabel(activeRoundId)}已鎖 {mySlots.length} 個號碼
@@ -1617,8 +3229,8 @@ function NumberGrid({
         <span>
           {selectedCard && selectedSlotNumber
             ? `付款 ⚡ ${formatTokenNumber(selectedCard.tokenValue || draw.tokenCost)} 並鎖定號碼`
-            : !roundIsCurrent
-              ? roundLockedReason
+            : roundHasEnded
+              ? "已過場"
             : buyingBlocked
               ? ROUND_BUY_LOCKED_LABEL
             : selectedCard
@@ -1631,38 +3243,135 @@ function NumberGrid({
 }
 
 const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
-  const embedUrl = useMemo(() => toKickEmbedUrl(kickUrl), [kickUrl]);
+  const [isMuted, setIsMuted] = useState(true);
+  const embedUrl = useMemo(() => {
+    const playerUrl = toKickEmbedUrl(kickUrl);
+    return playerUrl
+      ? `${playerUrl}?autoplay=true&muted=${isMuted}&allowfullscreen=true`
+      : "";
+  }, [isMuted, kickUrl]);
+  const frameWrapRef = useRef(null);
+  const playerFrameRef = useRef(null);
+  const inlinePlayerSizeRef = useRef(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [fullscreenScale, setFullscreenScale] = useState(1);
+
+  useEffect(() => {
+    function fitExistingPlayerToFullscreen() {
+      const size = inlinePlayerSizeRef.current;
+      if (!size?.width || !size?.height) return;
+      setFullscreenScale(Math.min(window.innerWidth / size.width, window.innerHeight / size.height));
+    }
+
+    function syncFullscreenState() {
+      const fullscreen = document.fullscreenElement === frameWrapRef.current;
+      setIsFullscreen(fullscreen);
+      if (fullscreen) {
+        window.requestAnimationFrame(fitExistingPlayerToFullscreen);
+      } else {
+        setFullscreenScale(1);
+      }
+    }
+
+    document.addEventListener("fullscreenchange", syncFullscreenState);
+    window.addEventListener("resize", fitExistingPlayerToFullscreen);
+    return () => {
+      document.removeEventListener("fullscreenchange", syncFullscreenState);
+      window.removeEventListener("resize", fitExistingPlayerToFullscreen);
+    };
+  }, []);
 
   if (!embedUrl) {
-    return <div className="stream-fallback">尚未設定 Kick 直播連結</div>;
+    return <div className="stream-fallback">尚未設定有效的 Kick 頻道</div>;
+  }
+
+  async function toggleFullscreen() {
+    try {
+      if (document.fullscreenElement === frameWrapRef.current) {
+        await document.exitFullscreen?.();
+      } else {
+        const playerRect = playerFrameRef.current?.getBoundingClientRect();
+        if (playerRect?.width && playerRect?.height) {
+          inlinePlayerSizeRef.current = {
+            width: playerRect.width,
+            height: playerRect.height,
+          };
+        }
+        await frameWrapRef.current?.requestFullscreen?.();
+      }
+    } catch {
+      // Browsers may reject fullscreen changes; the player remains usable inline.
+    }
   }
 
   return (
-    <iframe
-      className="kick-frame"
-      src={embedUrl}
-      title={`${title} Kick stream`}
-      allow="autoplay; fullscreen; picture-in-picture"
-      scrolling="no"
-      allowFullScreen
-    />
+    <div className="kick-frame-wrap" ref={frameWrapRef}>
+      <iframe
+        className="kick-frame"
+        ref={playerFrameRef}
+        src={embedUrl}
+        style={isFullscreen && inlinePlayerSizeRef.current ? {
+          width: `${inlinePlayerSizeRef.current.width}px`,
+          height: `${inlinePlayerSizeRef.current.height}px`,
+          maxWidth: "none",
+          maxHeight: "none",
+          transform: `scale(${fullscreenScale})`,
+        } : undefined}
+        title={`${title} Kick stream`}
+        allow="autoplay; fullscreen; picture-in-picture"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
+        referrerPolicy="strict-origin-when-cross-origin"
+        scrolling="no"
+        allowFullScreen
+      />
+      <button
+        className="stream-mute-btn"
+        type="button"
+        onClick={() => setIsMuted((current) => !current)}
+        aria-label={isMuted ? "開啟直播聲音" : "將直播靜音"}
+        aria-pressed={isMuted}
+        title={isMuted ? "開啟聲音" : "靜音"}
+      >
+        {isMuted ? <VolumeX size={19} /> : <Volume2 size={19} />}
+      </button>
+      <button
+        className="stream-fullscreen-btn"
+        type="button"
+        onClick={toggleFullscreen}
+        aria-label={isFullscreen ? "縮小直播" : "放大直播"}
+        title={isFullscreen ? "縮小直播" : "放大直播"}
+      >
+        {isFullscreen ? <Minimize2 size={19} /> : <Maximize2 size={19} />}
+      </button>
+    </div>
   );
 });
 
 function ChatRoom({ drawId, profile }) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const chatLogRef = useRef(null);
   const [messages, setMessages] = useState([]);
+  const [messagesLoading, setMessagesLoading] = useState(true);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [cooldownMs, setCooldownMs] = useState(0);
 
   useEffect(() => {
+    // Each live document owns a separate message collection; clear local state before switching rooms.
+    setMessages([]);
+    setText("");
+    setMessagesLoading(true);
     const messagesQuery = query(
       collection(db, "draws", drawId, "messages"),
       orderBy("createdAt", "asc"),
       limitToLast(100),
     );
-    const stopMessages = onSnapshot(messagesQuery, (snapshot) => {
+    const stopMessages = onSnapshot(messagesQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setMessages(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      if (isSnapshotReady(snapshot)) setMessagesLoading(false);
+    }, (error) => {
+      console.error("Room chat listener failed.", error);
+      setMessagesLoading(false);
     });
 
     return stopMessages;
@@ -1689,6 +3398,13 @@ function ChatRoom({ drawId, profile }) {
     const timer = window.setInterval(tick, 250);
     return () => window.clearInterval(timer);
   }, [profile?.lastChatAt]);
+
+  // Keep the live conversation pinned to the newest message as updates arrive.
+  useEffect(() => {
+    const chatLog = chatLogRef.current;
+    if (!chatLog || messagesLoading) return;
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }, [messages, messagesLoading]);
 
   async function sendMessage(event) {
     event.preventDefault();
@@ -1739,15 +3455,17 @@ function ChatRoom({ drawId, profile }) {
 
   return (
     <section className="panel chat-panel">
-      <div className="section-heading compact">
-        <ListChecks size={22} />
+      <div className={isBeta ? "section-heading compact beta-live-chat-heading" : "section-heading compact"}>
+        {!isBeta && <ListChecks size={22} />}
         <div>
-          <p className="eyebrow">Room chat</p>
-          <h2>房間聊天</h2>
+          {isBeta && <span>LIVE CHAT</span>}
+          <h2>大廳聊天</h2>
         </div>
       </div>
-      <div className="chat-log">
-        {messages.length ? (
+      <div className="chat-log" ref={chatLogRef} aria-live="polite">
+        {messagesLoading ? (
+          <InlineLoading label="正在載入大廳訊息..." />
+        ) : messages.length ? (
           messages.map((message) => (
             <article
               className={message.uid === profile.uid ? "chat-message own-message" : "chat-message"}
@@ -1761,7 +3479,7 @@ function ChatRoom({ drawId, profile }) {
             </article>
           ))
         ) : (
-          <p className="muted">這個房間暫時未有訊息。</p>
+          <p className="muted">大廳暫時未有訊息。</p>
         )}
       </div>
       <form className="chat-form" onSubmit={sendMessage}>
@@ -1769,7 +3487,7 @@ function ChatRoom({ drawId, profile }) {
           value={text}
           maxLength={500}
           onChange={(event) => setText(event.target.value)}
-          placeholder="輸入房間訊息"
+          placeholder="輸入大廳訊息"
           disabled={sending}
         />
         <button className="primary-btn" type="submit" disabled={sendDisabled}>
@@ -1781,14 +3499,22 @@ function ChatRoom({ drawId, profile }) {
   );
 }
 
-function toKickEmbedUrl(kickUrl) {
+function getKickChannel(kickValue) {
+  const value = String(kickValue || "").trim();
+  if (/^[A-Za-z0-9_-]{2,40}$/.test(value)) return value;
   try {
-    const url = new URL(kickUrl);
-    const channel = url.pathname.split("/").filter(Boolean)[0];
-    return channel ? `https://player.kick.com/${channel}` : "";
+    const url = new URL(value);
+    if (!["kick.com", "www.kick.com", "player.kick.com"].includes(url.hostname.toLowerCase())) return "";
+    const channel = url.pathname.split("/").filter(Boolean)[0] || "";
+    return /^[A-Za-z0-9_-]{2,40}$/.test(channel) ? channel : "";
   } catch {
     return "";
   }
+}
+
+function toKickEmbedUrl(kickValue) {
+  const channel = getKickChannel(kickValue);
+  return channel ? `https://player.kick.com/${channel}` : "";
 }
 
 function RoomThumbnail({ draw }) {
@@ -1806,7 +3532,7 @@ function VipProgramPanel({ deposit, tiers }) {
     <section className="vip-program-panel">
       <div className="vip-program-header">
         <div>
-          <p className="eyebrow">VIP program</p>
+
           <h1>
             VIP 等級 <span>{vip.currentTier?.name || "未入級"}</span>
           </h1>
@@ -1856,8 +3582,10 @@ function VipProgramPanel({ deposit, tiers }) {
 }
 
 function TokenRequest({ profile }) {
-  const tokenPackages = useTokenPackages();
-  const vipTiers = useVipProgram();
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const tokenPackages = useTokenPackages(!profile.isDemo);
+  const paymentSettings = usePaymentSettings(!profile.isDemo);
+  const vipTiers = useVipProgram(!profile.isDemo);
   const [selectedPackage, setSelectedPackage] = useState(tokenPackages[0].hkd);
   const [customHkd, setCustomHkd] = useState("");
   const [proof, setProof] = useState(null);
@@ -1866,6 +3594,7 @@ function TokenRequest({ profile }) {
   const [fpsName, setFpsName] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [requests, setRequests] = useState([]);
+  const [requestsLoading, setRequestsLoading] = useState(true);
   const usingCustomAmount = selectedPackage === "custom";
   const hkdAmount = usingCustomAmount ? Number(customHkd || 0) : Number(selectedPackage);
   const tokenAmount = usingCustomAmount
@@ -1875,8 +3604,8 @@ function TokenRequest({ profile }) {
   const bonusTokens = Math.max(0, tokenAmount - baseTokens);
   const bonusRate = baseTokens > 0 ? Math.round((bonusTokens / baseTokens) * 100) : 0;
   const approvedDeposit = requests
-    .filter((request) => request.status === "approved")
-    .reduce((sum, request) => sum + Number(request.hkdAmount || 0), 0);
+    .filter((request) => request.status === "approved" && request.proofMode !== "promo")
+    .reduce((sum, request) => sum + Number(request.verifiedHkdAmount ?? request.hkdAmount ?? 0), 0);
   const cumulativeDeposit = Math.max(Number(profile.totalDeposits || 0), approvedDeposit);
 
   useEffect(() => {
@@ -1889,30 +3618,62 @@ function TokenRequest({ profile }) {
   }, [selectedPackage, tokenPackages]);
 
   useEffect(() => {
+    if (profile.isDemo) {
+      setRequests([
+        {
+          id: "demo-token-request",
+          amount: 1050,
+          hkdAmount: 1000,
+          status: "approved",
+          fpsName: "Demo Player",
+        },
+      ]);
+      setRequestsLoading(false);
+      return undefined;
+    }
+    setRequestsLoading(true);
     const requestsQuery = query(
       collection(db, "tokenRequests"),
       where("uid", "==", profile.uid),
     );
-    const stopRequests = onSnapshot(requestsQuery, (snapshot) => {
+    const stopRequests = onSnapshot(requestsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setRequests(
         snapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }))
           .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt)),
       );
+      if (isSnapshotReady(snapshot)) setRequestsLoading(false);
+    }, (error) => {
+      console.error("Token request listener failed.", error);
+      setRequestsLoading(false);
     });
 
     return stopRequests;
-  }, [profile.uid]);
+  }, [profile.isDemo, profile.uid]);
 
   async function submitRequest(event) {
     event.preventDefault();
 
-    if (hkdAmount < 500 || tokenAmount < 1) {
+    if (profile.isDemo) {
+      alert("測試帳戶只供預覽，不會提交代幣申請。");
+      return;
+    }
+
+    if (!Number.isSafeInteger(hkdAmount) || hkdAmount < 500 || hkdAmount > 1000000 || tokenAmount < 1 || tokenAmount > 1000000) {
       alert("請選擇套餐，或輸入最少 HK$500 的自訂金額。");
       return;
     }
-    if (!fpsIdentifier.trim() || !fpsName.trim()) {
-      alert("請輸入轉數快識別碼及收款人姓名，方便管理員核對。");
+    const cleanPromoCode = promoCode.trim();
+    if (!proof && !cleanPromoCode) {
+      alert("請上傳付款證明，或輸入活動碼供管理員審核。");
+      return;
+    }
+    const requestFpsIdentifier = isBeta ? paymentSettings.fpsIdentifier : fpsIdentifier.trim();
+    const requestFpsName = isBeta ? paymentSettings.fpsName : fpsName.trim();
+    if (proof && (!requestFpsIdentifier || !requestFpsName)) {
+      alert(isBeta
+        ? "平台尚未設定 FPS 收款資料，請聯絡管理員。"
+        : "請輸入轉數快識別碼及收款人姓名，方便管理員核對。");
       return;
     }
 
@@ -1920,11 +3681,9 @@ function TokenRequest({ profile }) {
     try {
       const claimedUsername = await ensureUsernameClaim(profile.uid, profile.username);
 
-      const proofInfo = await createProofInfo({
-        proof,
-        profile,
-        amount: tokenAmount,
-      });
+      const proofInfo = proof
+        ? await createProofInfo({ proof, profile })
+        : { proofMode: "promo", proofPath: "", proofFileName: "", proofUrl: "" };
 
       await addDoc(collection(db, "tokenRequests"), {
         uid: profile.uid,
@@ -1934,12 +3693,12 @@ function TokenRequest({ profile }) {
         hkdAmount,
         exchangeRate: tokenAmount / hkdAmount,
         packageType: usingCustomAmount ? "custom" : "preset",
-        fpsIdentifier: fpsIdentifier.trim(),
-        fpsName: fpsName.trim(),
+        fpsIdentifier: requestFpsIdentifier,
+        fpsName: requestFpsName,
         ...proofInfo,
         status: "pending",
         adminNote: "",
-        promoCode: promoCode.trim(),
+        promoCode: cleanPromoCode,
         createdAt: serverTimestamp(),
       });
 
@@ -1958,13 +3717,13 @@ function TokenRequest({ profile }) {
 
   return (
     <div className="token-page">
-      <VipProgramPanel deposit={cumulativeDeposit} tiers={vipTiers} />
+      {!isBeta && <VipProgramPanel deposit={cumulativeDeposit} tiers={vipTiers} />}
       <div className="split-layout token-request-layout">
       <section className="panel token-request-panel">
         <div className="section-heading">
           <BadgeDollarSign size={24} />
           <div>
-            <p className="eyebrow">Token request</p>
+
             <h1>申請代幣</h1>
           </div>
         </div>
@@ -1981,7 +3740,7 @@ function TokenRequest({ profile }) {
                 >
                   <strong>HK${formatTokenNumber(item.hkd)}</strong>
                   <span>
-                    ⚡ {formatTokenNumber(item.tokens)}
+                    <TokenAmount value={item.tokens} />
                     <em>+{getTokenBonusRate(item)}% 額外</em>
                   </span>
                 </button>
@@ -2012,7 +3771,7 @@ function TokenRequest({ profile }) {
           )}
           <div className="token-preview">
             <div>
-              <span>申請代幣</span>
+              <span>{isBeta ? "可領取的代幣" : "申請代幣"}</span>
               <em>+{bonusRate}% 額外</em>
             </div>
             <strong><span className="coin-dot">D</span>{formatTokenNumber(tokenAmount)}</strong>
@@ -2021,31 +3780,43 @@ function TokenRequest({ profile }) {
               基本 1:1 = {formatTokenNumber(baseTokens)} 代幣 ＋ 額外 {bonusRate}% = {formatTokenNumber(bonusTokens)} 代幣
             </p>
           </div>
-          <label>
-            轉數快識別碼
-            <input
-              value={fpsIdentifier}
-              onChange={(event) => setFpsIdentifier(event.target.value)}
-              placeholder="請輸入 FPS 識別碼"
-              required
-            />
-          </label>
-          <label>
-            收款人姓名
-            <input
-              value={fpsName}
-              onChange={(event) => setFpsName(event.target.value)}
-              placeholder="請輸入收款人姓名"
-              required
-            />
-          </label>
+          {isBeta ? (
+            <div className="platform-fps-panel">
+              <div>
+                <span>平台 FPS 識別碼</span>
+                <strong>{paymentSettings.fpsIdentifier || "尚未設定"}</strong>
+              </div>
+              <div>
+                <span>收款人姓名</span>
+                <strong>{paymentSettings.fpsName || "尚未設定"}</strong>
+              </div>
+              <button
+                className="small-btn"
+                type="button"
+                disabled={!paymentSettings.fpsIdentifier}
+                onClick={() => navigator.clipboard.writeText(paymentSettings.fpsIdentifier)}
+              >
+                <Copy size={15} />複製 FPS 號碼
+              </button>
+            </div>
+          ) : (
+            <>
+              <label>
+                轉數快識別碼
+                <input value={fpsIdentifier} onChange={(event) => setFpsIdentifier(event.target.value)} placeholder="請輸入 FPS 識別碼" required={Boolean(proof)} />
+              </label>
+              <label>
+                收款人姓名
+                <input value={fpsName} onChange={(event) => setFpsName(event.target.value)} placeholder="請輸入收款人姓名" required={Boolean(proof)} />
+              </label>
+            </>
+          )}
         <FileUpload
             label="付款證明圖片"
             file={proof}
             onChange={setProof}
-            required
           />
-          <div className="form-or-divider"><span>或</span></div>
+          <p className="form-note">付款證明或活動碼擇一提供；所有申請須經人工審核，批准後才會發放代幣。</p>
           <label>
             推廣活動邀請碼
             <input
@@ -2054,8 +3825,14 @@ function TokenRequest({ profile }) {
               placeholder="輸入推廣活動邀請碼（選填）"
             />
           </label>
+          {isBeta && (
+            <div className="claimable-token-field">
+              <span>可領取的代幣</span>
+              <strong><TokenAmount value={tokenAmount} /></strong>
+            </div>
+          )}
           <p className="form-note">
-            基本兌換率 HK$1：2 代幣；入金愈多，額外代幣百分比愈高。審核完成後會自動加入帳戶及 VIP 累積入金。
+            基本兌換率 HK$1：1 代幣；入金愈多，額外代幣百分比愈高。批准後代幣會加入帳戶；只有核實的付款會計入 VIP 累積入金。
           </p>
           <button className="primary-btn" type="submit" disabled={submitting}>
             <FileImage size={18} />
@@ -2068,13 +3845,14 @@ function TokenRequest({ profile }) {
         <div className="section-heading compact">
           <Clock3 size={22} />
           <div>
-            <p className="eyebrow">Status</p>
+
             <h2>我的代幣申請</h2>
           </div>
         </div>
-        <RequestList requests={requests} />
+        <RequestList requests={requests} loading={requestsLoading} />
       </section>
       </div>
+      {isBeta && <VipProgramPanel deposit={cumulativeDeposit} tiers={vipTiers} />}
     </div>
   );
 }
@@ -2103,7 +3881,11 @@ async function createProofInfo({ proof, profile }) {
   };
 }
 
-function RequestList({ requests, adminMode = false, onApprove, onReject }) {
+function RequestList({ requests, loading = false, adminMode = false, onApprove, onReject }) {
+  if (loading) {
+    return <InlineLoading label="正在載入申請紀錄..." />;
+  }
+
   if (!requests.length) {
     return <p className="muted">暫時未有申請。</p>;
   }
@@ -2113,7 +3895,7 @@ function RequestList({ requests, adminMode = false, onApprove, onReject }) {
       {requests.map((request) => (
         <article className="record-item" key={request.id}>
           <div className="request-main">
-            <span className="coin-dot">⚡</span>
+            <span className="coin-dot"><Zap size={15} /></span>
             <div>
               <strong>
                 {request.amount} 代幣
@@ -2121,8 +3903,6 @@ function RequestList({ requests, adminMode = false, onApprove, onReject }) {
               </strong>
               <span>{formatDate(request.createdAt)}</span>
               {request.hkdAmount && <span>付款金額：HK${formatTokenNumber(request.hkdAmount)}</span>}
-              {request.fpsIdentifier && <span>FPS 識別碼：{request.fpsIdentifier}</span>}
-              {request.fpsName && <span>收款人：{request.fpsName}</span>}
               {request.promoCode && <span>活動碼：{request.promoCode}</span>}
             </div>
           </div>
@@ -2156,22 +3936,42 @@ function RequestList({ requests, adminMode = false, onApprove, onReject }) {
 }
 
 function MyRecords({ profile }) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
   const [records, setRecords] = useState([]);
   const [slotRecords, setSlotRecords] = useState([]);
   const [roomsById, setRoomsById] = useState({});
   const [recordsError, setRecordsError] = useState("");
+  const [recordsLoading, setRecordsLoading] = useState(true);
+  const [historyRoomsLoading, setHistoryRoomsLoading] = useState(true);
+  const demoCards = useBetaDemoCards(Boolean(profile.isDemo));
 
   useEffect(() => {
+    if (profile.isDemo) {
+      setRecords(enrichDemoRecords(BETA_DEMO_RECORDS, demoCards));
+      setRoomsById({
+        "demo-live-room": { id: "demo-live-room", status: "live", title: "Beta Live Card Draw" },
+        "demo-complete-room": { id: "demo-complete-room", status: "completed", title: "Weekend Card Break" },
+      });
+      setRecordsError("");
+      setRecordsLoading(false);
+      setHistoryRoomsLoading(false);
+      return undefined;
+    }
+    setRecordsLoading(true);
+    setHistoryRoomsLoading(true);
     const roomsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
     const stopRooms = onSnapshot(
       roomsQuery,
+      LIVE_SNAPSHOT_OPTIONS,
       (snapshot) => {
         setRoomsById(
           Object.fromEntries(snapshot.docs.map((item) => [item.id, { id: item.id, ...item.data() }])),
         );
+        if (isSnapshotReady(snapshot)) setHistoryRoomsLoading(false);
       },
       (error) => {
         console.error("History room listener failed.", error);
+        setHistoryRoomsLoading(false);
       },
     );
 
@@ -2181,6 +3981,7 @@ function MyRecords({ profile }) {
     );
     const stopRecords = onSnapshot(
       recordsQuery,
+      LIVE_SNAPSHOT_OPTIONS,
       (snapshot) => {
         setRecords(
           snapshot.docs
@@ -2188,10 +3989,12 @@ function MyRecords({ profile }) {
             .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt)),
         );
         setRecordsError("");
+        if (isSnapshotReady(snapshot)) setRecordsLoading(false);
       },
       (error) => {
         console.error("Draw records listener failed.", error);
         setRecordsError(getSafeErrorMessage(error, "未能載入我的紀錄。"));
+        setRecordsLoading(false);
       },
     );
 
@@ -2199,9 +4002,13 @@ function MyRecords({ profile }) {
       stopRooms();
       stopRecords();
     };
-  }, [profile.uid]);
+  }, [demoCards, profile.isDemo, profile.uid]);
 
   useEffect(() => {
+    if (profile.isDemo) {
+      setSlotRecords([]);
+      return undefined;
+    }
     const roomIds = Object.keys(roomsById);
     if (!roomIds.length) {
       setSlotRecords([]);
@@ -2239,24 +4046,123 @@ function MyRecords({ profile }) {
     });
 
     return () => stops.forEach((stop) => stop());
-  }, [profile.uid, roomsById]);
+  }, [profile.isDemo, profile.uid, roomsById]);
 
   const mergedRecords = useMemo(
     () => mergePurchaseRecords(records, slotRecords, roomsById),
     [records, roomsById, slotRecords],
   );
+  const historyLoading = recordsLoading || historyRoomsLoading;
+
+  if (isBeta) {
+    const activeRecords = mergedRecords.filter((record) => {
+      const room = roomsById[record.drawId];
+      return !record.cardId && room?.status === "live";
+    });
+    const completedRecords = mergedRecords.filter(
+      (record) => !activeRecords.some((active) => active.id === record.id),
+    );
+
+    return (
+      <section className="panel beta-history-page">
+        <div className="section-heading">
+          <ListChecks size={24} />
+          <div>
+
+            <h1>我的紀錄</h1>
+          </div>
+        </div>
+        {recordsError && <p className="form-note">{recordsError}</p>}
+        {historyLoading ? (
+          <InlineLoading label="正在載入我的紀錄..." />
+        ) : (
+          <>
+        <div className="beta-history-section">
+          <h2>正在抽卡</h2>
+          {activeRecords.length ? (
+            <div className="beta-active-record-grid">
+              {activeRecords.map((record) => (
+                <article className="beta-active-record" key={record.id}>
+                  <span className="beta-record-card-image">
+                    {record.targetCardImageUrl || record.cardImageUrl ? (
+                      <img
+                        src={record.targetCardImageUrl || record.cardImageUrl}
+                        alt={record.targetCardName || record.cardName || "正在抽卡卡牌"}
+                      />
+                    ) : (
+                      <Package size={24} />
+                    )}
+                  </span>
+                  <span className="pick-number-box">
+                    <em>天堂地獄號碼</em>
+                    <b>#{record.number}</b>
+                  </span>
+                  <div>
+                    <strong>{record.drawTitle || record.roomSlug || "抽卡房"}</strong>
+                    <p>{record.targetCardName || "等待開牌"}</p>
+                    <small>{formatRoundLabel(record.round)} · 直播中</small>
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">暫時沒有正在抽卡的紀錄。</p>
+          )}
+        </div>
+        <div className="beta-history-section">
+          <h2>已完成</h2>
+          {completedRecords.length ? (
+            <div className="history-table">
+              <div className="history-head">
+                <span>房間</span><span>中獎卡牌</span><span>天堂地獄號碼</span><span>售價</span><span>結果</span>
+              </div>
+              {completedRecords.map((record) => (
+                <article className="history-row" key={record.id}>
+                  <span>{record.drawTitle || record.roomSlug || record.drawId}</span>
+                  <span className="beta-history-card-cell">
+                    <span className="beta-record-card-image small">
+                      {record.cardImageUrl || record.targetCardImageUrl ? (
+                        <img
+                          src={record.cardImageUrl || record.targetCardImageUrl}
+                          alt={record.cardName || record.targetCardName || "中獎卡牌"}
+                        />
+                      ) : (
+                        <Package size={18} />
+                      )}
+                    </span>
+                    <span><strong>{record.cardName || "未分配卡牌"}</strong><small>所屬盲盒：{record.targetCardName || "未選卡牌"}</small></span>
+                  </span>
+                  <b>#{record.number}</b>
+                  <TokenAmount value={record.cardValue || record.targetCardValue || record.tokenCost} />
+                  <span className={`status-badge ${record.cardId ? (record.resultSide === "hell" ? "hell" : "heaven") : "pending"}`}>
+                    {record.cardId ? getResultSideLabel(record.resultSide) : "待開牌"}
+                  </span>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">暫時沒有已完成紀錄。</p>
+          )}
+        </div>
+          </>
+        )}
+      </section>
+    );
+  }
 
   return (
     <section className="panel">
       <div className="section-heading">
         <ListChecks size={24} />
         <div>
-          <p className="eyebrow">Draw history</p>
+
           <h1>我的紀錄</h1>
         </div>
       </div>
       {recordsError && <p className="form-note">{recordsError}</p>}
-      {mergedRecords.length ? (
+      {historyLoading ? (
+        <InlineLoading label="正在載入我的紀錄..." />
+      ) : mergedRecords.length ? (
         <div className="history-table">
           <div className="history-head">
             <span>房間</span>
@@ -2270,7 +4176,7 @@ function MyRecords({ profile }) {
               <span>{record.roomSlug || record.drawId}</span>
               <strong>{record.targetCardName || record.cardName || record.drawTitle}</strong>
               <b>#{record.number}</b>
-              <span>⚡ {formatTokenNumber(record.tokenCost)}</span>
+              <TokenAmount value={record.tokenCost} />
               <span className={`status-badge ${record.cardId ? "approved" : "pending"}`}>
                 {record.cardId ? "已完成" : "待開"}
               </span>
@@ -2285,48 +4191,104 @@ function MyRecords({ profile }) {
 }
 
 function CollectionPage({ profile }) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
   const [records, setRecords] = useState([]);
   const [activeStatus, setActiveStatus] = useState("pending");
   const [collectionError, setCollectionError] = useState("");
+  const [collectionLoading, setCollectionLoading] = useState(true);
+  const [selectedShippingIds, setSelectedShippingIds] = useState([]);
+  const [shippingIds, setShippingIds] = useState([]);
+  const [shippingForm, setShippingForm] = useState({
+    name: "",
+    phone: "",
+    method: "sf-door",
+    address: "",
+    note: "",
+  });
+  const [pickupSearch, setPickupSearch] = useState("");
+  const [pickupRegion, setPickupRegion] = useState("all");
+  const [pickupDistrict, setPickupDistrict] = useState("all");
+  const [selectedPickupCode, setSelectedPickupCode] = useState("");
+  const [shippingBusy, setShippingBusy] = useState(false);
+  const demoCards = useBetaDemoCards(Boolean(profile.isDemo));
+
+  // Build the second-level district menu from the currently selected territory.
+  const pickupDistricts = useMemo(() => (
+    [...new Set(
+      SF_PICKUP_POINTS
+        .filter((point) => pickupRegion === "all" || point.region === pickupRegion)
+        .map((point) => point.district),
+    )].sort((a, b) => a.localeCompare(b, "zh-HK"))
+  ), [pickupRegion]);
+
+  // Filter the bundled official SF Store list locally so the player never leaves the app.
+  const pickupResults = useMemo(() => {
+    const keyword = pickupSearch.trim().toLocaleLowerCase("zh-HK");
+    return SF_PICKUP_POINTS.filter((point) => {
+      const matchesRegion = pickupRegion === "all" || point.region === pickupRegion;
+      const matchesDistrict = pickupDistrict === "all" || point.district === pickupDistrict;
+      const searchableText = `${point.code} ${point.region} ${point.district} ${point.name} ${point.address}`
+        .toLocaleLowerCase("zh-HK");
+      return matchesRegion && matchesDistrict && (!keyword || searchableText.includes(keyword));
+    }).slice(0, 12);
+  }, [pickupDistrict, pickupRegion, pickupSearch]);
 
   useEffect(() => {
+    if (profile.isDemo) {
+      setRecords(enrichDemoRecords(BETA_DEMO_COLLECTION, demoCards));
+      setCollectionError("");
+      setCollectionLoading(false);
+      return undefined;
+    }
+    setCollectionLoading(true);
     const recordsQuery = query(
       collection(db, "drawRecords"),
       where("uid", "==", profile.uid),
     );
     const stopRecords = onSnapshot(
       recordsQuery,
+      LIVE_SNAPSHOT_OPTIONS,
       (snapshot) => {
         setRecords(
           snapshot.docs
             .map((item) => ({ id: item.id, ...item.data() }))
             .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt))
-            .filter((record) => record.cardId && !record.convertedToTokens),
+            .filter((record) => record.cardId && (isBeta || !record.convertedToTokens)),
         );
         setCollectionError("");
+        if (isSnapshotReady(snapshot)) setCollectionLoading(false);
       },
       (error) => {
         console.error("Collection listener failed.", error);
         setCollectionError(getSafeErrorMessage(error, "未能載入我的卡牌。"));
+        setCollectionLoading(false);
       },
     );
 
     return stopRecords;
-  }, [profile.uid]);
+  }, [demoCards, isBeta, profile.isDemo, profile.uid]);
 
-  const visibleRecords = records.filter(
-    (record) => (record.collectionStatus || "pending") === activeStatus,
-  );
+  const visibleRecords = records.filter((record) => {
+    if (!isBeta) return (record.collectionStatus || "pending") === activeStatus;
+    return getBetaCollectionRecordStatus(record) === activeStatus;
+  });
   const totalValue = records.reduce(
     (sum, record) => sum + Number(record.cardValue || record.tokenCost || 0),
     0,
   );
   const totalRefundValue = records.reduce(
-    (sum, record) => sum + getCardConversionRefund(record),
+    (sum, record) =>
+      record.convertedToTokens || (record.collectionStatus || "pending") !== "pending"
+        ? sum
+        : sum + getCardConversionRefund(record),
     0,
   );
 
   async function convertCardToTokens(record, { skipConfirm = false } = {}) {
+    if (profile.isDemo) {
+      alert("Demo Account 只供預覽，不會轉回代幣。");
+      return;
+    }
     const refund = getCardConversionRefund(record);
 
     if (!refund || record.convertedToTokens) return;
@@ -2349,8 +4311,10 @@ function CollectionPage({ profile }) {
         if (!recordSnap.exists() || recordSnap.data().uid !== profile.uid) {
           throw new Error("找不到這張卡牌紀錄。");
         }
-        if (recordSnap.data().convertedToTokens) {
-          throw new Error("這張卡牌已經轉回代幣。");
+        const latestRecord = recordSnap.data();
+        if (latestRecord.convertedToTokens || (latestRecord.collectionStatus || "pending") !== "pending"
+          || latestRecord.shippingRequested || latestRecord.shippingRequestedAt || latestRecord.shippedAt) {
+          throw new Error("只有未申請寄送的待處理卡牌可以轉回代幣。");
         }
         const latestRefund = getCardConversionRefund(recordSnap.data());
         if (latestRefund !== refund) {
@@ -2377,6 +4341,10 @@ function CollectionPage({ profile }) {
   }
 
   async function convertVisibleCards() {
+    if (profile.isDemo) {
+      alert("Demo Account 只供預覽，不會轉回代幣。");
+      return;
+    }
     if (!visibleRecords.length) return;
 
     const totalRefund = visibleRecords.reduce(
@@ -2394,51 +4362,140 @@ function CollectionPage({ profile }) {
     }
   }
 
+  function openShippingRequest(recordIds) {
+    const ids = recordIds.filter(Boolean);
+    if (!ids.length) {
+      alert("請先選擇要配送的卡牌。");
+      return;
+    }
+    setShippingIds(ids);
+    setShippingForm({
+      name: profile.displayName || profile.username || "",
+      phone: profile.phoneNumber || "",
+      method: "sf-door",
+      address: "",
+      note: "",
+    });
+    setPickupSearch("");
+    setPickupRegion("all");
+    setPickupDistrict("all");
+    setSelectedPickupCode("");
+  }
+
+  async function submitShippingRequest(event) {
+    event.preventDefault();
+    if (!shippingForm.name.trim() || !shippingForm.phone.trim() || !shippingForm.address.trim()) {
+      alert("請填寫收件人、電話及完整地址。");
+      return;
+    }
+    if (shippingForm.method === "sf-pickup" && !selectedPickupCode) {
+      alert("請從清單選擇順豐自提點。");
+      return;
+    }
+    if (profile.isDemo) {
+      alert("Demo Account 只供預覽，不會提交配送資料。");
+      setShippingIds([]);
+      return;
+    }
+
+    setShippingBusy(true);
+    try {
+      const batch = writeBatch(db);
+      shippingIds.forEach((recordId) => {
+        batch.update(doc(db, "drawRecords", recordId), {
+          collectionStatus: "shipping",
+          shippingRequested: true,
+          shippingRecipient: shippingForm.name.trim(),
+          shippingPhone: shippingForm.phone.trim(),
+          shippingMethod: shippingForm.method,
+          shippingAddress: shippingForm.address.trim(),
+          shippingNote: shippingForm.note.trim(),
+          shippingRequestedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      });
+      await batch.commit();
+      setSelectedShippingIds((current) => current.filter((id) => !shippingIds.includes(id)));
+      setShippingIds([]);
+      setActiveStatus("shipping");
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setShippingBusy(false);
+    }
+  }
+
   return (
     <section className="panel">
       <div className="section-heading">
         <Boxes size={24} />
         <div>
-          <p className="eyebrow">Collection</p>
+
           <h1>我的卡牌</h1>
-          <p className="muted">管理員配發的卡牌會顯示待處理、出貨中或已送達狀態。</p>
+          <p className="muted">管理員配發的卡牌會分為待處理、配送中、已配送及已轉換代幣。</p>
         </div>
       </div>
-      {records.length ? (
+      {collectionLoading ? (
+        <InlineLoading label="正在載入我的卡牌..." />
+      ) : records.length ? (
         <>
         <div className="collection-tabs">
-          {collectionStatuses.map((status) => (
+          {(isBeta ? betaCollectionStatuses : collectionStatuses).map((status) => (
             <button
               className={activeStatus === status ? "active" : ""}
               type="button"
               key={status}
               onClick={() => setActiveStatus(status)}
             >
-              {statusLabels[status]}
+              {isBeta
+                ? `${getBetaCollectionStatusLabel(status)} ${records.filter((record) => getBetaCollectionRecordStatus(record) === status).length}`
+                : statusLabels[status]}
             </button>
           ))}
         </div>
-        <div className="collection-summary">
+        {!isBeta && <div className="collection-summary">
           <div>
             <span>卡片總值</span>
-            <strong>
-              <span className="coin-dot">⚡</span>
-              {formatTokenNumber(totalValue)}
-            </strong>
+            <strong><TokenAmount value={totalValue} /></strong>
           </div>
           <div>
             <span>可轉回代幣</span>
-            <strong>⚡ {formatTokenNumber(totalRefundValue)}</strong>
+            <strong><TokenAmount value={totalRefundValue} /></strong>
           </div>
           <div>
             <span>此分頁</span>
             <strong>{visibleRecords.length} 張卡</strong>
           </div>
-          <button className="small-btn" type="button" onClick={convertVisibleCards}>
-            轉換為點數
-          </button>
-          <button className="primary-btn" type="button">申請發送</button>
-        </div>
+          {activeStatus === "pending" && (
+            <>
+              <button className="small-btn" type="button" onClick={convertVisibleCards}>
+                轉換為點數
+              </button>
+              {isBeta && (
+                <button
+                  className="primary-btn"
+                  type="button"
+                  onClick={() => openShippingRequest(selectedShippingIds)}
+                  disabled={!selectedShippingIds.length}
+                >
+                  批次申請配送
+                </button>
+              )}
+            </>
+          )}
+        </div>}
+        {isBeta && activeStatus === "pending" && (
+          <div className="beta-collection-actions">
+            <button
+              className="primary-btn"
+              type="button"
+              onClick={() => openShippingRequest(selectedShippingIds)}
+              disabled={!selectedShippingIds.length}
+            >
+              批次申請配送
+            </button>
+          </div>
+        )}
         {visibleRecords.length ? (
           <div className="collection-grid">
             {visibleRecords.map((record) => (
@@ -2453,20 +4510,62 @@ function CollectionPage({ profile }) {
                 <span className="card-check">✓</span>
                 <div>
                   <strong>{record.cardName}</strong>
-                  <span>{record.cardCategory || "其他"}</span>
-                  <span>
-                    {record.drawTitle} · #{record.number}
-                  </span>
+                  {isBeta ? (
+                    <span className="collection-room-meta">
+                      {record.drawTitle || record.roomSlug || "抽卡房"} · {formatRoundLabel(record.round)}
+                    </span>
+                  ) : (
+                    <>
+                      <span>{record.cardCategory || "其他"}</span>
+                      <span>{record.drawTitle} · #{record.number}</span>
+                    </>
+                  )}
                   <span className={`status-badge ${record.collectionStatus || "pending"}`}>
-                    {statusLabels[record.collectionStatus || "pending"]}
+                    {isBeta
+                      ? record.convertedToTokens
+                        ? "已轉回代幣"
+                        : record.collectionStatus === "shipped"
+                          ? "已配送"
+                          : getBetaCollectionStatusLabel(record.collectionStatus || "pending")
+                      : statusLabels[record.collectionStatus || "pending"]}
                   </span>
-                  <button
-                    className="small-btn"
-                    type="button"
-                    onClick={() => convertCardToTokens(record)}
-                  >
-                    轉回 {formatTokenNumber(getCardConversionRefund(record))} 代幣
-                  </button>
+                  {isBeta && activeStatus === "pending" && (
+                    <label className="collection-select-option">
+                      <input
+                        type="checkbox"
+                        checked={selectedShippingIds.includes(record.id)}
+                        onChange={(event) => setSelectedShippingIds((current) =>
+                          event.target.checked
+                            ? [...new Set([...current, record.id])]
+                            : current.filter((id) => id !== record.id),
+                        )}
+                      />
+                      選擇配送
+                    </label>
+                  )}
+                  {!record.convertedToTokens && activeStatus === "pending" && (
+                    <button className="small-btn" type="button" onClick={() => convertCardToTokens(record)}>
+                      轉回 {formatTokenNumber(getCardConversionRefund(record))} 代幣
+                    </button>
+                  )}
+                  {isBeta && activeStatus === "pending" && (
+                    <button className="primary-btn" type="button" onClick={() => openShippingRequest([record.id])}>
+                      申請配送
+                    </button>
+                  )}
+                  {record.trackingNumber && (
+                    <a
+                      className="small-btn collection-tracking-link"
+                      href={`https://htm.sf-express.com/hk/tc/dynamic_function/waybill/#search/bill-number/${encodeURIComponent(record.trackingNumber)}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      aria-label={`查詢順豐單號 ${record.trackingNumber}`}
+                    >
+                      <Truck size={16} />
+                      <span>順豐單號：{record.trackingNumber}</span>
+                      <ExternalLink size={14} />
+                    </a>
+                  )}
                 </div>
               </article>
             ))}
@@ -2483,59 +4582,243 @@ function CollectionPage({ profile }) {
           </p>
         </>
       )}
+      {isBeta && shippingIds.length > 0 && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setShippingIds([])}>
+          <section className="modal shipping-modal" role="dialog" aria-modal="true" aria-labelledby="shipping-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="icon-btn modal-close" type="button" onClick={() => setShippingIds([])} aria-label="關閉配送申請">
+              <X size={18} />
+            </button>
+
+            <h2 id="shipping-dialog-title">申請配送</h2>
+            <p className="muted">共 {shippingIds.length} 張卡牌，請填寫順豐收件資料。</p>
+            <form className="stack-form" onSubmit={submitShippingRequest}>
+              <label>收件人姓名<input value={shippingForm.name} onChange={(event) => setShippingForm((current) => ({ ...current, name: event.target.value }))} required /></label>
+              <label>聯絡電話<input type="tel" value={shippingForm.phone} onChange={(event) => setShippingForm((current) => ({ ...current, phone: event.target.value }))} required /></label>
+              <label>
+                配送方式
+                <select
+                  value={shippingForm.method}
+                  onChange={(event) => {
+                    setShippingForm((current) => ({ ...current, method: event.target.value, address: "" }));
+                    setSelectedPickupCode("");
+                  }}
+                >
+                  <option value="sf-door">順豐上門</option>
+                  <option value="sf-pickup">順豐自提點</option>
+                </select>
+              </label>
+              {shippingForm.method === "sf-pickup" && (
+                <div className="sf-pickup-finder">
+                  <div className="sf-pickup-heading">
+                    <div>
+                      <strong>選擇順豐站</strong>
+                      <small>搜尋地區、街道、大廈或網點編號</small>
+                    </div>
+                    <span>{SF_PICKUP_POINTS.length} 個網點</span>
+                  </div>
+                  <div className="sf-pickup-search-row">
+                    <select
+                      value={pickupRegion}
+                      onChange={(event) => {
+                        setPickupRegion(event.target.value);
+                        setPickupDistrict("all");
+                      }}
+                      aria-label="篩選順豐站區域"
+                    >
+                      <option value="all">全港區域</option>
+                      <option value="香港島">香港島</option>
+                      <option value="九龍">九龍</option>
+                      <option value="新界">新界</option>
+                    </select>
+                    <select value={pickupDistrict} onChange={(event) => setPickupDistrict(event.target.value)} aria-label="篩選順豐站分區">
+                      <option value="all">所有分區</option>
+                      {pickupDistricts.map((district) => (
+                        <option value={district} key={district}>{district}</option>
+                      ))}
+                    </select>
+                    <label className="sf-pickup-search">
+                      <Search size={17} aria-hidden="true" />
+                      <input
+                        type="search"
+                        value={pickupSearch}
+                        onChange={(event) => setPickupSearch(event.target.value)}
+                        placeholder="例如：旺角、海港城、852E"
+                        aria-label="搜尋順豐站"
+                      />
+                    </label>
+                  </div>
+                  <div className="sf-pickup-results" role="listbox" aria-label="順豐站搜尋結果">
+                    {pickupResults.length ? pickupResults.map((point) => (
+                      <button
+                        className={`sf-pickup-option${selectedPickupCode === point.code ? " selected" : ""}`}
+                        type="button"
+                        role="option"
+                        aria-selected={selectedPickupCode === point.code}
+                        key={point.code}
+                        onClick={() => {
+                          setSelectedPickupCode(point.code);
+                          setShippingForm((current) => ({
+                            ...current,
+                            address: `${point.code}｜${point.name}\n${point.address}`,
+                          }));
+                        }}
+                      >
+                        <span className="sf-pickup-code">{point.code}</span>
+                        <span className="sf-pickup-details">
+                          <strong>{point.name}</strong>
+                          <small>{point.address}</small>
+                        </span>
+                        <Check size={18} aria-hidden="true" />
+                      </button>
+                    )) : (
+                      <p className="sf-pickup-empty">搵唔到相關順豐站，請試另一個地區或關鍵字。</p>
+                    )}
+                  </div>
+                  <p className="sf-pickup-source">順豐香港官方網點資料，更新：{SF_PICKUP_POINTS_UPDATED_AT}</p>
+                </div>
+              )}
+              <label>
+                {shippingForm.method === "sf-pickup" ? "已選自提點" : "配送地址"}
+                <textarea
+                  rows={3}
+                  value={shippingForm.address}
+                  onChange={(event) => setShippingForm((current) => ({ ...current, address: event.target.value }))}
+                  placeholder={shippingForm.method === "sf-pickup" ? "請從上方清單選擇順豐站" : "請輸入完整順豐配送地址"}
+                  readOnly={shippingForm.method === "sf-pickup"}
+                  required
+                />
+              </label>
+              <label>備註<textarea rows={2} value={shippingForm.note} onChange={(event) => setShippingForm((current) => ({ ...current, note: event.target.value }))} placeholder="選填" /></label>
+              <button className="primary-btn" type="submit" disabled={shippingBusy}>
+                <Package size={17} />{shippingBusy ? "提交中..." : "確認申請配送"}
+              </button>
+            </form>
+          </section>
+        </div>
+      )}
     </section>
   );
 }
 
 function AdminPanel({ profile }) {
-  const [activeAdminSection, setActiveAdminSection] = useState("rooms");
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const [activeAdminSection, setActiveAdminSection] = useState(isBeta ? "live" : "rooms");
   const [requests, setRequests] = useState([]);
   const [draws, setDraws] = useState([]);
   const [cards, setCards] = useState([]);
   const [records, setRecords] = useState([]);
+  const [adminLoading, setAdminLoading] = useState({
+    requests: true,
+    draws: true,
+    cards: true,
+    records: true,
+  });
+  const [pendingShippingCount, setPendingShippingCount] = useState(0);
   const vipTiers = useVipProgram();
+  const adminSections = isBeta
+    ? [
+        { id: "live", label: "直播管理", eyebrow: "Live", icon: Gavel },
+        ...ADMIN_SECTIONS.filter((section) => !["rooms", "create-room"].includes(section.id)),
+        BETA_PAYMENT_SECTION,
+      ]
+    : ADMIN_SECTIONS;
   const activeSection =
-    ADMIN_SECTIONS.find((section) => section.id === activeAdminSection) || ADMIN_SECTIONS[0];
+    adminSections.find((section) => section.id === activeAdminSection) || adminSections[0];
   const ActiveIcon = activeSection.icon;
 
   useEffect(() => {
+    const drawsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
+    const stopDraws = onSnapshot(drawsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+      setDraws(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      if (isSnapshotReady(snapshot)) {
+        setAdminLoading((current) => ({ ...current, draws: false }));
+      }
+    }, (error) => {
+      console.error("Admin room listener failed.", error);
+      setAdminLoading((current) => ({ ...current, draws: false }));
+    });
+
+    const cardsQuery = query(collection(db, "cards"), orderBy("createdAt", "desc"));
+    const stopCards = onSnapshot(cardsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+      setCards(snapshot.docs
+        .map((item) => ({ id: item.id, ...item.data() }))
+        .filter((card) => !card.archived));
+      if (isSnapshotReady(snapshot)) {
+        setAdminLoading((current) => ({ ...current, cards: false }));
+      }
+    }, (error) => {
+      console.error("Admin card listener failed.", error);
+      setAdminLoading((current) => ({ ...current, cards: false }));
+    });
+
+    return () => {
+      stopDraws();
+      stopCards();
+    };
+  }, []);
+
+  // Only load the full request history while its admin section is open.
+  useEffect(() => {
+    if (activeAdminSection !== "requests") return undefined;
+
+    setAdminLoading((current) => ({ ...current, requests: true }));
     const requestsQuery = query(
       collection(db, "tokenRequests"),
       orderBy("createdAt", "desc"),
     );
-    const stopRequests = onSnapshot(requestsQuery, (snapshot) => {
+    return onSnapshot(requestsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setRequests(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      if (isSnapshotReady(snapshot)) {
+        setAdminLoading((current) => ({ ...current, requests: false }));
+      }
+    }, (error) => {
+      console.error("Admin token request listener failed.", error);
+      setAdminLoading((current) => ({ ...current, requests: false }));
     });
+  }, [activeAdminSection]);
 
-    const drawsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
-    const stopDraws = onSnapshot(drawsQuery, (snapshot) => {
-      setDraws(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+  // Keep the menu badge live with a small filtered query instead of loading every draw record.
+  useEffect(() => {
+    const pendingShippingQuery = query(
+      collection(db, "drawRecords"),
+      where("shippingRequested", "==", true),
+      where("collectionStatus", "==", "shipping"),
+    );
+    return onSnapshot(pendingShippingQuery, (snapshot) => {
+      setPendingShippingCount(snapshot.size);
+    }, (error) => {
+      console.error("Admin shipping badge listener failed.", error);
     });
-
-    const cardsQuery = query(collection(db, "cards"), orderBy("createdAt", "desc"));
-    const stopCards = onSnapshot(cardsQuery, (snapshot) => {
-      setCards(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-    });
-
-    const recordsQuery = query(collection(db, "drawRecords"), orderBy("createdAt", "desc"));
-    const stopRecords = onSnapshot(recordsQuery, (snapshot) => {
-      setRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-    });
-
-    return () => {
-      stopRequests();
-      stopDraws();
-      stopCards();
-      stopRecords();
-    };
   }, []);
 
+  // Purchase and delivery history is the largest dataset, so defer it until needed.
+  useEffect(() => {
+    if (activeAdminSection !== "records" && activeAdminSection !== "shipping") return undefined;
+
+    setAdminLoading((current) => ({ ...current, records: true }));
+    const recordsQuery = query(collection(db, "drawRecords"), orderBy("createdAt", "desc"));
+    return onSnapshot(recordsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+      setRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      if (isSnapshotReady(snapshot)) {
+        setAdminLoading((current) => ({ ...current, records: false }));
+      }
+    }, (error) => {
+      console.error("Admin record listener failed.", error);
+      setAdminLoading((current) => ({ ...current, records: false }));
+    });
+  }, [activeAdminSection]);
+
   async function approveRequest(request) {
-    const historicalApprovedDeposit = requests
-      .filter(
-        (item) => item.uid === request.uid && item.status === "approved" && item.id !== request.id,
-      )
-      .reduce((sum, item) => sum + Number(item.hkdAmount || 0), 0);
+    // Review codes manually; only verified bank payments count towards VIP deposits.
+    const isPromo = request.proofMode === "promo";
+    if (isPromo && !window.confirm(`確認已人工核實活動碼「${request.promoCode}」的有效性、使用資格及使用紀錄，並批准 ${formatTokenNumber(request.amount)} 代幣？活動碼獎勵不計入 VIP 入金。`)) return;
+    const verifiedInput = isPromo ? "0" : window.prompt("請先核對銀行實際入帳及付款證明，再輸入實際收到的港幣金額：");
+    if (verifiedInput === null) return;
+    const verifiedHkdAmount = Number(verifiedInput);
+    if (!Number.isSafeInteger(verifiedHkdAmount) || (!isPromo && verifiedHkdAmount < 500)) {
+      alert("請輸入已核實的有效入帳金額。");
+      return;
+    }
 
     try {
       await runTransaction(db, async (transaction) => {
@@ -2543,6 +4826,7 @@ function AdminPanel({ profile }) {
         const userRef = doc(db, "users", request.uid);
         const requestSnap = await transaction.get(requestRef);
         const userSnap = await transaction.get(userRef);
+        const packagesSnap = await transaction.get(doc(db, "settings", "tokenPackages"));
 
         if (!requestSnap.exists() || requestSnap.data().status !== "pending") {
           throw new Error("This request has already been reviewed.");
@@ -2552,15 +4836,16 @@ function AdminPanel({ profile }) {
         }
 
         const requestData = requestSnap.data();
+        if (requestData.proofMode !== request.proofMode || requestData.promoCode !== request.promoCode || requestData.amount !== request.amount) {
+          throw new Error("申請資料已變更，請重新審核。");
+        }
         const userData = userSnap.data();
-        const previousDeposit = Math.max(
-          Number(userData.totalDeposits || 0),
-          historicalApprovedDeposit,
-        );
-        const totalDeposits = previousDeposit + Number(requestData.hkdAmount || 0);
+        const packageSettings = packagesSnap.exists() ? packagesSnap.data() : null;
+        const approvedTokens = getVerifiedTokenGrant(requestData, verifiedHkdAmount, packageSettings);
+        const totalDeposits = Number(userData.totalDeposits || 0) + verifiedHkdAmount;
         const previousVipLevel = Number(userData.vipLevel ?? -1);
         const vipState = getVipState(vipTiers, totalDeposits);
-        const attainedTiers = vipTiers.filter(
+        const attainedTiers = isPromo ? [] : vipTiers.filter(
           (tier, index) =>
             index > previousVipLevel &&
             index <= vipState.currentIndex &&
@@ -2569,14 +4854,16 @@ function AdminPanel({ profile }) {
 
         transaction.update(requestRef, {
           status: "approved",
+          verifiedHkdAmount,
+          promoReviewed: isPromo,
           reviewedAt: serverTimestamp(),
           reviewedBy: profile.uid,
         });
         transaction.update(userRef, {
-          tokens: increment(Number(requestData.amount || 0)),
+          tokens: increment(approvedTokens),
           lastTokenGrantRequestId: request.id,
           totalDeposits,
-          vipLevel: vipState.currentIndex,
+          vipLevel: isPromo ? previousVipLevel : vipState.currentIndex,
           lastVipRewardTier: attainedTiers.at(-1)?.id || userData.lastVipRewardTier || "",
           updatedAt: serverTimestamp(),
         });
@@ -2627,13 +4914,18 @@ function AdminPanel({ profile }) {
 
   async function rejectRequest(request) {
     const reason = window.prompt("駁回原因（可選）：", "");
+    if (reason === null) return;
 
-    await updateDoc(doc(db, "tokenRequests", request.id), {
-      status: "rejected",
-      adminNote: reason || "",
-      reviewedAt: serverTimestamp(),
-      reviewedBy: profile.uid,
-    });
+    try {
+      await updateDoc(doc(db, "tokenRequests", request.id), {
+        status: "rejected",
+        adminNote: reason,
+        reviewedAt: serverTimestamp(),
+        reviewedBy: profile.uid,
+      });
+    } catch (error) {
+      showSafeError(error, "未能駁回申請，請稍後再試。");
+    }
   }
 
   async function completeDraw(draw) {
@@ -2659,12 +4951,12 @@ function AdminPanel({ profile }) {
         <div className="section-heading compact">
           <Shield size={22} />
           <div>
-            <p className="eyebrow">Admin tools</p>
+
             <h2>管理後台</h2>
           </div>
         </div>
         <div className="admin-function-grid">
-          {ADMIN_SECTIONS.map((section) => {
+          {adminSections.map((section) => {
             const SectionIcon = section.icon;
             return (
               <button
@@ -2675,6 +4967,9 @@ function AdminPanel({ profile }) {
               >
                 <SectionIcon size={20} />
                 <span>{section.label}</span>
+                {section.id === "shipping" && pendingShippingCount > 0 && (
+                  <b className="admin-notification-badge">{pendingShippingCount}</b>
+                )}
               </button>
             );
           })}
@@ -2684,7 +4979,7 @@ function AdminPanel({ profile }) {
       <div className="admin-content-heading">
         <ActiveIcon size={24} />
         <div>
-          <p className="eyebrow">{activeSection.eyebrow}</p>
+
           <h1>{activeSection.label}</h1>
         </div>
       </div>
@@ -2704,6 +4999,11 @@ function AdminPanel({ profile }) {
           <TokenPackageManager profile={profile} />
         </div>
       )}
+      {isBeta && activeAdminSection === "payment" && (
+        <div className="admin-section narrow-admin-section">
+          <PaymentSettingsManager profile={profile} />
+        </div>
+      )}
       {activeAdminSection === "vip" && (
         <div className="admin-section">
           <VipProgramManager cards={cards} profile={profile} tiers={vipTiers} />
@@ -2713,6 +5013,7 @@ function AdminPanel({ profile }) {
         <section className="panel admin-section narrow-admin-section">
           <RequestList
             requests={requests}
+            loading={adminLoading.requests}
             adminMode
             onApprove={approveRequest}
             onReject={rejectRequest}
@@ -2724,23 +5025,1003 @@ function AdminPanel({ profile }) {
           <RoomManagementList
             cards={cards}
             draws={draws}
+            loading={adminLoading.draws || adminLoading.cards}
             onCompleteDraw={completeDraw}
             onCopyRoomLink={copyRoomLink}
           />
         </section>
       )}
+      {isBeta && activeAdminSection === "live" && (
+        <section className="admin-section">
+          <SingleLiveManagement
+            cards={cards}
+            draws={draws}
+            loading={adminLoading.draws || adminLoading.cards}
+            profile={profile}
+          />
+        </section>
+      )}
       {activeAdminSection === "records" && (
         <div className="admin-section">
-          <AdminRoomRecordsPanel cards={cards} records={records} profile={profile} />
+          {isBeta ? (
+            <AdminRoundResultAssignmentPanel
+              cards={cards}
+              draws={draws}
+              records={records}
+              profile={profile}
+              loading={adminLoading.cards || adminLoading.draws || adminLoading.records}
+            />
+          ) : (
+            <AdminRoomRecordsPanel
+              cards={cards}
+              records={records}
+              profile={profile}
+              loading={adminLoading.cards || adminLoading.records}
+            />
+          )}
+        </div>
+      )}
+      {activeAdminSection === "shipping" && (
+        <div className="admin-section">
+          <ShippingRequestManager records={records} loading={adminLoading.records} />
         </div>
       )}
     </div>
   );
 }
 
-function RoomManagementList({ cards, draws, onCompleteDraw, onCopyRoomLink }) {
+// Assign a complete round in one pass, then require a full-table review before saving.
+function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loading = false }) {
+  const [selectedSessionKey, setSelectedSessionKey] = useState("");
+  const [draftSides, setDraftSides] = useState({});
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const purchaseRecords = useMemo(
+    () => records.filter((record) => record.uid && record.number).sort(compareRoomRoundRecords),
+    [records],
+  );
+  const sessions = useMemo(() => {
+    const sessionMap = new Map();
+    purchaseRecords.forEach((record) => {
+      const drawId = record.drawId || record.roomSlug || "unknown";
+      const roundId = record.round || "round-001";
+      const key = `${drawId}::${roundId}`;
+      if (!sessionMap.has(key)) {
+        sessionMap.set(key, {
+          key,
+          drawId,
+          roundId,
+          drawTitle: record.drawTitle || record.roomSlug || drawId,
+          sortValue: toMillis(record.createdAt),
+        });
+      }
+    });
+    return Array.from(sessionMap.values()).sort((left, right) => right.sortValue - left.sortValue);
+  }, [purchaseRecords]);
+
+  useEffect(() => {
+    if (!sessions.length) {
+      setSelectedSessionKey("");
+      return;
+    }
+    if (!sessions.some((session) => session.key === selectedSessionKey)) {
+      setSelectedSessionKey(sessions[0].key);
+    }
+  }, [selectedSessionKey, sessions]);
+
+  const selectedSession = sessions.find((session) => session.key === selectedSessionKey) || null;
+  const selectedDraw = draws.find((draw) => draw.id === selectedSession?.drawId) || null;
+  const sessionRecords = useMemo(
+    () => purchaseRecords.filter((record) =>
+      (record.drawId || record.roomSlug || "unknown") === selectedSession?.drawId
+        && (record.round || "round-001") === selectedSession?.roundId,
+    ),
+    [purchaseRecords, selectedSession?.drawId, selectedSession?.roundId],
+  );
+  const recordsByNumber = useMemo(
+    () => new Map(sessionRecords.map((record) => [Number(record.number), record])),
+    [sessionRecords],
+  );
+  const numberList = useMemo(
+    () => Array.from(recordsByNumber.keys())
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right),
+    [recordsByNumber],
+  );
+  const shareMode = getRoomShareMode(selectedDraw || {}, selectedSession?.roundId);
+  const heavenCount = numberList.filter((number) => draftSides[number] === "heaven").length;
+  const hellCount = numberList.filter((number) => draftSides[number] === "hell").length;
+  const unselectedCount = numberList.length - heavenCount - hellCount;
+
+  useEffect(() => {
+    if (!selectedSession) {
+      setDraftSides({});
+      return;
+    }
+    const savedSides = selectedDraw?.roundResultSides?.[selectedSession.roundId] || {};
+    const recordSides = Object.fromEntries(
+      sessionRecords
+        .filter((record) => ["heaven", "hell"].includes(record.resultSide))
+        .map((record) => [Number(record.number), record.resultSide]),
+    );
+    setDraftSides({ ...savedSides, ...recordSides });
+    setPreviewOpen(false);
+  }, [selectedSessionKey, selectedDraw?.roundResultSides, selectedSession, sessionRecords]);
+
+  function chooseSide(number, side) {
+    const record = recordsByNumber.get(number);
+    if (record?.cardId) return;
+    setDraftSides((current) => ({ ...current, [number]: side }));
+  }
+
+  function fillUnselectedWithHell() {
+    setDraftSides((current) => Object.fromEntries(
+      numberList.map((number) => [number, current[number] || "hell"]),
+    ));
+  }
+
+  function clearUnassignedSides() {
+    setDraftSides(Object.fromEntries(
+      sessionRecords
+        .filter((record) => record.cardId && ["heaven", "hell"].includes(record.resultSide))
+        .map((record) => [Number(record.number), record.resultSide]),
+    ));
+  }
+
+  function resolveRecordResult(record) {
+    const resultSide = draftSides[Number(record.number)];
+    const heavenCard = cards.find((card) => card.id === record.targetCardId) || null;
+    const resultCard = resultSide === "hell"
+      ? heavenCard?.hellCardId
+        ? cards.find((card) => card.id === heavenCard.hellCardId) || null
+        : null
+      : heavenCard;
+    return { heavenCard, resultCard, resultSide };
+  }
+
+  function openFullTablePreview() {
+    if (unselectedCount > 0) {
+      alert(`尚有 ${unselectedCount} 個號碼未標記天堂或地獄。`);
+      return;
+    }
+    const missingCardRecord = sessionRecords
+      .filter((record) => !record.cardId)
+      .find((record) => !resolveRecordResult(record).resultCard);
+    if (missingCardRecord) {
+      alert(`#${missingCardRecord.number} 未設定可派發卡牌，請先到卡牌庫設定天堂卡及地獄對應卡。`);
+      return;
+    }
+    setPreviewOpen(true);
+  }
+
+  async function confirmRoundAssignment() {
+    if (!selectedSession || saving) return;
+    setSaving(true);
+    try {
+      const batch = writeBatch(db);
+      if (selectedDraw) {
+        batch.update(doc(db, "draws", selectedDraw.id), {
+          roundResultSides: {
+            ...(selectedDraw.roundResultSides || {}),
+            [selectedSession.roundId]: Object.fromEntries(
+              numberList.map((number) => [String(number), draftSides[number]]),
+            ),
+          },
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      sessionRecords.filter((record) => !record.cardId).forEach((record) => {
+        const { heavenCard, resultCard, resultSide } = resolveRecordResult(record);
+        const cardValue = Number(resultCard.tokenValue || record.targetCardValue || record.tokenCost || 0);
+        batch.update(doc(db, "drawRecords", record.id), {
+          cardId: resultCard.id,
+          cardName: resultCard.name,
+          cardCategory: getCardCategory(resultCard),
+          cardImageUrl: resultCard.imageUrl || "",
+          cardValue,
+          cardConversionValue: Number(resultCard.conversionValue ?? resultCard.tokenValue ?? 0),
+          resultSide,
+          selectedHeavenCardId: heavenCard?.id || "",
+          collectionStatus: record.collectionStatus || "pending",
+          assignedAt: serverTimestamp(),
+          assignedBy: profile.uid,
+          updatedAt: serverTimestamp(),
+        });
+      });
+
+      await batch.commit();
+      setPreviewOpen(false);
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loading) {
+    return <section className="panel wide"><InlineLoading label="正在載入場次購買紀錄..." /></section>;
+  }
+
+  return (
+    <section className="panel wide batch-result-panel">
+      <div className="section-heading compact">
+        <ListChecks size={22} />
+        <div>
+          <h2>按場次分配抽卡結果</h2>
+          <p className="muted">一次標記所有已售號碼嘅天堂／地獄結果，預覽完整表格後先正式確認。</p>
+        </div>
+      </div>
+      {sessions.length ? (
+        <>
+          <div className="batch-result-toolbar">
+            <label>
+              <span>揀場次</span>
+              <select value={selectedSessionKey} onChange={(event) => setSelectedSessionKey(event.target.value)}>
+                {sessions.map((session) => (
+                  <option key={session.key} value={session.key}>{session.drawTitle} · {formatRoundLabel(session.roundId)}</option>
+                ))}
+              </select>
+            </label>
+            <div className="batch-result-counts">
+              <span>玩法 {shareMode}</span>
+              <span className="heaven">天堂 {heavenCount}</span>
+              <span className="hell">地獄 {hellCount}</span>
+              <span>未標記 {unselectedCount}</span>
+            </div>
+            <div className="batch-result-actions">
+              <button className="small-btn" type="button" onClick={fillUnselectedWithHell}>未標記全設地獄</button>
+              <button className="small-btn" type="button" onClick={clearUnassignedSides}>清除未確認</button>
+            </div>
+          </div>
+          <div className="batch-number-table" aria-label="已售號碼天堂地獄分配表">
+            {numberList.map((number) => {
+              const record = recordsByNumber.get(number);
+              const side = draftSides[number] || "";
+              return (
+                <article className={`batch-number-result ${side || "unselected"} ${record?.cardId ? "locked" : ""}`} key={number}>
+                  <header><strong>#{number}</strong><small>{record.username || "已售"}</small></header>
+                  <div>
+                    <button className={side === "heaven" ? "active" : ""} type="button" onClick={() => chooseSide(number, "heaven")} disabled={Boolean(record?.cardId)}>天堂</button>
+                    <button className={side === "hell" ? "active" : ""} type="button" onClick={() => chooseSide(number, "hell")} disabled={Boolean(record?.cardId)}>地獄</button>
+                  </div>
+                  {record?.cardId && <em>已派發</em>}
+                </article>
+              );
+            })}
+          </div>
+          <button className="primary-btn batch-preview-btn" type="button" onClick={openFullTablePreview}>
+            預覽完整結果表
+          </button>
+        </>
+      ) : <p className="muted">暫時未有可分配嘅購買場次。</p>}
+      {previewOpen && (
+        <AdminRoundResultConfirmModal
+          drawTitle={selectedSession.drawTitle}
+          roundId={selectedSession.roundId}
+          numberList={numberList}
+          recordsByNumber={recordsByNumber}
+          sides={draftSides}
+          saving={saving}
+          onCancel={() => setPreviewOpen(false)}
+          onConfirm={confirmRoundAssignment}
+        />
+      )}
+    </section>
+  );
+}
+
+function AdminRoundResultConfirmModal({ drawTitle, roundId, numberList, recordsByNumber, sides, saving, onCancel, onConfirm }) {
+  return (
+    <div className="modal-backdrop blind-box-backdrop" role="presentation" onMouseDown={saving ? undefined : onCancel}>
+      <section className="modal batch-result-modal" role="dialog" aria-modal="true" aria-labelledby="batch-result-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="icon-btn modal-close" type="button" onClick={onCancel} disabled={saving} aria-label="返回修改"><X size={19} /></button>
+        <h2 id="batch-result-title">確認完整結果表</h2>
+        <p className="blind-box-copy">{drawTitle} · {formatRoundLabel(roundId)}。下表只顯示已售號碼，確認後會一次過派發。</p>
+        <div className="batch-confirm-table">
+          {numberList.map((number) => {
+            const record = recordsByNumber.get(number);
+            const side = sides[number];
+            return (
+              <div className={side} key={number}>
+                <strong>#{number}</strong>
+                <span>{side === "heaven" ? "天堂" : "地獄"}</span>
+                <small>{record.username || "已售"}</small>
+              </div>
+            );
+          })}
+        </div>
+        <div className="blind-box-actions">
+          <button className="small-btn" type="button" onClick={onCancel} disabled={saving}>返回修改</button>
+          <button className="primary-btn" type="button" onClick={onConfirm} disabled={saving}>{saving ? "派發中..." : "確認並一次過派發"}</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ShippingRequestManager({ records, loading = false }) {
+  const [trackingNumbers, setTrackingNumbers] = useState({});
+  const [savingId, setSavingId] = useState("");
+  const [shippingView, setShippingView] = useState("pending");
+  const [auditUser, setAuditUser] = useState(null);
+  const pendingRequests = records
+    .filter((record) => record.shippingRequested && record.collectionStatus === "shipping")
+    .sort((a, b) => toMillis(b.shippingRequestedAt) - toMillis(a.shippingRequestedAt));
+  const shippedRequests = records
+    .filter((record) => record.collectionStatus === "shipped" && (record.shippingRequested || record.trackingNumber))
+    .sort((a, b) => toMillis(b.shippedAt || b.updatedAt) - toMillis(a.shippedAt || a.updatedAt));
+  const visibleRequests = shippingView === "shipped" ? shippedRequests : pendingRequests;
+
+  async function markShipped(record) {
+    const trackingNumber = String(trackingNumbers[record.id] || record.trackingNumber || "").trim();
+    if (!trackingNumber) {
+      alert("請先輸入順豐運單號碼。");
+      return;
+    }
+    setSavingId(record.id);
+    try {
+      await updateDoc(doc(db, "drawRecords", record.id), {
+        collectionStatus: "shipped",
+        trackingNumber,
+        shippedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSavingId("");
+    }
+  }
+
+  return (
+    <section className="panel shipping-admin-panel">
+      <div className="section-heading compact">
+        <Bell size={22} />
+        <div>
+
+          <h2>{shippingView === "shipped" ? "已配送紀錄" : "待處理配送需求"}</h2>
+          <p className="muted">處理完成後會永久保留在「已配送紀錄」。</p>
+        </div>
+        <strong className="shipping-request-count">{pendingRequests.length} 個待處理</strong>
+      </div>
+      <div className="collection-tabs admin-status-tabs shipping-status-tabs">
+        <button
+          className={shippingView === "pending" ? "active" : ""}
+          type="button"
+          onClick={() => setShippingView("pending")}
+        >
+          待處理 {pendingRequests.length}
+        </button>
+        <button
+          className={shippingView === "shipped" ? "active" : ""}
+          type="button"
+          onClick={() => setShippingView("shipped")}
+        >
+          已配送紀錄 {shippedRequests.length}
+        </button>
+      </div>
+      {loading ? (
+        <InlineLoading label="正在載入配送需求..." />
+      ) : visibleRequests.length ? (
+        <div className="shipping-request-list">
+          <div className="shipping-list-header" aria-hidden="true">
+            <span>卡牌／房間</span>
+            <span>收件人</span>
+            <span>配送資料</span>
+            <span>時間</span>
+            <span>順豐單號／操作</span>
+          </div>
+          {visibleRequests.map((record) => (
+            <article className="shipping-request-card" key={record.id}>
+              <div className="shipping-card-summary">
+                <strong>{record.cardName || "未命名卡牌"}</strong>
+                <span>{record.drawTitle || record.roomSlug || "抽卡房"} · {formatRoundLabel(record.round)}</span>
+                <button
+                  className="shipping-user-link"
+                  type="button"
+                  onClick={() => setAuditUser({ uid: record.uid, username: record.username })}
+                >
+                  <UserRoundPlus size={13} />{record.username || "未命名玩家"} · #{record.number || "--"}
+                </button>
+              </div>
+              <dl className="shipping-recipient-details">
+                <div><dt>收件人</dt><dd>{record.shippingRecipient || "--"}</dd></div>
+                <div><dt>電話</dt><dd>{record.shippingPhone || "--"}</dd></div>
+              </dl>
+              <dl className="shipping-address-details">
+                <div><dt>配送方式</dt><dd>{record.shippingMethod === "sf-pickup" ? "順豐自提點" : "順豐上門"}</dd></div>
+                <div className="shipping-address-row"><dt>地址</dt><dd>{record.shippingAddress || "--"}</dd></div>
+                {record.shippingNote && <div className="shipping-address-row"><dt>備註</dt><dd>{record.shippingNote}</dd></div>}
+              </dl>
+              <dl className="shipping-time-details">
+                <div><dt>申請時間</dt><dd>{formatDate(record.shippingRequestedAt)}</dd></div>
+                {record.collectionStatus === "shipped" && (
+                  <div><dt>完成配送</dt><dd>{formatDate(record.shippedAt || record.updatedAt)}</dd></div>
+                )}
+              </dl>
+              {record.collectionStatus === "shipped" ? (
+                <div className="shipping-completed-details">
+                  <span className="status-badge shipped">已配送</span>
+                  <small>順豐單號</small>
+                  {record.trackingNumber ? (
+                    <a
+                      className="small-btn"
+                      href={`https://htm.sf-express.com/hk/tc/dynamic_function/waybill/#search/bill-number/${encodeURIComponent(record.trackingNumber)}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <Truck size={16} />{record.trackingNumber}<ExternalLink size={14} />
+                    </a>
+                  ) : <strong>--</strong>}
+                </div>
+              ) : (
+                <div className="shipping-request-actions">
+                  <input
+                    value={trackingNumbers[record.id] ?? record.trackingNumber ?? ""}
+                    onChange={(event) => setTrackingNumbers((current) => ({
+                      ...current,
+                      [record.id]: event.target.value,
+                    }))}
+                    placeholder="順豐運單號碼"
+                  />
+                  <button
+                    className="primary-btn"
+                    type="button"
+                    onClick={() => markShipped(record)}
+                    disabled={savingId === record.id}
+                  >
+                    <Truck size={17} />{savingId === record.id ? "處理中..." : "標記已配送"}
+                  </button>
+                </div>
+              )}
+            </article>
+          ))}
+        </div>
+      ) : (
+        <p className="empty-state compact-empty">
+          {shippingView === "shipped" ? "暫時未有已配送紀錄。" : "暫時未有待處理配送需求。"}
+        </p>
+      )}
+      {auditUser && (
+        <UserRecordAuditModal
+          records={records}
+          user={auditUser}
+          onClose={() => setAuditUser(null)}
+        />
+      )}
+    </section>
+  );
+}
+
+function UserRecordAuditModal({ records, user, onClose }) {
+  const [slotChecks, setSlotChecks] = useState({});
+  const [checking, setChecking] = useState(true);
+  const [accountSummary, setAccountSummary] = useState(null);
+  const [depositRecords, setDepositRecords] = useState([]);
+  const [selectedProof, setSelectedProof] = useState(null);
+  const userRecords = useMemo(
+    () => records
+      .filter((record) => record.uid === user.uid)
+      .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt)),
+    [records, user.uid],
+  );
+  const totalSpend = userRecords.reduce((sum, record) => sum + Number(record.tokenCost || 0), 0);
+  const assignedCount = userRecords.filter((record) => record.cardId).length;
+  const shippingCount = userRecords.filter((record) => record.shippingRequested).length;
+  const totalPayout = userRecords
+    .filter((record) => record.cardId)
+    .reduce(
+      (sum, record) => sum + Number(record.cardConversionValue ?? getCardConversionRefund(record) ?? 0),
+      0,
+    );
+  const grossProfit = totalSpend - totalPayout;
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      getDoc(doc(db, "users", user.uid)),
+      getDocs(query(collection(db, "tokenRequests"), where("uid", "==", user.uid))),
+    ])
+      .then(([profileSnapshot, requestSnapshot]) => {
+        const profileData = profileSnapshot.exists() ? profileSnapshot.data() : {};
+        const approvedDeposit = requestSnapshot.docs
+          .map((item) => item.data())
+          .filter((request) => request.status === "approved" && request.proofMode !== "promo")
+          .reduce((sum, request) => sum + Number(request.verifiedHkdAmount ?? request.hkdAmount ?? 0), 0);
+        if (!cancelled) {
+          setDepositRecords(
+            requestSnapshot.docs
+              .map((item) => ({ id: item.id, ...item.data() }))
+              .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt)),
+          );
+          setAccountSummary({
+            ...profileData,
+            totalDeposits: Math.max(Number(profileData.totalDeposits || 0), approvedDeposit),
+          });
+        }
+      })
+      .catch((error) => {
+        console.error("Admin user account summary failed.", error);
+        if (!cancelled) setAccountSummary({});
+      });
+    return () => { cancelled = true; };
+  }, [user.uid]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkSlots() {
+      setChecking(true);
+      const checkedEntries = await Promise.all(userRecords.map(async (record) => {
+        if (!record.drawId || !record.slotId || !record.round) {
+          return [record.id, record.number
+            ? { status: "warning", message: "購買紀錄缺少房間、場次或號碼 ID" }
+            : { status: "system", message: "系統贈送紀錄，無購買號碼" }];
+        }
+
+        try {
+          let slotSnapshot = await getDoc(doc(
+            db,
+            "draws",
+            record.drawId,
+            "rounds",
+            record.round,
+            "slots",
+            String(record.slotId),
+          ));
+          if (!slotSnapshot.exists()) {
+            slotSnapshot = await getDoc(doc(db, "draws", record.drawId, "slots", String(record.slotId)));
+          }
+          if (!slotSnapshot.exists()) {
+            return [record.id, { status: "warning", message: "搵唔到對應房間號碼紀錄" }];
+          }
+
+          const slot = slotSnapshot.data();
+          const mismatches = [];
+          if (slot.purchaseRecordId !== record.id) mismatches.push("紀錄 ID");
+          if (slot.uid !== record.uid) mismatches.push("玩家 UID");
+          if (slot.username !== record.username) mismatches.push("玩家名稱");
+          if (Number(slot.number) !== Number(record.number)) mismatches.push("號碼");
+          if (Number(slot.tokenCost) !== Number(record.tokenCost)) mismatches.push("付款代幣");
+          if (slot.targetCardId !== record.targetCardId) mismatches.push("所屬盲盒卡牌");
+          if (Number(slot.targetCardValue) !== Number(record.targetCardValue)) mismatches.push("目標卡價值");
+          if (slot.round && slot.round !== record.round) mismatches.push("場次");
+
+          return mismatches.length
+            ? [record.id, { status: "warning", message: `${mismatches.join("、")}與房間紀錄不一致` }]
+            : [record.id, { status: "ok", message: "與房間號碼及付款紀錄一致" }];
+        } catch (error) {
+          console.error("Admin user record audit failed.", error);
+          return [record.id, { status: "error", message: "暫時無法完成核對，請重試" }];
+        }
+      }));
+
+      if (!cancelled) {
+        setSlotChecks(Object.fromEntries(checkedEntries));
+        setChecking(false);
+      }
+    }
+
+    checkSlots();
+    return () => { cancelled = true; };
+  }, [userRecords]);
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal user-audit-modal" role="dialog" aria-modal="true" aria-labelledby="user-audit-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="icon-btn modal-close" type="button" onClick={onClose} aria-label="關閉玩家紀錄"><X size={19} /></button>
+
+        <h2 id="user-audit-title">{user.username || "未命名玩家"} 全部紀錄</h2>
+        <p className="user-audit-uid">UID：{user.uid || "--"}</p>
+        <div className="user-audit-summary">
+          <span><small>累計入金</small><strong>{accountSummary ? `HK$${formatTokenNumber(accountSummary.totalDeposits || 0)}` : "載入中..."}</strong></span>
+          <span><small>抽卡投入</small><strong><TokenAmount value={totalSpend} /></strong></span>
+          <span><small>派彩／攞出</small><strong><TokenAmount value={totalPayout} /></strong></span>
+          <span className={grossProfit >= 0 ? "user-profit" : "user-loss"}>
+            <small>平台毛利</small>
+            <strong>{grossProfit >= 0 ? "賺 " : "蝕 "}<TokenAmount value={Math.abs(grossProfit)} /></strong>
+          </span>
+          <span><small>現有代幣</small><strong>{accountSummary ? <TokenAmount value={roundTokenBalance(accountSummary.tokens)} /> : "載入中..."}</strong></span>
+          <span><small>紀錄／派卡／配送</small><strong>{userRecords.length}／{assignedCount}／{shippingCount}</strong></span>
+        </div>
+        <p className="user-audit-note">毛利按「抽卡投入代幣 − 已派卡兌換價值」計算；累計入金以港幣獨立顯示。系統亦會將每筆紀錄與原本房間號碼資料核對。</p>
+        <section className="user-audit-section">
+          <div className="user-audit-section-title">
+            <h3>入金紀錄</h3>
+            <strong>{depositRecords.length} 筆</strong>
+          </div>
+          {accountSummary && depositRecords.length ? (
+            <div className="deposit-audit-list">
+              <div className="deposit-audit-header" aria-hidden="true">
+                <span>日期／紀錄</span>
+                <span>方式</span>
+                <span>申請入金</span>
+                <span>獲批代幣</span>
+                <span>狀態</span>
+                <span>審核資料</span>
+              </div>
+              {depositRecords.map((request) => (
+                <article className="deposit-audit-row" key={request.id}>
+                  <div><strong>{formatDate(request.createdAt)}</strong><span>ID：{request.id}</span></div>
+                  <div>
+                    <strong>{request.proofMode === "promo" ? "活動碼" : "FPS／銀行"}</strong>
+                    {request.proofMode === "promo" ? (
+                      <span>{request.promoCode || "--"}</span>
+                    ) : request.proofUrl ? (
+                      <button className="proof-preview-button" type="button" onClick={() => setSelectedProof(request)}>
+                        <FileImage size={14} />查看付款證明
+                      </button>
+                    ) : (
+                      <span>{request.fpsIdentifier || "未有付款證明"}</span>
+                    )}
+                  </div>
+                  <div><strong>{request.proofMode === "promo" ? "非現金" : `HK$${formatTokenNumber(request.hkdAmount || 0)}`}</strong><span>{request.status === "approved" && request.proofMode !== "promo" ? `核實 HK$${formatTokenNumber(request.verifiedHkdAmount ?? request.hkdAmount ?? 0)}` : "--"}</span></div>
+                  <div><strong><TokenAmount value={request.amount || 0} /></strong><span>{request.packageType === "custom" ? "自訂金額" : "套餐"}</span></div>
+                  <div><span className={`status-badge ${request.status || "pending"}`}>{statusLabels[request.status] || request.status || "待審核"}</span></div>
+                  <div><strong>{request.reviewedBy ? "已由管理員審核" : "等待審核"}</strong><span>{request.reviewedAt ? formatDate(request.reviewedAt) : request.adminNote || "--"}</span></div>
+                </article>
+              ))}
+            </div>
+          ) : accountSummary ? (
+            <p className="empty-state compact-empty">未有入金申請紀錄。</p>
+          ) : (
+            <InlineLoading label="正在載入入金紀錄..." />
+          )}
+        </section>
+        <section className="user-audit-section">
+          <div className="user-audit-section-title">
+            <h3>抽卡及派彩紀錄</h3>
+            <strong>{userRecords.length} 筆</strong>
+          </div>
+        {userRecords.length ? (
+          <div className="user-audit-list">
+            <div className="user-audit-list-header" aria-hidden="true">
+              <span>日期／紀錄</span>
+              <span>房間／選擇</span>
+              <span>投入</span>
+              <span>派彩</span>
+              <span>實際結果</span>
+              <span>資料核對</span>
+            </div>
+            {userRecords.map((record) => {
+              const check = slotChecks[record.id];
+              const payout = record.cardId
+                ? Number(record.cardConversionValue ?? getCardConversionRefund(record) ?? 0)
+                : 0;
+              return (
+                <article className="user-audit-record" key={record.id}>
+                  <div className="user-audit-cell user-audit-date">
+                    <strong>{formatDate(record.createdAt)}</strong>
+                    <span>ID：{record.id}</span>
+                  </div>
+                  <div className="user-audit-cell user-audit-room">
+                    <strong>{record.drawTitle || record.roomSlug || "系統紀錄"}</strong>
+                    <span>{formatRoundLabel(record.round)} · #{record.number || "--"}</span>
+                    <span>想抽：{record.targetCardName || "--"}</span>
+                  </div>
+                  <div className="user-audit-cell user-audit-money">
+                    <strong><TokenAmount value={record.tokenCost || 0} /></strong>
+                  </div>
+                  <div className="user-audit-cell user-audit-money">
+                    <strong><TokenAmount value={payout} /></strong>
+                  </div>
+                  <div className="user-audit-cell user-audit-outcome">
+                    <strong>{record.cardName || "尚未派卡"}</strong>
+                    <span>{record.cardId ? `兌換價值 ${formatTokenNumber(payout)}` : "等待開卡結果"}</span>
+                    {record.shippingRequested && <span>配送：{getBetaCollectionStatusLabel(record.collectionStatus)}</span>}
+                  </div>
+                  <div className={`user-audit-result ${check?.status || "checking"}`}>
+                    {checking && !check ? <RefreshCcw className="spin" size={15} /> : check?.status === "ok" ? <Check size={15} /> : <Bell size={15} />}
+                    <span>{check?.message || "正在核對房間紀錄..."}</span>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ) : <p className="empty-state compact-empty">搵唔到呢位玩家嘅紀錄。</p>}
+        </section>
+        {selectedProof && (
+          <div className="proof-preview-backdrop" role="presentation" onMouseDown={() => setSelectedProof(null)}>
+            <section className="proof-preview-modal" role="dialog" aria-modal="true" aria-labelledby="proof-preview-title" onMouseDown={(event) => event.stopPropagation()}>
+              <button className="icon-btn modal-close" type="button" onClick={() => setSelectedProof(null)} aria-label="關閉付款證明"><X size={19} /></button>
+
+              <h3 id="proof-preview-title">付款證明</h3>
+              <p>{formatDate(selectedProof.createdAt)} · HK${formatTokenNumber(selectedProof.hkdAmount || 0)}</p>
+              <img src={selectedProof.proofUrl} alt={`${user.username || "玩家"} 的付款證明`} />
+              <a className="small-btn" href={selectedProof.proofUrl} target="_blank" rel="noreferrer">
+                <ExternalLink size={15} />另開原圖
+              </a>
+            </section>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+// Beta uses one permanent live hall; older draw documents stay untouched as historical records.
+function SingleLiveManagement({ cards, draws, loading = false, profile }) {
+  const live = draws.find((draw) => draw.status === "live")
+    || draws.find((draw) => draw.status === "draft")
+    || draws[0]
+    || null;
+  const archivedLives = draws.filter((draw) => draw.id !== live?.id && draw.status === "completed");
+  const [title, setTitle] = useState(live?.title || "LiveDraw 直播抽卡大廳");
+  const [kickUrl, setKickUrl] = useState(live?.kickUrl || "");
+  const [status, setStatus] = useState(live?.status || "draft");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setTitle(live?.title || "LiveDraw 直播抽卡大廳");
+    setKickUrl(live?.kickUrl || "");
+    setStatus(live?.status || "draft");
+  }, [live?.id, live?.kickUrl, live?.status, live?.title]);
+
+  if (loading) return <InlineLoading label="正在載入直播設定..." />;
+
+  if (!live) {
+    return (
+      <div className="single-live-admin">
+        <div className="single-live-note">
+          <strong>尚未建立直播</strong>
+          <span>只需建立一次；之後所有日期、場次和賽果都在同一個直播內管理。</span>
+        </div>
+        <CreateDrawForm profile={profile} cards={cards} />
+      </div>
+    );
+  }
+
+  const currentRoundId = toRoundId(getRoomCurrentRound(live));
+  const buyingBlocked = isRoundBuyingBlocked(live, currentRoundId);
+  const detailsChanged =
+    title.trim() !== String(live.title || "") ||
+    getKickChannel(kickUrl) !== String(live.kickUrl || "") ||
+    status !== String(live.status || "draft");
+
+  async function saveLiveDetails() {
+    const cleanTitle = title.trim();
+    const cleanKickChannel = getKickChannel(kickUrl);
+    if (!cleanTitle) {
+      alert("請輸入直播名稱。");
+      return;
+    }
+    if (!cleanKickChannel) {
+      alert("請輸入有效的 Kick 頻道名稱。");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await updateDoc(doc(db, "draws", live.id), {
+        title: cleanTitle,
+        kickUrl: cleanKickChannel,
+        status,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      });
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function toggleBuying() {
+    const nextBlockedRounds = buyingBlocked
+      ? (live.buyingBlockedRounds || []).filter((roundId) => roundId !== currentRoundId)
+      : [...new Set([...(live.buyingBlockedRounds || []), currentRoundId])];
+    const action = buyingBlocked ? "重新開放" : "停止";
+    if (!window.confirm(`確認${action}${formatRoundLabel(currentRoundId)}購買？`)) return;
+
+    try {
+      await updateDoc(doc(db, "draws", live.id), {
+        buyingBlockedRounds: nextBlockedRounds,
+        buyingBlockedRound: buyingBlocked ? "" : currentRoundId,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      showSafeError(error);
+    }
+  }
+
+  return (
+    <div className="single-live-admin">
+      <section className="panel single-live-settings">
+        <div className="section-heading compact">
+          <Gavel size={22} />
+          <div>
+            <h2>唯一直播大廳</h2>
+            <p className="muted">所有直播日期、場次、號碼及賽果都使用同一個直播。</p>
+          </div>
+        </div>
+        <div className="single-live-form">
+          <label>
+            直播名稱
+            <input value={title} onChange={(event) => setTitle(event.target.value)} />
+          </label>
+          <label>
+            Kick 頻道名稱
+            <input value={kickUrl} onChange={(event) => setKickUrl(event.target.value)} placeholder="例如 livedrawtcg" />
+          </label>
+          <label>
+            直播狀態
+            <select value={status} onChange={(event) => setStatus(event.target.value)}>
+              <option value="draft">未開播</option>
+              <option value="live">直播中</option>
+              <option value="completed">已暫停</option>
+            </select>
+          </label>
+          <button className="primary-btn" type="button" onClick={saveLiveDetails} disabled={saving || !detailsChanged}>
+            <Save size={16} />{saving ? "儲存中..." : "儲存直播設定"}
+          </button>
+          <button className={buyingBlocked ? "small-btn" : "small-btn danger"} type="button" onClick={toggleBuying}>
+            <Lock size={15} />{buyingBlocked ? "重開本場購買" : "停止本場購買"}
+          </button>
+        </div>
+      </section>
+      <section className="panel single-live-section">
+        <div className="section-heading compact"><Clock3 size={22} /><div><h2>直播日期、場次與賽果</h2></div></div>
+        <RoomRoundSettings draw={live} />
+      </section>
+      <section className="panel single-live-section">
+        <div className="section-heading compact"><Boxes size={22} /><div><h2>直播卡池</h2></div></div>
+        <RoomPoolEditor draw={live} cards={cards} singleLive />
+      </section>
+      <NewLiveSessionForm cards={cards} currentLive={live} draws={draws} profile={profile} />
+      {archivedLives.length > 0 && (
+        <section className="panel single-live-section admin-live-archive">
+          <div className="section-heading compact">
+            <ListChecks size={22} />
+            <div><h2>已封存直播</h2><p className="muted">舊直播資料只可查看，不會被新直播覆蓋。</p></div>
+          </div>
+          <div className="admin-live-archive-list">
+            {archivedLives.map((draw) => (
+              <article key={draw.id}>
+                <div><strong>{draw.title || "過往直播"}</strong><span>{getRoomRoundCount(draw)} 場 · {formatDate(draw.archivedAt || draw.updatedAt || draw.createdAt)}</span></div>
+                <a className="small-btn" href={makeRoomLink(draw.id)} target="_blank" rel="noreferrer">前台查看</a>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+// Atomically archives active sessions and creates a clean live session with fresh round slots.
+function NewLiveSessionForm({ cards, currentLive, draws, profile }) {
+  const now = new Date();
+  const localDateTime = new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const [title, setTitle] = useState(`${new Intl.DateTimeFormat("zh-HK", { month: "2-digit", day: "2-digit" }).format(now)} LiveDraw 直播`);
+  const [kickUrl, setKickUrl] = useState(currentLive?.kickUrl || "");
+  const [firstRoundAt, setFirstRoundAt] = useState(localDateTime);
+  const [totalRounds, setTotalRounds] = useState("6");
+  const [cardCount, setCardCount] = useState(String(currentLive?.cardCount || 20));
+  const [shareMode, setShareMode] = useState("1/2");
+  const [copyPool, setCopyPool] = useState(true);
+  const [creating, setCreating] = useState(false);
+
+  useEffect(() => {
+    setKickUrl(currentLive?.kickUrl || "");
+    setCardCount(String(currentLive?.cardCount || 20));
+  }, [currentLive?.cardCount, currentLive?.id, currentLive?.kickUrl]);
+
+  async function createNewLive(event) {
+    event.preventDefault();
+    const cleanTitle = title.trim();
+    const cleanKickChannel = getKickChannel(kickUrl);
+    const cleanTotalRounds = Math.max(1, Math.min(100, Math.round(Number(totalRounds) || 1)));
+    const cleanCardCount = Math.max(4, Math.min(100, Math.round(Number(cardCount) || 20)));
+    const firstRoundDate = new Date(firstRoundAt);
+    if (!cleanTitle || !cleanKickChannel || Number.isNaN(firstRoundDate.getTime())) {
+      alert("請輸入直播名稱、有效 Kick 頻道及首場時間。");
+      return;
+    }
+    if (!window.confirm("確認封存現有直播並開啟全新直播？舊直播紀錄會保留，新的場次及號碼會由空白開始。")) return;
+
+    setCreating(true);
+    try {
+      const newDrawRef = doc(collection(db, "draws"));
+      const batch = writeBatch(db);
+      const archivedDraws = draws.filter((draw) => ["live", "draft"].includes(draw.status));
+      const sourcePoolCards = copyPool ? normalizeRoomCards(currentLive?.poolCards) : [];
+      const poolCards = sourcePoolCards.length
+        ? sourcePoolCards
+        : copyPool
+          ? cards.filter((card) => (currentLive?.poolCardIds || []).includes(card.id)).map(roomCardPayload)
+          : [];
+      const roundSchedules = Object.fromEntries(
+        rangeNumbers(1, cleanTotalRounds).map((roundNumber) => [
+          toRoundId(roundNumber),
+          new Date(firstRoundDate.getTime() + (roundNumber - 1) * 40 * 60 * 1000).toISOString(),
+        ]),
+      );
+      const roundShareModes = Object.fromEntries(
+        rangeNumbers(1, cleanTotalRounds).map((roundNumber) => [toRoundId(roundNumber), shareMode]),
+      );
+
+      archivedDraws.forEach((draw) => {
+        batch.update(doc(db, "draws", draw.id), {
+          status: "completed",
+          archivedAt: serverTimestamp(),
+          archivedBy: profile.uid,
+          updatedAt: serverTimestamp(),
+        });
+      });
+      batch.set(newDrawRef, {
+        title: cleanTitle,
+        slug: normalizeSlug(`${cleanTitle}-${Date.now()}`),
+        kickUrl: cleanKickChannel,
+        cardCount: cleanCardCount,
+        tokenCost: Number(currentLive?.tokenCost || 10),
+        totalRounds: cleanTotalRounds,
+        currentRound: 1,
+        round: toRoundId(1),
+        status: "live",
+        shareMode,
+        roundShareModes,
+        roundSchedules,
+        roundResultImages: {},
+        buyingBlockedRounds: [],
+        buyingBlockedRound: "",
+        poolText: copyPool ? String(currentLive?.poolText || "") : "",
+        poolCards,
+        poolCardIds: poolCards.map((card) => card.id).filter(Boolean),
+        poolCardValues: Object.fromEntries(poolCards.filter((card) => card.id).map((card) => [card.id, Number(card.tokenValue || 0)])),
+        thumbnailUrl: "",
+        roomLink: makeRoomLink(newDrawRef.id),
+        previousLiveId: currentLive?.id || "",
+        chatStartedAt: serverTimestamp(),
+        createdBy: profile.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await batch.commit();
+      await ensureRoomRoundSlots(newDrawRef.id, rangeNumbers(1, cleanTotalRounds), cleanCardCount);
+      alert("新直播已建立；舊直播已安全封存。新場次、號碼及聊天室均由空白開始。");
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <section className="panel single-live-section new-live-session">
+      <div className="section-heading compact">
+        <Plus size={22} />
+        <div><h2>開新直播</h2><p className="muted">現有直播會封存；玩家紀錄、場次、號碼及賽果全部保留。</p></div>
+      </div>
+      <form className="new-live-session-form" onSubmit={createNewLive}>
+        <label>新直播名稱<input value={title} onChange={(event) => setTitle(event.target.value)} required /></label>
+        <label>Kick 頻道<input value={kickUrl} onChange={(event) => setKickUrl(event.target.value)} required /></label>
+        <label>首場時間<input type="datetime-local" value={firstRoundAt} onChange={(event) => setFirstRoundAt(event.target.value)} required /></label>
+        <label>總場數<input type="number" min="1" max="100" value={totalRounds} onChange={(event) => setTotalRounds(event.target.value)} required /></label>
+        <label>每場號碼<input type="number" min="4" max="100" value={cardCount} onChange={(event) => setCardCount(event.target.value)} required /></label>
+        <label>預設機率<select value={shareMode} onChange={(event) => setShareMode(event.target.value)}><option value="1/2">1/2 二份之一</option><option value="1/5">1/5 五份之一</option><option value="1/10">1/10 十分之一</option></select></label>
+        <label className="new-live-copy-pool"><input type="checkbox" checked={copyPool} onChange={(event) => setCopyPool(event.target.checked)} />沿用現有直播卡池</label>
+        <button className="primary-btn" type="submit" disabled={creating}><Plus size={17} />{creating ? "建立中..." : "封存舊直播並開新直播"}</button>
+      </form>
+    </section>
+  );
+}
+
+function RoomManagementList({ cards, draws, loading = false, onCompleteDraw, onCopyRoomLink }) {
+  if (loading) {
+    return <InlineLoading label="正在載入房間管理..." />;
+  }
+
   if (!draws.length) {
     return <p className="muted">暫時未有房間。</p>;
+  }
+
+  async function updateRoomStatus(draw, status) {
+    try {
+      await updateDoc(doc(db, "draws", draw.id), { status, updatedAt: serverTimestamp() });
+    } catch (error) {
+      showSafeError(error);
+    }
   }
 
   async function toggleCurrentRoundBuying(draw) {
@@ -2777,22 +6058,30 @@ function RoomManagementList({ cards, draws, onCompleteDraw, onCopyRoomLink }) {
           <div className="room-manage-summary">
             <div className="room-manage-main">
               <RoomThumbnail draw={draw} />
-              <div>
-                <strong>{draw.title}</strong>
-                <span>
-                  {draw.cardCount} 張卡 · {getRoomRoundCount(draw)} 場 · 目前{" "}
-                  {formatRoundLabel(toRoundId(getRoomCurrentRound(draw)))} · ⚡ {draw.tokenCost} 入場
-                </span>
+              <div className="room-manage-info">
+                <div className="room-manage-title-row">
+                  <strong>{draw.title}</strong>
+                  <span className={`status-badge ${draw.status}`}>{statusLabels[draw.status] || draw.status}</span>
+                  {buyingBlocked && <span className="status-badge rejected">{ROUND_BUY_LOCKED_LABEL}</span>}
+                </div>
+                <div className="room-manage-stats">
+                  <span><b>{draw.cardCount}</b> 張卡</span>
+                  <span><b>{getRoomRoundCount(draw)}</b> 場</span>
+                  <span>目前 <b>{formatRoundLabel(toRoundId(getRoomCurrentRound(draw)))}</b></span>
+                  <span><b>{getRoomShareMode(draw)}</b> 玩法</span>
+                </div>
                 <span className="room-link-text">{makeRoomLink(draw.id)}</span>
-                <span className={`status-badge ${draw.status}`}>
-                  {statusLabels[draw.status] || draw.status}
-                </span>
-                {buyingBlocked && (
-                  <span className="status-badge rejected">{ROUND_BUY_LOCKED_LABEL}</span>
-                )}
               </div>
             </div>
             <div className="record-actions">
+              <label className="room-status-control">
+                <span>房間狀態</span>
+                <select value={draw.status || "draft"} onChange={(event) => updateRoomStatus(draw, event.target.value)}>
+                  <option value="draft">即將開</option>
+                  <option value="live">直播中</option>
+                  <option value="completed">已結束</option>
+                </select>
+              </label>
               <button className="small-btn" type="button" onClick={() => onCopyRoomLink(draw)}>
                 <Copy size={15} />
                 複製連結
@@ -2807,16 +6096,22 @@ function RoomManagementList({ cards, draws, onCompleteDraw, onCopyRoomLink }) {
                   {buyingBlocked ? "重開本場購買" : "停止本場購買"}
                 </button>
               )}
-              {draw.status === "live" && (
-                <button className="small-btn" type="button" onClick={() => onCompleteDraw(draw)}>
-                  <CopyCheck size={15} />
-                  完成並刪除
-                </button>
-              )}
+              <button className="small-btn danger room-delete-btn" type="button" onClick={() => onCompleteDraw(draw)}>
+                <X size={15} />
+                刪除房間
+              </button>
             </div>
           </div>
-          <RoomRoundSettings draw={draw} />
-          <RoomPoolEditor draw={draw} cards={cards} />
+          <div className="room-manage-sections">
+            <details className="room-config-section">
+              <summary><span><Clock3 size={17} />場次與賽果</span><small>{getRoomRoundCount(draw)} 場 · 目前 {formatRoundLabel(currentRoundId)}</small></summary>
+              <RoomRoundSettings draw={draw} />
+            </details>
+            <details className="room-config-section">
+              <summary><span><Boxes size={17} />房間卡池</span><small>{getRoomPoolIds(draw).length} 張卡牌</small></summary>
+              <RoomPoolEditor draw={draw} cards={cards} />
+            </details>
+          </div>
         </article>
       );
       })}
@@ -2878,7 +6173,7 @@ function TokenPackageManager({ profile }) {
       <div className="section-heading compact">
         <BadgeDollarSign size={22} />
         <div>
-          <p className="eyebrow">Token packages</p>
+
           <h2>代幣套餐設定</h2>
         </div>
       </div>
@@ -2932,6 +6227,60 @@ function TokenPackageManager({ profile }) {
       <p className="form-note">
         玩家申請代幣頁會即時使用這裡的套餐。自訂金額仍會按系統 bonus 規則自動計算。
       </p>
+    </section>
+  );
+}
+
+function PaymentSettingsManager({ profile }) {
+  const savedSettings = usePaymentSettings();
+  const [form, setForm] = useState(savedSettings);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    setForm(savedSettings);
+  }, [savedSettings]);
+
+  async function savePaymentSettings(event) {
+    event.preventDefault();
+    if (!form.fpsIdentifier.trim() || !form.fpsName.trim()) {
+      alert("請輸入平台 FPS 識別碼及收款人姓名。");
+      return;
+    }
+    setSaving(true);
+    setSaved(false);
+    try {
+      await setDoc(doc(db, "settings", "payment"), {
+        fpsIdentifier: form.fpsIdentifier.trim(),
+        fpsName: form.fpsName.trim(),
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      });
+      setSaved(true);
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="panel">
+      <div className="section-heading compact">
+        <Copy size={22} />
+        <div><h2>平台 FPS 收款資料</h2></div>
+      </div>
+      <p className="form-note">
+        {savedSettings.isDummy
+          ? "目前使用測試收款資料。儲存以下設定後，Beta 申請代幣頁會即時改用正式資料。"
+          : "目前使用已儲存的收款資料；更新後會即時同步到 Beta 申請代幣頁。"}
+      </p>
+      <form className="stack-form" onSubmit={savePaymentSettings}>
+        <label>FPS 識別碼<input value={form.fpsIdentifier} onChange={(event) => { setSaved(false); setForm((current) => ({ ...current, fpsIdentifier: event.target.value })); }} placeholder="例如：1234567" required /></label>
+        <label>收款人姓名<input value={form.fpsName} onChange={(event) => { setSaved(false); setForm((current) => ({ ...current, fpsName: event.target.value })); }} placeholder="請輸入收款帳戶姓名" required /></label>
+        <button className="primary-btn" type="submit" disabled={saving}><Save size={17} />{saving ? "儲存中..." : "儲存付款設定"}</button>
+        {saved && <p className="form-note" role="status">付款設定已儲存並同步到申請代幣頁。</p>}
+      </form>
     </section>
   );
 }
@@ -2996,7 +6345,7 @@ function VipProgramManager({ cards, profile, tiers }) {
       <div className="section-heading">
         <Crown size={24} />
         <div>
-          <p className="eyebrow">VIP program</p>
+
           <h1>VIP 等級及升級贈卡</h1>
           <p className="muted">設定每級累積入金門檻及指定贈送卡牌；批准入金時系統會自動發放新達成級別的獎勵。</p>
         </div>
@@ -3040,7 +6389,7 @@ function VipProgramManager({ cards, profile, tiers }) {
               )}
               <div>
                 <strong>{tier.rewardName || "待設定升級獎勵"}</strong>
-                <span>可轉回 ⚡ {formatTokenNumber(tier.rewardConversionValue || 0)}</span>
+                <span>可轉回 <TokenAmount value={tier.rewardConversionValue || 0} /></span>
               </div>
             </div>
           </article>
@@ -3054,13 +6403,16 @@ function VipProgramManager({ cards, profile, tiers }) {
   );
 }
 
-function AdminRoomRecordsPanel({ cards, records, profile }) {
+function AdminRoomRecordsPanel({ cards, records, profile, loading = false }) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
   const [roomFilter, setRoomFilter] = useState("all");
   const [roundFilter, setRoundFilter] = useState("all");
   const [drawRecordStatus, setDrawRecordStatus] = useState("active");
   const [selectedCards, setSelectedCards] = useState({});
   const [selectedStatuses, setSelectedStatuses] = useState({});
+  const [selectedResultSides, setSelectedResultSides] = useState({});
   const [assigningId, setAssigningId] = useState("");
+  const [pendingAssignment, setPendingAssignment] = useState(null);
   const purchaseRecords = records
     .filter((record) => record.uid && record.number)
     .sort(compareRoomRoundRecords);
@@ -3087,14 +6439,33 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
   const completedRecords = filteredRecords.filter((record) => record.cardId);
   const visibleStatusRecords =
     drawRecordStatus === "completed" ? completedRecords : activeRecords;
-  const totalSpend = visibleStatusRecords.reduce(
+  const totalSpend = filteredRecords.reduce(
     (sum, record) => sum + Number(record.tokenCost || record.targetCardValue || 0),
+    0,
+  );
+  const totalPayout = completedRecords.reduce(
+    (sum, record) => sum + Number(record.cardConversionValue ?? getCardConversionRefund(record) ?? 0),
     0,
   );
 
   useEffect(() => {
     setRoundFilter("all");
   }, [roomFilter]);
+
+  if (loading) {
+    return (
+      <section className="panel wide">
+        <div className="section-heading compact">
+          <ListChecks size={22} />
+          <div>
+
+            <h2>{isBeta ? "直播購買紀錄 / 分配抽卡結果" : "房間購買紀錄 / 分配抽卡結果"}</h2>
+          </div>
+        </div>
+        <InlineLoading label="正在載入購買紀錄..." />
+      </section>
+    );
+  }
 
   function updateSelection(recordId, value) {
     setSelectedCards((current) => ({ ...current, [recordId]: value }));
@@ -3104,9 +6475,18 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
     setSelectedStatuses((current) => ({ ...current, [recordId]: value }));
   }
 
-  async function assignCard(record) {
+  function updateResultSide(recordId, value) {
+    setSelectedResultSides((current) => ({ ...current, [recordId]: value }));
+  }
+
+  function openAssignmentConfirmation(record) {
     const cardId = selectedCards[record.id] || record.cardId || record.targetCardId;
-    const card = cards.find((item) => item.id === cardId);
+    const selectedCard = cards.find((item) => item.id === cardId);
+    const resultSide = selectedResultSides[record.id] || record.resultSide || "heaven";
+    const card =
+      resultSide === "hell" && selectedCard?.hellCardId
+        ? cards.find((item) => item.id === selectedCard.hellCardId) || selectedCard
+        : selectedCard;
     const collectionStatus =
       selectedStatuses[record.id] || record.collectionStatus || "pending";
 
@@ -3114,6 +6494,14 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
       alert("請選擇要分配的卡牌。");
       return;
     }
+
+    setPendingAssignment({ record, selectedCard, card, resultSide, collectionStatus });
+  }
+
+  async function confirmAssignment() {
+    if (!pendingAssignment || assigningId) return;
+
+    const { record, selectedCard, card, resultSide, collectionStatus } = pendingAssignment;
 
     setAssigningId(record.id);
     try {
@@ -3125,11 +6513,14 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
         cardImageUrl: card.imageUrl || "",
         cardValue,
         cardConversionValue: Number(card.conversionValue ?? card.tokenValue ?? 0),
+        resultSide,
+        selectedHeavenCardId: selectedCard?.id || "",
         collectionStatus,
         assignedAt: serverTimestamp(),
         assignedBy: profile.uid,
         updatedAt: serverTimestamp(),
       });
+      setPendingAssignment(null);
     } catch (error) {
       showSafeError(error);
     } finally {
@@ -3142,22 +6533,22 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
       <div className="section-heading compact">
         <ListChecks size={22} />
         <div>
-          <p className="eyebrow">Room records</p>
-          <h2>房間購買紀錄 / 分配抽卡結果</h2>
+
+          <h2>{isBeta ? "直播購買紀錄 / 分配抽卡結果" : "房間購買紀錄 / 分配抽卡結果"}</h2>
           <p className="muted">
-            用房間同場次篩選後，直接查看購買資料並分配實際抽中卡牌。
+            {isBeta ? "按場次查看購買資料並分配實際抽中卡牌。" : "用房間同場次篩選後，直接查看購買資料並分配實際抽中卡牌。"}
           </p>
         </div>
       </div>
       <div className="admin-record-toolbar">
-        <select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}>
+        {!isBeta && <select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}>
           <option value="all">全部房間</option>
           {rooms.map(([roomId, roomTitle]) => (
             <option key={roomId} value={roomId}>
               {roomTitle}
             </option>
           ))}
-        </select>
+        </select>}
         <select value={roundFilter} onChange={(event) => setRoundFilter(event.target.value)}>
           <option value="all">全部場次</option>
           {rounds.map((round) => (
@@ -3166,8 +6557,12 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
             </option>
           ))}
         </select>
-        <strong>{visibleStatusRecords.length} 筆紀錄</strong>
-        <strong>合共 ⚡ {formatTokenNumber(totalSpend)}</strong>
+        <strong>{filteredRecords.length} 筆紀錄</strong>
+      </div>
+      <div className="admin-finance-summary">
+        <span><small>總計購買</small><strong><TokenAmount value={totalSpend} /></strong></span>
+        <span><small>派彩總額</small><strong><TokenAmount value={totalPayout} /></strong></span>
+        <span><small>毛利</small><strong><TokenAmount value={totalSpend - totalPayout} /></strong></span>
       </div>
       <div className="collection-tabs admin-status-tabs">
         <button
@@ -3175,14 +6570,14 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
           type="button"
           onClick={() => setDrawRecordStatus("active")}
         >
-          正在抽卡 {activeRecords.length}
+          未分配 {activeRecords.length}
         </button>
         <button
           className={drawRecordStatus === "completed" ? "active" : ""}
           type="button"
           onClick={() => setDrawRecordStatus("completed")}
         >
-          已完成抽卡 {completedRecords.length}
+          已分配 {completedRecords.length}
         </button>
       </div>
       {visibleStatusRecords.length ? (
@@ -3193,25 +6588,30 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
                 card.id === (selectedCards[record.id] || record.cardId || record.targetCardId),
               ) ||
               null;
+            const resultSide = selectedResultSides[record.id] || record.resultSide || "heaven";
+            const resultCard =
+              resultSide === "hell" && selectedCard?.hellCardId
+                ? cards.find((card) => card.id === selectedCard.hellCardId) || selectedCard
+                : selectedCard;
             const previewImage =
-              selectedCard?.imageUrl || record.cardImageUrl || record.targetCardImageUrl || "";
-            const previewName = selectedCard?.name || record.cardName || record.targetCardName || "";
+              resultCard?.imageUrl || record.targetCardImageUrl || record.cardImageUrl || "";
+            const previewName = resultCard?.name || record.cardName || record.targetCardName || "";
             const previewValue =
-              selectedCard?.tokenValue || record.cardValue || record.targetCardValue || 0;
+              resultCard?.conversionValue ?? record.cardConversionValue ?? getCardConversionRefund(record) ?? 0;
 
             return (
               <article className="admin-record-card" key={record.id}>
                 <div className="admin-record-card-main">
                   <div>
-                    <span className="record-label">房間</span>
-                    <strong>{record.drawTitle || "未命名房間"}</strong>
-                    <small>{record.roomSlug || record.drawId} · {record.round || "round-001"}</small>
+                    <span className="record-label">{isBeta ? "直播" : "房間"}</span>
+                    <strong title={record.drawTitle || "未命名房間"}>{record.drawTitle || "未命名房間"}</strong>
+                    <small title={record.roomSlug || record.drawId}>{record.roomSlug || record.drawId} · {formatRoundLabel(record.round)}</small>
                     <small>{formatDate(record.createdAt)}</small>
                   </div>
                   <div>
                     <span className="record-label">玩家</span>
-                    <strong>{record.username || "未命名玩家"}</strong>
-                    <small>{record.uid}</small>
+                    <strong title={record.username || "未命名玩家"}>{record.username || "未命名玩家"}</strong>
+                    <small className="record-full-id" title={record.uid}>{record.uid}</small>
                   </div>
                   <div className="record-number-tile">
                     <span>號碼</span>
@@ -3219,11 +6619,11 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
                   </div>
                   <div className="record-number-tile">
                     <span>花費</span>
-                    <b>⚡ {formatTokenNumber(record.tokenCost || record.targetCardValue || 0)}</b>
+                    <b><TokenAmount value={record.tokenCost || record.targetCardValue || 0} /></b>
                   </div>
                   <div>
                     <span className="record-label">玩家選擇卡牌</span>
-                    <strong>{record.targetCardName || "未選卡牌"}</strong>
+                    <strong title={record.targetCardName || "未選卡牌"}>{record.targetCardName || "未選卡牌"}</strong>
                     <small>
                       {record.targetCardValue
                         ? `價值 ⚡ ${formatTokenNumber(record.targetCardValue)}`
@@ -3231,30 +6631,10 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
                     </small>
                   </div>
                 </div>
-                <div className="record-assignment-cell">
-                  <span className="record-label">分配結果</span>
-                  <div className="assignment-preview compact-preview">
-                    {previewImage ? (
-                      <img src={previewImage} alt={previewName || "Selected card"} />
-                    ) : (
-                      <div className="assignment-placeholder">
-                        <Package size={18} />
-                      </div>
-                    )}
-                    <span>
-                      {previewName || "未分配"}
-                      {previewValue ? ` · ⚡ ${formatTokenNumber(previewValue)}` : ""}
-                    </span>
-                  </div>
-                  {record.cardName && (
-                    <small className="assigned-note">
-                      已分配：{record.cardName}（{statusLabels[record.collectionStatus]}）
-                    </small>
-                  )}
-                </div>
                 <div className="assignment-controls inline-assignment-controls">
                   <select
                     value={selectedCards[record.id] || record.cardId || record.targetCardId || ""}
+                    title={selectedCard?.name || "選擇卡牌"}
                     onChange={(event) => updateSelection(record.id, event.target.value)}
                   >
                     <option value="">選擇卡牌</option>
@@ -3264,6 +6644,22 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
                       </option>
                     ))}
                   </select>
+                  <div className="result-side-toggle" aria-label="開牌結果">
+                    <button
+                      className={resultSide === "heaven" ? "active" : ""}
+                      type="button"
+                      onClick={() => updateResultSide(record.id, "heaven")}
+                    >
+                      天堂
+                    </button>
+                    <button
+                      className={resultSide === "hell" ? "active" : ""}
+                      type="button"
+                      onClick={() => updateResultSide(record.id, "hell")}
+                    >
+                      地獄
+                    </button>
+                  </div>
                   <select
                     value={selectedStatuses[record.id] || record.collectionStatus || "pending"}
                     onChange={(event) => updateStatus(record.id, event.target.value)}
@@ -3277,13 +6673,20 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
                   <button
                     className="small-btn"
                     type="button"
-                    onClick={() => assignCard(record)}
+                    onClick={() => openAssignmentConfirmation(record)}
                     disabled={assigningId === record.id}
                   >
                     <Package size={15} />
-                    {assigningId === record.id ? "儲存中..." : "分配"}
+                    {assigningId === record.id ? "儲存中..." : "生成盲盒"}
                   </button>
                 </div>
+                {record.cardName && (
+                  <div className="assigned-result-inline">
+                    {previewImage ? <img src={previewImage} alt={previewName || "已分配卡牌"} /> : <Package size={18} />}
+                    <span>已分配：{previewName}{previewValue ? ` · ⚡ ${formatTokenNumber(previewValue)}` : ""}</span>
+                    <b className={record.resultSide === "hell" ? "hell" : "heaven"}>{getResultSideLabel(record.resultSide)}</b>
+                  </div>
+                )}
               </article>
             );
           })}
@@ -3291,7 +6694,48 @@ function AdminRoomRecordsPanel({ cards, records, profile }) {
       ) : (
         <p className="muted">暫時未有購買紀錄。</p>
       )}
+      {pendingAssignment && (
+        <AdminBlindBoxConfirmModal
+          assignment={pendingAssignment}
+          saving={assigningId === pendingAssignment.record.id}
+          onCancel={() => setPendingAssignment(null)}
+          onConfirm={confirmAssignment}
+        />
+      )}
     </section>
+  );
+}
+
+// Reviews the exact result before an administrator permanently assigns a card to a draw record.
+function AdminBlindBoxConfirmModal({ assignment, saving, onCancel, onConfirm }) {
+  const { record, card, resultSide, collectionStatus } = assignment;
+
+  return (
+    <div className="modal-backdrop blind-box-backdrop" role="presentation" onMouseDown={saving ? undefined : onCancel}>
+      <section className="modal blind-box-modal admin-blind-box-modal" role="dialog" aria-modal="true" aria-labelledby="admin-blind-box-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="icon-btn modal-close" type="button" onClick={onCancel} disabled={saving} aria-label="取消生成盲盒"><X size={19} /></button>
+        <div className="admin-blind-box-preview">
+          {card.imageUrl ? <img src={card.imageUrl} alt={card.name} /> : <Package size={42} />}
+        </div>
+
+        <h2 id="admin-blind-box-title">確認生成盲盒</h2>
+        <p className="blind-box-copy">請核對派發結果。確認後，玩家會在「我的紀錄」及「我的卡牌」看到呢張卡。</p>
+        <div className="blind-box-order admin-blind-box-order">
+          <div><span>玩家</span><strong>{record.username || "未命名玩家"}</strong></div>
+          <div><span>房間／場次</span><strong>{record.drawTitle || "未命名房間"} · {formatRoundLabel(record.round)}</strong></div>
+          <div><span>盲盒號碼</span><strong>#{record.number}</strong></div>
+          <div><span>玩家花費</span><strong><TokenAmount value={record.tokenCost || record.targetCardValue || 0} /></strong></div>
+          <div><span>玩家所屬盲盒</span><strong>{record.targetCardName || "未選卡牌"}</strong></div>
+          <div><span>天堂／地獄</span><strong className={resultSide === "hell" ? "result-hell" : "result-heaven"}>{getResultSideLabel(resultSide)}</strong></div>
+          <div className="blind-box-target"><span>實際派發卡牌</span><strong>{card.name} · ⚡ {formatTokenNumber(card.conversionValue ?? card.tokenValue ?? 0)}</strong></div>
+          <div className="blind-box-target"><span>卡牌狀態</span><strong>{statusLabels[collectionStatus]}</strong></div>
+        </div>
+        <div className="blind-box-actions">
+          <button className="small-btn" type="button" onClick={onCancel} disabled={saving}>返回修改</button>
+          <button className="primary-btn" type="button" onClick={onConfirm} disabled={saving}>{saving ? "生成中..." : "確認生成盲盒"}</button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -3299,9 +6743,13 @@ function CreateCardForm({ cards, profile }) {
   const cardCategories = useCardCategories(cards);
   const [newCard, setNewCard] = useState({
     name: "",
-    tokenValue: 10,
+    modePriceHalf: 10,
+    modePriceFifth: 10,
+    modePriceTenth: 10,
+    allowedShareModes: [...SHARE_MODES],
     conversionValue: 8,
     category: CARD_CATEGORIES[0],
+    hellCardId: "",
     imageFile: null,
   });
   const [newCategoryName, setNewCategoryName] = useState("");
@@ -3310,7 +6758,9 @@ function CreateCardForm({ cards, profile }) {
   const [cardDrafts, setCardDrafts] = useState({});
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [publishingShowcase, setPublishingShowcase] = useState(false);
   const [savingCardId, setSavingCardId] = useState("");
+  const [deletingCardId, setDeletingCardId] = useState("");
   const importInputId = useId();
 
   useEffect(() => {
@@ -3340,8 +6790,12 @@ function CreateCardForm({ cards, profile }) {
     return (
       String(draft.name || "") !== String(card.name || "") ||
       String(draft.category || CARD_CATEGORIES[0]) !== getCardCategory(card) ||
-      Number(draft.tokenValue || 0) !== Number(card.tokenValue || 0) ||
+      Number(draft.modePriceHalf || 0) !== getCardModePrices(card).half ||
+      Number(draft.modePriceFifth || 0) !== getCardModePrices(card).fifth ||
+      Number(draft.modePriceTenth || 0) !== getCardModePrices(card).tenth ||
+      JSON.stringify(getCardAllowedShareModes(draft)) !== JSON.stringify(getCardAllowedShareModes(card)) ||
       Number(draft.conversionValue || 0) !== Number(card.conversionValue ?? card.tokenValue ?? 0) ||
+      String(draft.hellCardId || "") !== String(card.hellCardId || "") ||
       Boolean(draft.imageFile)
     );
   }
@@ -3357,6 +6811,31 @@ function CreateCardForm({ cards, profile }) {
         ...(current[cardId] || {}),
         [field]: value,
       },
+    }));
+  }
+
+  function toggleAllowedShareMode(cardId, mode) {
+    setCardDrafts((current) => {
+      const draft = current[cardId] || {};
+      const allowedShareModes = getCardAllowedShareModes(draft);
+      return {
+        ...current,
+        [cardId]: {
+          ...draft,
+          allowedShareModes: allowedShareModes.includes(mode)
+            ? allowedShareModes.filter((item) => item !== mode)
+            : SHARE_MODES.filter((item) => [...allowedShareModes, mode].includes(item)),
+        },
+      };
+    });
+  }
+
+  function toggleNewCardShareMode(mode) {
+    setNewCard((current) => ({
+      ...current,
+      allowedShareModes: current.allowedShareModes.includes(mode)
+        ? current.allowedShareModes.filter((item) => item !== mode)
+        : SHARE_MODES.filter((item) => [...current.allowedShareModes, mode].includes(item)),
     }));
   }
 
@@ -3469,8 +6948,17 @@ function CreateCardForm({ cards, profile }) {
       alert("請先上傳卡牌圖片。");
       return;
     }
-    if (Number(newCard.tokenValue) < 1) {
-      alert("卡牌代幣價值最少為 1。");
+    const modePrices = {
+      half: Number(newCard.modePriceHalf),
+      fifth: Number(newCard.modePriceFifth),
+      tenth: Number(newCard.modePriceTenth),
+    };
+    if (Object.values(modePrices).some((value) => value < 1)) {
+      alert("三種玩法的卡牌價值都最少為 1。");
+      return;
+    }
+    if (!newCard.allowedShareModes.length) {
+      alert("每張卡最少要開放一種份額。");
       return;
     }
     if (Number(newCard.conversionValue) < 0) {
@@ -3491,15 +6979,18 @@ function CreateCardForm({ cards, profile }) {
       await addDoc(collection(db, "cards"), {
         name: cleanName,
         category: newCard.category || CARD_CATEGORIES[0],
-        tokenValue: Number(newCard.tokenValue),
+        tokenValue: modePrices.half,
+        modePrices,
+        allowedShareModes: newCard.allowedShareModes,
         conversionValue: Number(newCard.conversionValue),
+        hellCardId: newCard.hellCardId || "",
         imageUrl,
         imageMode: "compressed-data-url",
         createdBy: profile.uid,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      setNewCard({ name: "", tokenValue: 10, conversionValue: 8, category: CARD_CATEGORIES[0], imageFile: null });
+      setNewCard({ name: "", modePriceHalf: 10, modePriceFifth: 10, modePriceTenth: 10, allowedShareModes: [...SHARE_MODES], conversionValue: 8, category: CARD_CATEGORIES[0], hellCardId: "", imageFile: null });
     } catch (error) {
       showSafeError(error);
     } finally {
@@ -3510,15 +7001,24 @@ function CreateCardForm({ cards, profile }) {
   async function saveCardEdit(card) {
     const draft = cardDrafts[card.id] || {};
     const cleanName = String(draft.name || "").trim();
-    const cleanTokenValue = Number(draft.tokenValue || 0);
+    const cleanModePrices = {
+      half: Number(draft.modePriceHalf || 0),
+      fifth: Number(draft.modePriceFifth || 0),
+      tenth: Number(draft.modePriceTenth || 0),
+    };
     const cleanConversionValue = Number(draft.conversionValue || 0);
+    const allowedShareModes = getCardAllowedShareModes(draft);
 
     if (!cleanName) {
       alert("請輸入卡牌名稱。");
       return;
     }
-    if (cleanTokenValue < 1) {
-      alert("卡牌代幣價值最少為 1。");
+    if (Object.values(cleanModePrices).some((value) => value < 1)) {
+      alert("三種玩法的卡牌價值都最少為 1。");
+      return;
+    }
+    if (!allowedShareModes.length) {
+      alert("每張卡最少要開放一種份額。");
       return;
     }
     if (cleanConversionValue < 0) {
@@ -3538,8 +7038,11 @@ function CreateCardForm({ cards, profile }) {
       const updates = {
         name: cleanName,
         category: draft.category || CARD_CATEGORIES[0],
-        tokenValue: cleanTokenValue,
+        tokenValue: cleanModePrices.half,
+        modePrices: cleanModePrices,
+        allowedShareModes,
         conversionValue: cleanConversionValue,
+        hellCardId: draft.hellCardId || "",
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
       };
@@ -3556,7 +7059,7 @@ function CreateCardForm({ cards, profile }) {
       await updateAssignedRecordsForCard(card.id, {
         cardName: cleanName,
         cardCategory: draft.category || CARD_CATEGORIES[0],
-        cardValue: cleanTokenValue,
+        cardValue: cleanModePrices.half,
         cardConversionValue: cleanConversionValue,
         ...(updates.imageUrl ? { cardImageUrl: updates.imageUrl } : {}),
         updatedAt: serverTimestamp(),
@@ -3564,15 +7067,21 @@ function CreateCardForm({ cards, profile }) {
       await updateRoomPoolCardsForCard(card.id, {
         name: cleanName,
         category: draft.category || CARD_CATEGORIES[0],
-        tokenValue: cleanTokenValue,
+        tokenValue: cleanModePrices.half,
+        modePrices: cleanModePrices,
+        allowedShareModes,
       });
       setCardDrafts((current) => ({
         ...current,
         [card.id]: {
           name: cleanName,
           category: draft.category || CARD_CATEGORIES[0],
-          tokenValue: cleanTokenValue,
+          modePriceHalf: cleanModePrices.half,
+          modePriceFifth: cleanModePrices.fifth,
+          modePriceTenth: cleanModePrices.tenth,
+          allowedShareModes,
           conversionValue: cleanConversionValue,
+          hellCardId: draft.hellCardId || "",
           imageFile: null,
         },
       }));
@@ -3583,17 +7092,126 @@ function CreateCardForm({ cards, profile }) {
     }
   }
 
+  async function deleteCard(card) {
+    if (!window.confirm(`確認刪除「${card.name}」？\n\n這張卡會從卡牌庫及所有房間卡池移除；已完成的抽卡及配送紀錄會保留。`)) {
+      return;
+    }
+
+    setDeletingCardId(card.id);
+    try {
+      const roomsSnapshot = await getDocs(collection(db, "draws"));
+      const batch = writeBatch(db);
+
+      roomsSnapshot.docs.forEach((roomDoc) => {
+        const room = roomDoc.data();
+        const poolCardIds = getRoomPoolIds(room);
+        if (!poolCardIds.includes(card.id)) return;
+
+        const poolCards = normalizeRoomCards(room.poolCards)
+          .filter((item) => item.id !== card.id)
+          .map(roomCardPayload);
+        const nextPoolCardIds = poolCardIds.filter((cardId) => cardId !== card.id);
+        const poolCardValues = { ...(room.poolCardValues || {}) };
+        delete poolCardValues[card.id];
+
+        batch.update(roomDoc.ref, {
+          poolCards,
+          poolCardIds: nextPoolCardIds,
+          poolCardValues,
+          updatedAt: serverTimestamp(),
+          updatedBy: profile.uid,
+        });
+      });
+
+      cards.forEach((item) => {
+        if (item.id !== card.id && item.hellCardId === card.id) {
+          batch.update(doc(db, "cards", item.id), {
+            hellCardId: "",
+            updatedAt: serverTimestamp(),
+            updatedBy: profile.uid,
+          });
+        }
+      });
+
+      batch.set(doc(db, "publicCardShowcase", card.id), {
+        active: false,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      }, { merge: true });
+      batch.update(doc(db, "cards", card.id), {
+        archived: true,
+        archivedAt: serverTimestamp(),
+        archivedBy: profile.uid,
+        updatedAt: serverTimestamp(),
+      });
+      await batch.commit();
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setDeletingCardId("");
+    }
+  }
+
   function exportCardsCsv() {
     const csvRows = cards.map((card) => ({
       id: card.id,
       name: card.name || "",
       category: getCardCategory(card),
-      tokenValue: Number(card.tokenValue || 0),
+      priceHalf: getCardModePrices(card).half,
+      priceFifth: getCardModePrices(card).fifth,
+      priceTenth: getCardModePrices(card).tenth,
+      allowedShareModes: getCardAllowedShareModes(card).join("|"),
       conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 0),
+      hellCardId: card.hellCardId || "",
       imageUrl: card.imageUrl || "",
     }));
-    const csvText = createCsvText(["id", "name", "category", "tokenValue", "conversionValue", "imageUrl"], csvRows);
+    const csvText = createCsvText(["id", "name", "category", "priceHalf", "priceFifth", "priceTenth", "allowedShareModes", "conversionValue", "hellCardId", "imageUrl"], csvRows);
     downloadTextFile(`draw-card-library-${new Date().toISOString().slice(0, 10)}.csv`, csvText);
+  }
+
+  async function publishHomepageShowcase() {
+    const featuredCards = [...cards]
+      .filter((card) => card.name && card.imageUrl && Number(card.tokenValue || 0) > 0)
+      .sort((left, right) => Number(right.tokenValue || 0) - Number(left.tokenValue || 0))
+      .slice(0, PUBLIC_CARD_SHOWCASE_LIMIT);
+
+    if (!featuredCards.length) {
+      alert("卡牌庫未有可發佈的卡牌圖片。");
+      return;
+    }
+    if (!window.confirm(`確認更新首頁走馬燈的 ${featuredCards.length} 張卡牌？`)) {
+      return;
+    }
+
+    setPublishingShowcase(true);
+    try {
+      const existingSnapshot = await getDocs(collection(db, "publicCardShowcase"));
+      const batch = writeBatch(db);
+
+      existingSnapshot.docs.forEach((item) => {
+        batch.set(item.ref, { active: false, updatedAt: serverTimestamp() }, { merge: true });
+      });
+      featuredCards.forEach((card, index) => {
+        batch.set(doc(db, "publicCardShowcase", card.id), {
+          name: String(card.name || ""),
+          imageUrl: String(card.imageUrl || ""),
+          tokenValue: Number(card.tokenValue || 0),
+          modePrices: getCardModePrices(card),
+          allowedShareModes: getCardAllowedShareModes(card),
+          category: getCardCategory(card),
+          active: true,
+          rank: index + 1,
+          updatedAt: serverTimestamp(),
+          updatedBy: profile.uid,
+        }, { merge: true });
+      });
+      await batch.commit();
+      alert(`首頁走馬燈已更新，共 ${featuredCards.length} 張卡牌。`);
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setPublishingShowcase(false);
+    }
   }
 
   async function importCardsCsv(file) {
@@ -3641,7 +7259,10 @@ function CreateCardForm({ cards, profile }) {
           name: row.name,
           category: row.category || CARD_CATEGORIES[0],
           tokenValue: row.tokenValue,
+          modePrices: row.modePrices,
+          allowedShareModes: row.allowedShareModes,
           conversionValue: row.conversionValue,
+          hellCardId: row.hellCardId || "",
           updatedAt: serverTimestamp(),
           updatedBy: profile.uid,
         };
@@ -3667,6 +7288,8 @@ function CreateCardForm({ cards, profile }) {
             name: row.name,
             category: row.category || CARD_CATEGORIES[0],
             tokenValue: row.tokenValue,
+            modePrices: row.modePrices,
+            allowedShareModes: row.allowedShareModes,
             conversionValue: row.conversionValue,
           });
           updatedCount += 1;
@@ -3675,7 +7298,10 @@ function CreateCardForm({ cards, profile }) {
             name: row.name,
             category: row.category || CARD_CATEGORIES[0],
             tokenValue: row.tokenValue,
+            modePrices: row.modePrices,
+            allowedShareModes: row.allowedShareModes,
             conversionValue: row.conversionValue,
+            hellCardId: row.hellCardId || "",
             imageUrl: row.imageUrl || "",
             imageMode: row.imageUrl
               ? row.imageUrl.startsWith("data:image/")
@@ -3704,13 +7330,22 @@ function CreateCardForm({ cards, profile }) {
       <div className="section-heading">
         <ImagePlus size={24} />
         <div>
-          <p className="eyebrow">Card library</p>
+
           <h1>卡牌庫管理</h1>
           <p className="muted">可分開設定抽卡價值及玩家把卡牌轉回代幣的價值。</p>
         </div>
       </div>
 
       <div className="card-sheet-toolbar">
+        <button
+          className="small-btn"
+          type="button"
+          onClick={publishHomepageShowcase}
+          disabled={publishingShowcase}
+        >
+          <RefreshCcw size={15} />
+          {publishingShowcase ? "更新中..." : "更新首頁走馬燈"}
+        </button>
         <button className="small-btn" type="button" onClick={exportCardsCsv}>
           <Download size={15} />
           匯出 Excel CSV
@@ -3727,7 +7362,7 @@ function CreateCardForm({ cards, profile }) {
           />
         </label>
         <span className="form-note">
-          CSV 欄位：id、name、category、tokenValue、conversionValue、imageUrl。保留 id 可更新現有卡；留空 id 會新增。
+          CSV 欄位：id、name、category、priceHalf、priceFifth、priceTenth、conversionValue、hellCardId、imageUrl。保留 id 可更新現有卡；留空 id 會新增。
         </span>
       </div>
 
@@ -3792,8 +7427,12 @@ function CreateCardForm({ cards, profile }) {
           <span>圖片</span>
           <span>卡牌名稱</span>
           <span>分類</span>
-          <span>抽卡價值</span>
+          <span>1/2 價值</span>
+          <span>1/5 價值</span>
+          <span>1/10 價值</span>
+          <span>開放份額</span>
           <span>兌換價值</span>
+          <span>地獄對應卡</span>
           <span>操作</span>
         </div>
 
@@ -3804,37 +7443,91 @@ function CreateCardForm({ cards, profile }) {
             label="新增圖片"
             onChange={(file) => updateNewCard("imageFile", file)}
           />
-          <input
-            value={newCard.name}
-            onChange={(event) => updateNewCard("name", event.target.value)}
-            placeholder="例如：Pikachu AR"
-            required
-          />
-          <select
-            value={newCard.category}
-            onChange={(event) => updateNewCard("category", event.target.value)}
-          >
-            {cardCategories.map((category) => (
-              <option key={category} value={category}>
-                {category}
-              </option>
+          <label className="card-sheet-field">
+            <span>卡牌名稱</span>
+            <input
+              value={newCard.name}
+              onChange={(event) => updateNewCard("name", event.target.value)}
+              placeholder="例如：Pikachu AR"
+              required
+            />
+          </label>
+          <label className="card-sheet-field">
+            <span>分類</span>
+            <select
+              value={newCard.category}
+              onChange={(event) => updateNewCard("category", event.target.value)}
+            >
+              {cardCategories.map((category) => (
+                <option key={category} value={category}>
+                  {category}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="card-sheet-field">
+            <span>1/2 價值</span>
+            <input
+              type="number"
+              min="1"
+              step="any"
+              value={newCard.modePriceHalf}
+              onChange={(event) => updateNewCard("modePriceHalf", event.target.value)}
+              required
+            />
+          </label>
+          <label className="card-sheet-field">
+            <span>1/5 價值</span>
+            <input
+              type="number"
+              min="1"
+              step="any"
+              value={newCard.modePriceFifth}
+              onChange={(event) => updateNewCard("modePriceFifth", event.target.value)}
+              required
+            />
+          </label>
+          <label className="card-sheet-field">
+            <span>1/10 價值</span>
+            <input
+              type="number"
+              min="1"
+              step="any"
+              value={newCard.modePriceTenth}
+              onChange={(event) => updateNewCard("modePriceTenth", event.target.value)}
+              required
+            />
+          </label>
+          <fieldset className="card-sheet-field card-share-mode-field">
+            <legend>開放份額</legend>
+            {SHARE_MODES.map((mode) => (
+              <label key={mode}>
+                <input
+                  type="checkbox"
+                  checked={newCard.allowedShareModes.includes(mode)}
+                  onChange={() => toggleNewCardShareMode(mode)}
+                />
+                {mode}
+              </label>
             ))}
-          </select>
-          <input
-            type="number"
-            min="1"
-            value={newCard.tokenValue}
-            onChange={(event) => updateNewCard("tokenValue", event.target.value)}
-            required
-          />
-          <input
-            type="number"
-            min="0"
-            value={newCard.conversionValue}
-            onChange={(event) => updateNewCard("conversionValue", event.target.value)}
-            aria-label="卡牌兌換代幣價值"
-            required
-          />
+          </fieldset>
+          <label className="card-sheet-field">
+            <span>兌換價值</span>
+            <input
+              type="number"
+              min="0"
+              value={newCard.conversionValue}
+              onChange={(event) => updateNewCard("conversionValue", event.target.value)}
+              required
+            />
+          </label>
+          <label className="card-sheet-field">
+            <span>地獄對應卡</span>
+            <select value={newCard.hellCardId} onChange={(event) => updateNewCard("hellCardId", event.target.value)}>
+              <option value="">未設定</option>
+              {cards.map((card) => <option key={card.id} value={card.id}>{card.name}</option>)}
+            </select>
+          </label>
           <button className="primary-btn" type="submit" disabled={creating}>
             <Save size={18} />
             {creating ? "建立中..." : "新增"}
@@ -3847,8 +7540,12 @@ function CreateCardForm({ cards, profile }) {
               const draft = cardDrafts[card.id] || {
                 name: card.name || "",
                 category: getCardCategory(card),
-                tokenValue: Number(card.tokenValue || 10),
+                modePriceHalf: getCardModePrices(card).half,
+                modePriceFifth: getCardModePrices(card).fifth,
+                modePriceTenth: getCardModePrices(card).tenth,
+                allowedShareModes: getCardAllowedShareModes(card),
                 conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 10),
+                hellCardId: card.hellCardId || "",
                 imageFile: null,
               };
               const changed = cardDraftChanged(card, draft);
@@ -3860,33 +7557,85 @@ function CreateCardForm({ cards, profile }) {
                     label="更換圖片"
                     onChange={(file) => updateDraft(card.id, "imageFile", file)}
                   />
-                  <input
-                    value={draft.name}
-                    onChange={(event) => updateDraft(card.id, "name", event.target.value)}
-                  />
-                  <select
-                    value={draft.category || CARD_CATEGORIES[0]}
-                    onChange={(event) => updateDraft(card.id, "category", event.target.value)}
-                  >
-                    {cardCategories.map((category) => (
-                      <option key={category} value={category}>
-                        {category}
-                      </option>
+                  <label className="card-sheet-field">
+                    <span>卡牌名稱</span>
+                    <input
+                      value={draft.name}
+                      onChange={(event) => updateDraft(card.id, "name", event.target.value)}
+                    />
+                  </label>
+                  <label className="card-sheet-field">
+                    <span>分類</span>
+                    <select
+                      value={draft.category || CARD_CATEGORIES[0]}
+                      onChange={(event) => updateDraft(card.id, "category", event.target.value)}
+                    >
+                      {cardCategories.map((category) => (
+                        <option key={category} value={category}>
+                          {category}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="card-sheet-field">
+                    <span>1/2 價值</span>
+                    <input
+                      type="number"
+                      min="1"
+                      step="any"
+                      value={draft.modePriceHalf}
+                      onChange={(event) => updateDraft(card.id, "modePriceHalf", event.target.value)}
+                    />
+                  </label>
+                  <label className="card-sheet-field">
+                    <span>1/5 價值</span>
+                    <input
+                      type="number"
+                      min="1"
+                      step="any"
+                      value={draft.modePriceFifth}
+                      onChange={(event) => updateDraft(card.id, "modePriceFifth", event.target.value)}
+                    />
+                  </label>
+                  <label className="card-sheet-field">
+                    <span>1/10 價值</span>
+                    <input
+                      type="number"
+                      min="1"
+                      step="any"
+                      value={draft.modePriceTenth}
+                      onChange={(event) => updateDraft(card.id, "modePriceTenth", event.target.value)}
+                    />
+                  </label>
+                  <fieldset className="card-sheet-field card-share-mode-field">
+                    <legend>開放份額</legend>
+                    {SHARE_MODES.map((mode) => (
+                      <label key={mode}>
+                        <input
+                          type="checkbox"
+                          checked={getCardAllowedShareModes(draft).includes(mode)}
+                          onChange={() => toggleAllowedShareMode(card.id, mode)}
+                        />
+                        {mode}
+                      </label>
                     ))}
-                  </select>
-                  <input
-                    type="number"
-                    min="1"
-                    value={draft.tokenValue}
-                    onChange={(event) => updateDraft(card.id, "tokenValue", event.target.value)}
-                  />
-                  <input
-                    type="number"
-                    min="0"
-                    value={draft.conversionValue}
-                    onChange={(event) => updateDraft(card.id, "conversionValue", event.target.value)}
-                    aria-label={`${card.name} 兌換代幣價值`}
-                  />
+                  </fieldset>
+                  <label className="card-sheet-field">
+                    <span>兌換價值</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={draft.conversionValue}
+                      onChange={(event) => updateDraft(card.id, "conversionValue", event.target.value)}
+                    />
+                  </label>
+                  <label className="card-sheet-field">
+                    <span>地獄對應卡</span>
+                    <select value={draft.hellCardId || ""} onChange={(event) => updateDraft(card.id, "hellCardId", event.target.value)}>
+                      <option value="">未設定</option>
+                      {cards.filter((item) => item.id !== card.id).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                    </select>
+                  </label>
                   <div className="card-row-actions">
                     <button
                       className="small-btn"
@@ -3908,6 +7657,15 @@ function CreateCardForm({ cards, profile }) {
                         還原
                       </button>
                     )}
+                    <button
+                      className="small-btn danger"
+                      type="button"
+                      onClick={() => deleteCard(card)}
+                      disabled={savingCardId === card.id || deletingCardId === card.id}
+                    >
+                      <Trash2 size={15} />
+                      {deletingCardId === card.id ? "刪除中..." : "刪除卡牌"}
+                    </button>
                   </div>
                 </div>
               );
@@ -3964,7 +7722,7 @@ function ImageCellPicker({ imageUrl, file, label, onChange }) {
   );
 }
 
-function RoomPoolEditor({ draw, cards }) {
+function RoomPoolEditor({ draw, cards, singleLive = false }) {
   const [selectedIds, setSelectedIds] = useState(
     getRoomPoolIds(draw),
   );
@@ -4001,7 +7759,7 @@ function RoomPoolEditor({ draw, cards }) {
     );
 
     if (!poolCards.length) {
-      alert("請最少選擇一張房間卡牌。");
+      alert(singleLive ? "請最少選擇一張直播卡牌。" : "請最少選擇一張房間卡牌。");
       return;
     }
 
@@ -4024,7 +7782,7 @@ function RoomPoolEditor({ draw, cards }) {
     <div className="room-pool-editor">
       <div className="room-pool-header">
         <div>
-          <strong>房間可選卡牌</strong>
+          <strong>{singleLive ? "直播可選卡牌" : "房間可選卡牌"}</strong>
           <span>{selectedIds.length} 張已選</span>
         </div>
         <button
@@ -4069,7 +7827,7 @@ function RoomPoolEditor({ draw, cards }) {
                   </span>
                 )}
                 <span>{card.name}</span>
-                <small>⚡ {formatTokenNumber(card.tokenValue || 0)}</small>
+                <small><TokenAmount value={card.tokenValue || 0} /></small>
               </button>
             ))}
           </div>
@@ -4085,17 +7843,58 @@ function RoomPoolEditor({ draw, cards }) {
 function RoomRoundSettings({ draw }) {
   const [totalRounds, setTotalRounds] = useState(String(getRoomRoundCount(draw)));
   const [currentRound, setCurrentRound] = useState(String(getRoomCurrentRound(draw)));
+  const [roundSchedules, setRoundSchedules] = useState(() => getRoundScheduleDrafts(draw));
+  const [roundShareModes, setRoundShareModes] = useState(() => ({ ...(draw.roundShareModes || {}) }));
+  const [resultFiles, setResultFiles] = useState({});
+  const [uploadingRoundId, setUploadingRoundId] = useState("");
   const [saving, setSaving] = useState(false);
   const savedTotal = getRoomRoundCount(draw);
   const savedCurrent = getRoomCurrentRound(draw);
+  const savedRoundSchedules = draw.roundSchedules;
   const totalRoundNumber = Number(totalRounds);
   const currentRoundNumber = Number(currentRound);
-  const hasChanges = totalRoundNumber !== savedTotal || currentRoundNumber !== savedCurrent;
+  const hasChanges =
+    totalRoundNumber !== savedTotal ||
+    currentRoundNumber !== savedCurrent ||
+    JSON.stringify(roundSchedules) !== JSON.stringify(getRoundScheduleDrafts(draw)) ||
+    JSON.stringify(roundShareModes) !== JSON.stringify(draw.roundShareModes || {}) ||
+    Object.values(resultFiles).some(Boolean);
 
   useEffect(() => {
-    setTotalRounds(String(getRoomRoundCount(draw)));
-    setCurrentRound(String(getRoomCurrentRound(draw)));
-  }, [draw]);
+    setTotalRounds(String(savedTotal));
+    setCurrentRound(String(savedCurrent));
+    setRoundSchedules(getRoundScheduleDrafts({ roundSchedules: savedRoundSchedules }));
+    setRoundShareModes({ ...(draw.roundShareModes || {}) });
+    setResultFiles({});
+  }, [draw.id, draw.roundShareModes, savedCurrent, savedRoundSchedules, savedTotal]);
+
+  function addFutureRound() {
+    const currentTotal = Math.max(1, Math.min(100, Math.round(Number(totalRounds) || 1)));
+    if (currentTotal >= 100) {
+      alert("每個直播最多可以設定 100 場。");
+      return;
+    }
+
+    const nextRoundNumber = currentTotal + 1;
+    const previousRoundId = toRoundId(currentTotal);
+    const nextRoundId = toRoundId(nextRoundNumber);
+    const previousSchedule = roundSchedules[previousRoundId];
+    const previousDate = previousSchedule ? new Date(previousSchedule) : null;
+    const nextDate = previousDate && !Number.isNaN(previousDate.getTime())
+      ? new Date(previousDate.getTime() + 40 * 60 * 1000)
+      : new Date(Date.now() + 24 * 60 * 60 * 1000);
+    nextDate.setSeconds(0, 0);
+    const localDateTime = new Date(nextDate.getTime() - nextDate.getTimezoneOffset() * 60000)
+      .toISOString()
+      .slice(0, 16);
+
+    setTotalRounds(String(nextRoundNumber));
+    setRoundSchedules((current) => ({ ...current, [nextRoundId]: localDateTime }));
+    setRoundShareModes((current) => ({
+      ...current,
+      [nextRoundId]: current[previousRoundId] || getRoomShareMode(draw, previousRoundId),
+    }));
+  }
 
   async function saveRoundSettings() {
     const nextTotal = Math.max(1, Math.min(100, Math.round(Number(totalRounds) || 1)));
@@ -4103,10 +7902,32 @@ function RoomRoundSettings({ draw }) {
 
     setSaving(true);
     try {
+      const nextRoundSchedules = {};
+      const nextRoundShareModes = {};
+      const nextResultImages = { ...(draw.roundResultImages || {}) };
+
+      for (const roundNumber of rangeNumbers(1, nextTotal)) {
+        const roundId = toRoundId(roundNumber);
+        const scheduleValue = roundSchedules[roundId];
+        if (scheduleValue) {
+          nextRoundSchedules[roundId] = new Date(scheduleValue).toISOString();
+        }
+        nextRoundShareModes[roundId] = roundShareModes[roundId] || getRoomShareMode(draw, roundId);
+        if (resultFiles[roundId]) {
+          nextResultImages[roundId] = await uploadCompressedImage(
+            resultFiles[roundId],
+            `draw-results/${draw.id}/${roundId}-${Date.now()}.webp`,
+          );
+        }
+      }
+
       await updateDoc(doc(db, "draws", draw.id), {
         totalRounds: nextTotal,
         currentRound: nextCurrent,
         round: toRoundId(nextCurrent),
+        roundSchedules: nextRoundSchedules,
+        roundShareModes: nextRoundShareModes,
+        roundResultImages: nextResultImages,
         updatedAt: serverTimestamp(),
       });
       await ensureRoomRoundSlots(draw.id, rangeNumbers(1, nextTotal), Number(draw.cardCount || 30));
@@ -4117,42 +7938,132 @@ function RoomRoundSettings({ draw }) {
     }
   }
 
+  async function uploadRoundResult(roundId, file) {
+    if (!file) return;
+
+    setResultFiles((current) => ({ ...current, [roundId]: file }));
+    setUploadingRoundId(roundId);
+    try {
+      const imageUrl = await uploadCompressedImage(
+        file,
+        `draw-results/${draw.id}/${roundId}-${Date.now()}.webp`,
+      );
+      await updateDoc(doc(db, "draws", draw.id), {
+        [`roundResultImages.${roundId}`]: imageUrl,
+        updatedAt: serverTimestamp(),
+      });
+      setResultFiles((current) => ({ ...current, [roundId]: null }));
+      alert(`${formatRoundLabel(roundId)}賽果相片已上載。`);
+    } catch (error) {
+      showSafeError(error, "賽果相片上載失敗，請重新選擇圖片再試。");
+    } finally {
+      setUploadingRoundId("");
+    }
+  }
+
   return (
-    <div className="room-round-settings">
-      <label>
-        總場數
-        <input
-          type="number"
-          min="1"
-          max="100"
-          value={totalRounds}
-          onChange={(event) => setTotalRounds(event.target.value)}
-        />
-      </label>
-      <label>
-        目前場次
-        <input
-          type="number"
-          min="1"
-          max={totalRounds}
-          value={currentRound}
-          onChange={(event) => setCurrentRound(event.target.value)}
-        />
-      </label>
-      <button
-        className="small-btn"
-        type="button"
-        onClick={saveRoundSettings}
-        disabled={saving || !hasChanges}
-      >
-        <Save size={15} />
-        {saving ? "儲存中..." : "儲存場次"}
-      </button>
+    <div className="room-round-settings-wrap">
+      <div className="room-round-settings">
+        <label>
+          總場數
+          <input
+            type="number"
+            min="1"
+            max="100"
+            value={totalRounds}
+            onChange={(event) => setTotalRounds(event.target.value)}
+          />
+        </label>
+        <label>
+          目前場次
+          <input
+            type="number"
+            min="1"
+            max={totalRounds}
+            value={currentRound}
+            onChange={(event) => setCurrentRound(event.target.value)}
+          />
+        </label>
+        <button
+          className="small-btn"
+          type="button"
+          onClick={saveRoundSettings}
+          disabled={saving || Boolean(uploadingRoundId) || !hasChanges}
+        >
+          <Save size={15} />
+          {saving ? "儲存中..." : "儲存場次"}
+        </button>
+        <button
+          className="small-btn future-round-add-btn"
+          type="button"
+          onClick={addFutureRound}
+          disabled={saving || Boolean(uploadingRoundId) || totalRoundNumber >= 100}
+        >
+          <Plus size={15} />
+          新增未來場次
+        </button>
+      </div>
+      <div className="round-schedule-editor">
+        {rangeNumbers(1, Math.max(1, Math.min(100, Number(totalRounds) || 1))).map((roundNumber) => {
+          const roundId = toRoundId(roundNumber);
+          const resultImage = draw.roundResultImages?.[roundId] || "";
+          return (
+            <div className="round-schedule-row" key={roundId}>
+              <strong>第 {roundNumber} 場</strong>
+              <label>
+                預計開卡時間
+                <input
+                  type="datetime-local"
+                  value={roundSchedules[roundId] || ""}
+                  onChange={(event) =>
+                    setRoundSchedules((current) => ({
+                      ...current,
+                      [roundId]: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                本場機率
+                <select
+                  value={roundShareModes[roundId] || getRoomShareMode(draw, roundId)}
+                  onChange={(event) => setRoundShareModes((current) => ({
+                    ...current,
+                    [roundId]: event.target.value,
+                  }))}
+                >
+                  <option value="1/2">1/2 二份之一</option>
+                  <option value="1/5">1/5 五份之一</option>
+                  <option value="1/10">1/10 十分之一</option>
+                </select>
+              </label>
+              <FileUpload
+                id={`round-result-${draw.id}-${roundId}`}
+                label={uploadingRoundId === roundId ? "賽果相片上載中..." : "賽果相片"}
+                file={resultFiles[roundId] || null}
+                onChange={(file) => uploadRoundResult(roundId, file)}
+                disabled={Boolean(uploadingRoundId)}
+              />
+              {uploadingRoundId === roundId ? (
+                <span className="round-result-empty">正在壓縮及上載...</span>
+              ) : resultImage ? (
+                <a className="round-result-preview" href={resultImage} target="_blank" rel="noreferrer">
+                  <img src={resultImage} alt={`第 ${roundNumber} 場賽果`} />
+                  查看現有相片
+                </a>
+              ) : (
+                <span className="round-result-empty">未有賽果相片</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
 function CreateDrawForm({ profile, cards }) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
   const [form, setForm] = useState(DEFAULT_DRAW);
   const [thumbnailFile, setThumbnailFile] = useState(null);
   const [selectedCardIds, setSelectedCardIds] = useState([]);
@@ -4181,7 +8092,7 @@ function CreateDrawForm({ profile, cards }) {
     const cardCount = Number(form.cardCount);
     const tokenCost = Number(form.tokenCost);
     const totalRounds = Number(form.totalRounds);
-    const currentRound = Number(form.currentRound);
+    const currentRound = isBeta ? 1 : Number(form.currentRound);
 
     if (cardCount < 4 || cardCount > 100) {
       alert("卡牌數量必須介乎 4 至 100。");
@@ -4200,7 +8111,7 @@ function CreateDrawForm({ profile, cards }) {
       return;
     }
     if (!selectedCardIds.length) {
-      alert("請最少選擇一張房間卡牌。");
+      alert(isBeta ? "請最少選擇一張直播卡牌。" : "請最少選擇一張房間卡牌。");
       return;
     }
 
@@ -4215,24 +8126,42 @@ function CreateDrawForm({ profile, cards }) {
       const poolCardValues = Object.fromEntries(
         poolCards.map((card) => [card.id, Number(card.tokenValue || 0)]),
       );
-      const thumbnailUrl = thumbnailFile
+      const thumbnailUrl = !isBeta && thumbnailFile
         ? await imageFileToCompressedDataUrl(thumbnailFile, {
             maxWidth: 900,
             maxHeight: 520,
             quality: 0.7,
           })
-        : form.thumbnailUrl.trim();
+        : isBeta ? "" : form.thumbnailUrl.trim();
+      const firstRoundDate = form.firstRoundAt ? new Date(form.firstRoundAt) : null;
+      const roundSchedules = Object.fromEntries(
+        rangeNumbers(1, totalRounds).map((roundNumber) => {
+          const scheduledAt = firstRoundDate && !Number.isNaN(firstRoundDate.getTime())
+            ? new Date(firstRoundDate.getTime() + (roundNumber - 1) * 40 * 60 * 1000).toISOString()
+            : "";
+          return [toRoundId(roundNumber), scheduledAt];
+        }),
+      );
+      const roundShareModes = Object.fromEntries(
+        rangeNumbers(1, totalRounds).map((roundNumber) => [
+          toRoundId(roundNumber),
+          form.shareMode || "1/2",
+        ]),
+      );
 
       batch.set(drawRef, {
         title: form.title.trim(),
         slug,
-        kickUrl: form.kickUrl.trim(),
+        kickUrl: getKickChannel(form.kickUrl),
         cardCount,
         tokenCost,
         totalRounds,
         currentRound,
         round: toRoundId(currentRound),
         status: form.status,
+        shareMode: form.shareMode || "1/2",
+        roundShareModes,
+        roundSchedules,
         poolText: form.poolText.trim(),
         poolCards,
         poolCardIds: poolCards.map((card) => card.id),
@@ -4266,13 +8195,14 @@ function CreateDrawForm({ profile, cards }) {
       <div className="section-heading">
         <Plus size={24} />
         <div>
-          <p className="eyebrow">New draw</p>
-          <h1>建立抽卡房間</h1>
+
+          <h1>{isBeta ? "建立唯一直播" : "建立抽卡房間"}</h1>
+          {isBeta && <p className="muted">只需建立一次；日後直接在「直播管理」新增日期、場次及賽果。</p>}
         </div>
       </div>
       <form className="stack-form" onSubmit={createDraw}>
         <label>
-          房間標題
+          {isBeta ? "直播名稱" : "房間標題"}
           <input
             value={form.title}
             onChange={(event) => updateField("title", event.target.value)}
@@ -4280,7 +8210,7 @@ function CreateDrawForm({ profile, cards }) {
           />
         </label>
         <label>
-          房間連結名稱
+          {isBeta ? "直播識別名稱" : "房間連結名稱"}
           <input
             value={form.slug}
             onChange={(event) => updateField("slug", normalizeSlug(event.target.value))}
@@ -4289,27 +8219,41 @@ function CreateDrawForm({ profile, cards }) {
           />
         </label>
         <label>
-          Kick 頻道連結
+          Kick 頻道名稱
           <input
             value={form.kickUrl}
             onChange={(event) => updateField("kickUrl", event.target.value)}
-            placeholder="https://kick.com/channel-name"
+            placeholder="只輸入頻道名稱，例如 livedrawtcg"
+            pattern="[A-Za-z0-9_-]{2,40}"
+            title="只可輸入 Kick 頻道名稱，不接受網址或 HTML"
             required
           />
         </label>
-        <FileUpload
-          label="房間主圖"
-          file={thumbnailFile}
-          onChange={setThumbnailFile}
-        />
-        <label>
-          或輸入主圖網址
-          <input
-            value={form.thumbnailUrl}
-            onChange={(event) => updateField("thumbnailUrl", event.target.value)}
-            placeholder="https://..."
-          />
-        </label>
+        {isBeta ? (
+          <div className="form-row">
+            <label>
+              首頁狀態
+              <select value={form.status} onChange={(event) => updateField("status", event.target.value)}>
+                <option value="live">直播中</option>
+                <option value="draft">即將開</option>
+                <option value="completed">已結束</option>
+              </select>
+            </label>
+            <label>
+              卡牌分類（賽道）
+              <select value={form.shareMode} onChange={(event) => updateField("shareMode", event.target.value)}>
+                <option value="1/2">1/2 二份之一</option>
+                <option value="1/5">1/5 五份之一</option>
+                <option value="1/10">1/10 十分之一</option>
+              </select>
+            </label>
+          </div>
+        ) : (
+          <>
+            <FileUpload label="房間主圖" file={thumbnailFile} onChange={setThumbnailFile} />
+            <label>或輸入主圖網址<input value={form.thumbnailUrl} onChange={(event) => updateField("thumbnailUrl", event.target.value)} placeholder="https://..." /></label>
+          </>
+        )}
         <div className="form-row">
           <label>
             卡牌數量
@@ -4345,20 +8289,17 @@ function CreateDrawForm({ profile, cards }) {
               required
             />
           </label>
-          <label>
-            目前場次
-            <input
-              type="number"
-              min="1"
-              max={form.totalRounds || 1}
-              value={form.currentRound}
-              onChange={(event) => updateField("currentRound", event.target.value)}
-              required
-            />
-          </label>
+          {isBeta ? (
+            <label>
+              首場預計開卡時間
+              <input type="datetime-local" value={form.firstRoundAt} onChange={(event) => updateField("firstRoundAt", event.target.value)} />
+            </label>
+          ) : (
+            <label>目前場次<input type="number" min="1" max={form.totalRounds || 1} value={form.currentRound} onChange={(event) => updateField("currentRound", event.target.value)} required /></label>
+          )}
         </div>
         <div className="form-field">
-          <span>房間卡池</span>
+          <span>{isBeta ? "直播卡池" : "房間卡池"}</span>
           {cards.length ? (
             <>
               <div className="card-search">
@@ -4388,7 +8329,7 @@ function CreateDrawForm({ profile, cards }) {
                       </div>
                     )}
                     <strong>{card.name}</strong>
-                    <span>⚡ {formatTokenNumber(card.tokenValue || 0)}</span>
+                    <TokenAmount value={card.tokenValue || 0} />
                   </button>
                 ))}
               </div>
@@ -4398,18 +8339,12 @@ function CreateDrawForm({ profile, cards }) {
             <span className="form-note">請先在右邊建立卡牌，再建立房間。</span>
           )}
         </div>
-        <label>
-          文字備註
-          <textarea
-            value={form.poolText}
-            onChange={(event) => updateField("poolText", event.target.value)}
-            placeholder="列出卡名、稀有度、備註或寄送安排。"
-            rows={5}
-          />
-        </label>
+        {!isBeta && (
+          <label>文字備註<textarea value={form.poolText} onChange={(event) => updateField("poolText", event.target.value)} placeholder="列出卡名、稀有度、備註或寄送安排。" rows={5} /></label>
+        )}
         <button className="primary-btn" type="submit" disabled={creating}>
           <Save size={18} />
-          {creating ? "建立中..." : "建立房間"}
+          {creating ? "建立中..." : isBeta ? "建立直播" : "建立房間"}
         </button>
       </form>
     </section>
@@ -4431,10 +8366,12 @@ function roomCardPayload(card) {
     name: card.name || "",
     category: getCardCategory(card),
     tokenValue: Number(card.tokenValue || 0),
+    modePrices: getCardModePrices(card),
+    allowedShareModes: getCardAllowedShareModes(card),
   };
 }
 
-function buildRoomCards(room, cards) {
+function buildRoomCards(room, cards, roundId = "") {
   if (!room) return [];
 
   const libraryCards = new Map(cards.map((card) => [String(card.id), card]));
@@ -4449,10 +8386,18 @@ function buildRoomCards(room, cards) {
       const libraryCard = libraryCards.get(cardId);
       const legacyCard = legacyCards.get(cardId);
       const source = libraryCard || legacyCard;
+      const priceSource = {
+        ...(legacyCard || {}),
+        ...(libraryCard || {}),
+        modePrices: libraryCard?.modePrices || legacyCard?.modePrices,
+      };
+      const availabilitySource = libraryCard || legacyCard;
       const roomValue = Number(roomValues[cardId] || 0);
-      const tokenValue = roomValue > 0
-        ? roomValue
-        : Number(source?.tokenValue || legacyCard?.tokenValue || 0);
+      const tokenValue = libraryCard?.modePrices || legacyCard?.modePrices
+        ? getCardTokenValue(priceSource, getRoomShareMode(room, roundId))
+        : roomValue > 0
+          ? roomValue
+          : Number(source?.tokenValue || legacyCard?.tokenValue || 0);
 
       if (!source) return null;
 
@@ -4462,9 +8407,11 @@ function buildRoomCards(room, cards) {
         category: getCardCategory(source || legacyCard),
         imageUrl: String(libraryCard?.imageUrl || legacyCard?.imageUrl || ""),
         tokenValue,
+        modePrices: getCardModePrices(priceSource),
+        allowedShareModes: getCardAllowedShareModes(availabilitySource),
       };
     })
-    .filter((card) => card?.id && card.name);
+    .filter((card) => card?.id && card.name && cardAllowsShareMode(card, getRoomShareMode(room, roundId)));
 }
 
 function getRoomPoolIds(room) {
@@ -4492,6 +8439,8 @@ function normalizeRoomCards(cards) {
       category: getCardCategory(card),
       imageUrl: String(card?.imageUrl || ""),
       tokenValue: Number(card?.tokenValue || 0),
+      modePrices: getCardModePrices(card),
+      allowedShareModes: getCardAllowedShareModes(card),
     }))
     .filter((card) => card.id && card.name);
 }
@@ -4588,10 +8537,23 @@ function normalizeImportedCardRows(rows) {
       const id = String(row.id || "").trim();
       const name = String(row.name || row.cardname || row["card name"] || "").trim();
       const category = normalizeCardCategory(row.category || row.cat || row.type || "");
-      const tokenValue = Number(row.tokenvalue || row.price || row.token || row.value || 0);
+      const legacyPrice = Number(row.tokenvalue || row.price || row.token || row.value || 0);
+      const modePrices = {
+        half: Number(row.pricehalf || row.halfprice || legacyPrice),
+        fifth: Number(row.pricefifth || row.fifthprice || legacyPrice),
+        tenth: Number(row.pricetenth || row.tenthprice || legacyPrice),
+      };
+      const tokenValue = modePrices.half;
       const conversionValue = Number(
         row.conversionvalue || row.refundvalue || row.convertvalue || tokenValue,
       );
+      const hellCardId = String(row.hellcardid || row.hellcard || "").trim();
+      const allowedShareModesText = String(
+        row.allowedsharemodes || row.sharemodes || row.allowedmodes || "",
+      );
+      const allowedShareModes = allowedShareModesText
+        ? SHARE_MODES.filter((mode) => allowedShareModesText.split(/[|,;/\s]+/).includes(mode))
+        : [...SHARE_MODES];
       const imageUrl = String(row.imageurl || row.image || row.photo || row.picture || "").trim();
 
       return {
@@ -4599,27 +8561,39 @@ function normalizeImportedCardRows(rows) {
         name,
         category,
         tokenValue,
+        modePrices,
+        allowedShareModes,
         conversionValue: Math.max(0, conversionValue),
+        hellCardId,
         imageUrl,
       };
     })
-    .filter((row) => row.name && row.tokenValue > 0);
+    .filter((row) => row.name && row.allowedShareModes.length && Object.values(row.modePrices).every((value) => value > 0));
 }
 
 function createCardDraft(card) {
+  const modePrices = getCardModePrices(card);
   return {
     name: card.name || "",
     category: getCardCategory(card),
-    tokenValue: Number(card.tokenValue || 10),
+    modePriceHalf: modePrices.half,
+    modePriceFifth: modePrices.fifth,
+    modePriceTenth: modePrices.tenth,
+    allowedShareModes: getCardAllowedShareModes(card),
     conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 10),
+    hellCardId: card.hellCardId || "",
     imageFile: null,
   };
 }
 
-function useTokenPackages() {
+function useTokenPackages(enabled = true) {
   const [packages, setPackages] = useState(TOKEN_PACKAGES);
 
   useEffect(() => {
+    if (!enabled) {
+      setPackages(TOKEN_PACKAGES);
+      return undefined;
+    }
     const settingsRef = doc(db, "settings", "tokenPackages");
     const stopSettings = onSnapshot(
       settingsRef,
@@ -4646,15 +8620,49 @@ function useTokenPackages() {
     );
 
     return stopSettings;
-  }, []);
+  }, [enabled]);
 
   return packages;
 }
 
-function useVipProgram() {
+function usePaymentSettings(enabled = true) {
+  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const fallbackSettings = isBeta
+    ? BETA_DUMMY_PAYMENT_SETTINGS
+    : EMPTY_PAYMENT_SETTINGS;
+  const [settings, setSettings] = useState(fallbackSettings);
+
+  useEffect(() => {
+    if (!enabled) {
+      setSettings(BETA_DUMMY_PAYMENT_SETTINGS);
+      return undefined;
+    }
+    return onSnapshot(doc(db, "settings", "payment"), (snapshot) => {
+      const fpsIdentifier = String(snapshot.data()?.fpsIdentifier || "");
+      const fpsName = String(snapshot.data()?.fpsName || "");
+      if (!snapshot.exists() || !fpsIdentifier || !fpsName) {
+        setSettings(fallbackSettings);
+        return;
+      }
+      setSettings({
+        fpsIdentifier,
+        fpsName,
+        isDummy: false,
+      });
+    });
+  }, [enabled, fallbackSettings]);
+
+  return settings;
+}
+
+function useVipProgram(enabled = true) {
   const [tiers, setTiers] = useState(DEFAULT_VIP_TIERS);
 
   useEffect(() => {
+    if (!enabled) {
+      setTiers(DEFAULT_VIP_TIERS);
+      return undefined;
+    }
     const settingsRef = doc(db, "settings", "vipProgram");
     const stopSettings = onSnapshot(
       settingsRef,
@@ -4667,7 +8675,7 @@ function useVipProgram() {
       },
     );
     return stopSettings;
-  }, []);
+  }, [enabled]);
 
   return tiers;
 }
@@ -4724,10 +8732,15 @@ function getTokenBonusRate(tokenPackage) {
   return Math.max(0, Math.round(((Number(tokenPackage?.tokens || 0) - baseTokens) / baseTokens) * 100));
 }
 
-function useCardCategories(cards = []) {
+function useCardCategories(cards = [], enabled = true) {
   const [categories, setCategories] = useState(CARD_CATEGORIES);
 
   useEffect(() => {
+    if (!enabled) {
+      setCategories(CARD_CATEGORIES);
+      return undefined;
+    }
+
     const settingsRef = doc(db, "settings", "cardCategories");
     const stopSettings = onSnapshot(
       settingsRef,
@@ -4742,7 +8755,7 @@ function useCardCategories(cards = []) {
     );
 
     return stopSettings;
-  }, []);
+  }, [enabled]);
 
   return useMemo(
     () => normalizeCardCategories([...categories, ...cards.map((card) => card.category)]),
@@ -4767,6 +8780,30 @@ function normalizeTokenPackages(packages) {
     });
 
   return [...uniquePackages.values()].sort((left, right) => left.hkd - right.hkd);
+}
+
+// Calculate the grant from verified payment and protected rates; reject stale or forged claims.
+function getVerifiedTokenGrant(request, verifiedHkdAmount, settings) {
+  const isPromo = request.proofMode === "promo";
+  const pricingAmount = isPromo ? request.hkdAmount : verifiedHkdAmount;
+  if (isPromo ? (!request.promoCode?.trim() || verifiedHkdAmount !== 0)
+    : (request.proofMode !== "storage" || !request.proofUrl || request.hkdAmount !== verifiedHkdAmount)) {
+    throw new Error("實際入帳金額與申請不符，或缺少付款證明。請拒絕此申請並要求重新提交。");
+  }
+  const savedPackages = settings ? normalizeTokenPackages(settings.packages) : TOKEN_PACKAGES;
+  const packages = settings && Number(settings.rateVersion || 1) < TOKEN_PACKAGE_RATE_VERSION
+    ? savedPackages.map((item) => ({ ...item, tokens: Math.max(1, Math.round(item.tokens / 2)) }))
+    : savedPackages;
+  const grant = request.packageType === "custom"
+    ? calculateTokenAmount(pricingAmount)
+    : request.packageType === "preset"
+      ? packages.find((item) => item.hkd === pricingAmount && item.tokens === request.amount)?.tokens
+      : 0;
+  if (!Number.isSafeInteger(grant) || grant < 1 || grant > 1000000
+    || grant !== request.amount || request.exchangeRate !== grant / pricingAmount) {
+    throw new Error("申請代幣數量不符合目前套餐價格。請拒絕此申請並要求重新提交。");
+  }
+  return grant;
 }
 
 function calculateTokenAmount(hkdAmount) {
@@ -4856,12 +8893,87 @@ function isRoundBuyingBlocked(room, roundId = toRoundId(getRoomCurrentRound(room
   return blockedRounds.includes(roundId) || room.buyingBlockedRound === roundId;
 }
 
+function getRoundDisplayStatus(room, roundId) {
+  const roundNumber = getRoundSortValue(roundId);
+  const currentRoundNumber = getRoomCurrentRound(room);
+  if (room?.status === "completed" || roundNumber < currentRoundNumber) {
+    return { key: "completed", label: "已結束" };
+  }
+  if (room?.status !== "live" || roundNumber > currentRoundNumber) {
+    return { key: "upcoming", label: "即將開" };
+  }
+  return { key: "live", label: "直播中" };
+}
+
 function getRoomRoundOptions(room) {
   return Array.from({ length: getRoomRoundCount(room) }, (_, index) => toRoundId(index + 1));
 }
 
+// Group scheduled rounds by local calendar date for both the overview and detailed number view.
+function getRoundsByDate(room, roundOptions) {
+  return roundOptions.reduce((groups, roundId) => {
+    const schedule = getRoundSchedule(room, roundId);
+    const key = schedule instanceof Date
+      ? `${schedule.getFullYear()}-${String(schedule.getMonth() + 1).padStart(2, "0")}-${String(schedule.getDate()).padStart(2, "0")}`
+      : "unscheduled";
+    const label = schedule instanceof Date
+      ? new Intl.DateTimeFormat("zh-HK", { month: "numeric", day: "numeric", weekday: "short" }).format(schedule)
+      : "日期待定";
+    const fullLabel = schedule instanceof Date
+      ? `${new Intl.DateTimeFormat("zh-HK", { day: "2-digit", month: "2-digit", year: "numeric" }).format(schedule)} 抽卡場次`
+      : "日期待定 · 抽卡場次";
+    const existing = groups.find((group) => group.key === key);
+
+    if (existing) existing.rounds.push(roundId);
+    else groups.push({ key, label, fullLabel, rounds: [roundId] });
+    return groups;
+  }, []);
+}
+
 function formatRoundLabel(round) {
   return `第 ${getRoundSortValue(round) || 1} 場`;
+}
+
+function getRoundSchedule(room, roundId) {
+  const value = room?.roundSchedules?.[roundId];
+  if (!value) return "時間待定";
+  const date = value?.toDate ? value.toDate() : new Date(value);
+  if (Number.isNaN(date.getTime())) return "時間待定";
+  return date;
+}
+
+function formatRoundSchedule(room, roundId) {
+  const date = getRoundSchedule(room, roundId);
+  if (typeof date === "string") return date;
+  return new Intl.DateTimeFormat("zh-HK", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function getBetaCollectionStatusLabel(status) {
+  return {
+    pending: "待處理",
+    shipping: "配送中",
+    shipped: "已配送",
+    converted: "已轉換代幣",
+  }[status] || "待處理";
+}
+
+function getBetaCollectionRecordStatus(record) {
+  if (record?.convertedToTokens || record?.collectionStatus === "converted") return "converted";
+  if (record?.collectionStatus === "shipped") return "shipped";
+  if (record?.collectionStatus === "shipping") return "shipping";
+  return "pending";
+}
+
+function getResultSideLabel(resultSide) {
+  if (resultSide === "hell") return "地獄";
+  if (resultSide === "heaven") return "天堂";
+  return "未設定";
 }
 
 function compareRoomRoundRecords(left, right) {
@@ -5086,6 +9198,31 @@ async function updateRoomPoolCardsForCard(cardId, updates) {
   }
 }
 
+function getRoundScheduleDrafts(room) {
+  return Object.fromEntries(
+    Object.entries(room?.roundSchedules || {}).map(([roundId, value]) => {
+      const date = value instanceof Timestamp ? value.toDate() : new Date(value);
+      if (Number.isNaN(date.getTime())) return [roundId, ""];
+      const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+      return [roundId, localDate.toISOString().slice(0, 16)];
+    }),
+  );
+}
+
+async function uploadCompressedImage(file, path) {
+  const dataUrl = await imageFileToCompressedDataUrl(file, {
+    maxWidth: 1280,
+    maxHeight: 1280,
+    quality: 0.76,
+    minQuality: 0.62,
+    targetBytes: 420 * 1024,
+  });
+  const imageBlob = await fetch(dataUrl).then((response) => response.blob());
+  const imageRef = ref(storage, path);
+  await uploadBytes(imageRef, imageBlob, { contentType: "image/webp" });
+  return getDownloadURL(imageRef);
+}
+
 async function renameCategoryInCards(oldCategory, newCategory) {
   const cardsSnapshot = await getDocs(
     query(collection(db, "cards"), where("category", "==", oldCategory)),
@@ -5250,6 +9387,16 @@ function toMillis(value) {
 
 function formatTokenNumber(value) {
   return new Intl.NumberFormat("en-US").format(Number(value || 0));
+}
+
+// Token balances are shown as whole units while the stored ledger value remains unchanged.
+function roundTokenBalance(value) {
+  const amount = Number(value || 0);
+  return Number.isFinite(amount) ? Math.round(amount) : 0;
+}
+
+function formatTokenBalance(value) {
+  return formatTokenNumber(roundTokenBalance(value));
 }
 
 export default App;

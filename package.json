@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:beta": "vite --mode beta",
     "build": "vite build",
+    "build:beta": "vite build --mode beta",
     "preview": "vite preview",
     "lint": "eslint ."
   },

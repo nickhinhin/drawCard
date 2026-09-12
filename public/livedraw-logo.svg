@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 430 112" role="img" aria-labelledby="title">
+  <title id="title">LiveDraw TCG</title>
+  <path fill="#fff" d="M10 12h64l26 18v51L67 101 10 84zm17 18v40l37 10 17-10V43L62 30zm13 10h22v30l-22-6z"/>
+  <path fill="#e31837" d="m76 25 25 17v24L88 57V39z"/>
+  <text x="116" y="67" fill="#e31837" font-family="Arial Black,Arial,sans-serif" font-size="49" font-style="italic" font-weight="900">LIVEDRAW</text>
+  <text x="181" y="96" fill="#fff" font-family="Arial Black,Arial,sans-serif" font-size="23" font-style="italic" font-weight="900" letter-spacing="9">TCG</text>
+</svg>

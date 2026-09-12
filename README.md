@@ -9,9 +9,10 @@ Firebase-backed React website for live card draws.
 - Token applications with bank proof image upload to Firebase Storage.
 - Admin review queue for approving or rejecting token requests.
 - Live Kick stream embed per draw.
+- Beta administration uses one permanent live hall; dates, rounds, results, and card pools are managed inside that single live stream.
 - Admin room creation with separate room link, title, thumbnail, Kick URL, and 4 to 100 card slots.
 - Per-room chat room for signed-in users.
-- Admin card library with browser-compressed card images.
+- Admin card library with browser-compressed card images and independent 1/2, 1/5, and 1/10 prices.
 - Admin result assignment from purchased number records to specific cards.
 - Transactional card number purchase that deducts tokens and locks the number.
 - Player history, collection status, and admin draw status tracking in Firestore.
@@ -76,7 +77,7 @@ After that, admin users can approve token requests, create rooms, and complete/d
 - `draws/{id}`: room title, slug, room link, thumbnail, Kick URL, card count, token price, pool info, status.
 - `draws/{id}/slots/{number}`: card slot availability and buyer info (`uid` + username snapshot).
 - `draws/{id}/messages/{messageId}`: room chat messages from signed-in users.
-- `cards/{id}`: admin-created card name and compressed image.
+- `cards/{id}`: admin-created card name, compressed image, conversion value, and `modePrices` for 1/2, 1/5, and 1/10 play.
 - `drawRecords/{id}`: purchase record plus admin-assigned card result and collection status.
 
 ## Admin flow
