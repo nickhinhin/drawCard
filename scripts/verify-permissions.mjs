@@ -1,6 +1,5 @@
 import { deleteApp, initializeApp } from "firebase/app";
 import {
-  addDoc,
   collection,
   connectFirestoreEmulator,
   doc,
@@ -10,7 +9,9 @@ import {
   query,
   runTransaction,
   serverTimestamp,
+  updateDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
 import {
   connectAuthEmulator,
@@ -37,6 +38,10 @@ function string(value) {
 
 function integer(value) {
   return { integerValue: String(value) };
+}
+
+function boolean(value) {
+  return { booleanValue: value };
 }
 
 function timestamp() {
@@ -106,6 +111,34 @@ async function ensureUsernameClaim(firestore, uid, username) {
   return cleanUsername;
 }
 
+async function renameUsername(firestore, uid, currentUsername, nextUsername) {
+  const cleanUsername = nextUsername.trim().replace(/\s+/g, "_").replace(/[^A-Za-z0-9_]/g, "").slice(0, 24);
+  const currentKey = currentUsername.toLowerCase();
+  const nextKey = cleanUsername.toLowerCase();
+
+  await runTransaction(firestore, async (transaction) => {
+    const profileRef = doc(firestore, "users", uid);
+    const currentRef = doc(firestore, "usernames", currentKey);
+    const nextRef = doc(firestore, "usernames", nextKey);
+    const currentSnap = await transaction.get(currentRef);
+    const nextSnap = await transaction.get(nextRef);
+
+    if (nextSnap.exists() && nextSnap.data()?.uid !== uid) {
+      throw new Error("The renamed test username is unexpectedly claimed.");
+    }
+
+    transaction.update(profileRef, { username: cleanUsername, updatedAt: serverTimestamp() });
+    if (nextSnap.exists()) {
+      transaction.update(nextRef, { username: cleanUsername });
+    } else {
+      transaction.set(nextRef, { uid, username: cleanUsername, createdAt: serverTimestamp() });
+    }
+    if (currentSnap.exists() && currentSnap.data()?.uid === uid) transaction.delete(currentRef);
+  });
+
+  return cleanUsername;
+}
+
 async function run() {
   const stamp = Date.now();
   const app = initializeApp(
@@ -153,6 +186,7 @@ async function run() {
           fields: {
             status: string("live"),
             round: string("round-001"),
+            currentRound: integer(1),
             shareMode: string("1/5"),
             roundShareModes: map({ "round-001": string("1/5") }),
             poolCardIds: array(["card-1"]),
@@ -171,6 +205,16 @@ async function run() {
               fifth: integer(25),
               tenth: integer(50),
             }),
+          },
+        },
+      },
+      {
+        update: {
+          name: `projects/${projectId}/databases/(default)/documents/draws/${drawId}/rounds/round-001`,
+          fields: {
+            round: string("round-001"),
+            roundNumber: integer(1),
+            updatedAt: timestamp(),
           },
         },
       },
@@ -240,15 +284,10 @@ async function run() {
       });
     });
 
-    const proofRef = storageRef(storage, `token-proofs/${uid}/proof.jpg`);
-    await uploadBytes(
-      proofRef,
-      new Blob(["permission audit"], { type: "image/jpeg" }),
-      { contentType: "image/jpeg" },
-    );
-    await getDownloadURL(proofRef);
-
-    await addDoc(collection(firestore, "tokenRequests"), {
+    const tokenRequestRef = doc(collection(firestore, "tokenRequests"));
+    const proofPath = `token-proofs/${uid}/${tokenRequestRef.id}`;
+    const quotaBatch = writeBatch(firestore);
+    quotaBatch.set(tokenRequestRef, {
       uid,
       username,
       email,
@@ -259,13 +298,38 @@ async function run() {
       fpsIdentifier: "0000000",
       fpsName: "Permission audit",
       proofMode: "storage",
-      proofPath: `token-proofs/${uid}/proof.jpg`,
+      proofPath,
       proofFileName: "proof.jpg",
-      proofUrl: `https://firebasestorage.googleapis.com/v0/b/${projectId}.firebasestorage.app/o/token-proofs%2F${uid}%2Fproof.jpg?alt=media&token=test`,
-      status: "pending",
+      proofUrl: "",
+      status: "awaiting_upload",
       adminNote: "",
       promoCode: "",
+      promoCodeId: "",
+      quotaVersion: 1,
       createdAt: serverTimestamp(),
+    });
+    quotaBatch.update(userRef, {
+      lastTokenRequestId: tokenRequestRef.id,
+      lastTokenRequestAt: serverTimestamp(),
+      pendingTokenRequestCount: 1,
+      tokenRequestWindowStartedAt: serverTimestamp(),
+      tokenRequestWindowCount: 1,
+      updatedAt: serverTimestamp(),
+    });
+    await quotaBatch.commit();
+
+    const proofRef = storageRef(storage, proofPath);
+    await uploadBytes(
+      proofRef,
+      new Blob(["permission audit"], { type: "image/jpeg" }),
+      { contentType: "image/jpeg" },
+    );
+    await getDownloadURL(proofRef);
+
+    await updateDoc(tokenRequestRef, {
+      status: "pending",
+      proofUrl: `https://firebasestorage.googleapis.com/v0/b/drawcard-26e01.firebasestorage.app/o/token-proofs%2F${uid}%2F${tokenRequestRef.id}?alt=media&token=test`,
+      uploadedAt: serverTimestamp(),
     });
 
     await runTransaction(firestore, async (transaction) => {
@@ -284,26 +348,122 @@ async function run() {
       });
     });
 
-    const [profileAfter, claimAfter, slotAfter] = await Promise.all([
+    const renamedUsername = await renameUsername(firestore, uid, username, "Renamed_Player");
+    const scheduledDrawId = `${drawId}-scheduled`;
+    const scheduledSlotPath = `draws/${scheduledDrawId}/rounds/round-001/slots/1`;
+    await seedDocuments([
+      {
+        update: {
+          name: `projects/${projectId}/databases/(default)/documents/draws/${scheduledDrawId}`,
+          fields: {
+            status: string("scheduled"),
+            preorderOpen: boolean(true),
+            round: string("round-001"),
+            currentRound: integer(1),
+            shareMode: string("1/10"),
+            roundShareModes: map({ "round-001": string("1/10") }),
+            poolCardIds: array(["card-1"]),
+            poolCardValues: map({ "card-1": integer(10) }),
+          },
+        },
+      },
+      {
+        update: {
+          name: `projects/${projectId}/databases/(default)/documents/draws/${scheduledDrawId}/rounds/round-001`,
+          fields: {
+            round: string("round-001"),
+            roundNumber: integer(1),
+            updatedAt: timestamp(),
+          },
+        },
+      },
+      {
+        update: {
+          name: `projects/${projectId}/databases/(default)/documents/${scheduledSlotPath}`,
+          fields: {
+            number: integer(1),
+            round: string("round-001"),
+            status: string("available"),
+          },
+        },
+      },
+    ]);
+
+    const scheduledSlotRef = doc(firestore, scheduledSlotPath);
+    const scheduledRecordRef = doc(collection(firestore, "drawRecords"));
+    await runTransaction(firestore, async (transaction) => {
+      const userSnap = await transaction.get(userRef);
+      const slotSnap = await transaction.get(scheduledSlotRef);
+      const tokenCost = 50;
+
+      if (!slotSnap.exists() || slotSnap.data()?.status !== "available") {
+        throw new Error("Scheduled test slot is not available.");
+      }
+
+      transaction.update(userRef, {
+        tokens: userSnap.data().tokens - tokenCost,
+        lastPurchaseRecordId: scheduledRecordRef.id,
+        updatedAt: serverTimestamp(),
+      });
+      transaction.update(scheduledSlotRef, {
+        purchaseRecordId: scheduledRecordRef.id,
+        status: "locked",
+        uid,
+        username: renamedUsername,
+        tokenCost,
+        targetCardId: "card-1",
+        targetCardName: "Permission audit card",
+        targetCardImageUrl: "",
+        targetCardValue: tokenCost,
+        shareMode: "1/10",
+        round: "round-001",
+        updatedAt: serverTimestamp(),
+      });
+      transaction.set(scheduledRecordRef, {
+        slotId: "1",
+        uid,
+        username: renamedUsername,
+        drawId: scheduledDrawId,
+        drawTitle: "Scheduled permission audit room",
+        roomSlug: scheduledDrawId,
+        roomLink: `/room=${scheduledDrawId}`,
+        round: "round-001",
+        roundSort: 1,
+        number: 1,
+        tokenCost,
+        targetCardId: "card-1",
+        targetCardName: "Permission audit card",
+        targetCardImageUrl: "",
+        targetCardValue: tokenCost,
+        shareMode: "1/10",
+        createdAt: serverTimestamp(),
+      });
+    });
+
+    const [profileAfter, claimAfter, oldClaimAfter, slotAfter, scheduledSlotAfter] = await Promise.all([
       getDoc(userRef),
+      getDoc(doc(firestore, "usernames", renamedUsername.toLowerCase())),
       getDoc(doc(firestore, "usernames", username.toLowerCase())),
       getDoc(slotRef),
+      getDoc(scheduledSlotRef),
     ]);
     const [recordsAfter, requestsAfter] = await Promise.all([
       getDocs(query(collection(firestore, "drawRecords"), where("uid", "==", uid))),
       getDocs(query(collection(firestore, "tokenRequests"), where("uid", "==", uid))),
     ]);
     if (
-      profileAfter.data()?.username !== username
+      profileAfter.data()?.username !== renamedUsername
       || claimAfter.data()?.uid !== uid
+      || oldClaimAfter.exists()
       || slotAfter.data()?.status !== "locked"
-      || recordsAfter.empty
+      || scheduledSlotAfter.data()?.status !== "locked"
+      || recordsAfter.size < 2
       || requestsAfter.empty
     ) {
       throw new Error("Permission audit completed but persisted data was not correct.");
     }
 
-    console.log("PASS: legacy username repair, proof upload, number purchase, token request, record reads, and room chat are allowed by Firebase rules.");
+    console.log("PASS: username repair and rename, live purchase, scheduled preorder, proof upload, token request, record reads, and live chat are allowed by Firebase rules.");
   } finally {
     await signOut(auth).catch(() => undefined);
     await deleteApp(app);

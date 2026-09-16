@@ -1,4 +1,5 @@
 import { initializeApp } from "firebase/app";
+import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "firebase/app-check";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
 import {
   initializeFirestore,
@@ -28,6 +29,14 @@ const firebaseConfig = {
 };
 
 export const app = initializeApp(firebaseConfig);
+const appCheckSiteKey = import.meta.env.VITE_FIREBASE_APP_CHECK_SITE_KEY;
+// App Check stays off until this web app is registered with a matching Enterprise site key.
+export const appCheck = appCheckSiteKey
+  ? initializeAppCheck(app, {
+    provider: new ReCaptchaEnterpriseProvider(appCheckSiteKey),
+    isTokenAutoRefreshEnabled: true,
+  })
+  : null;
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 // Keep confirmed Firestore data across reloads so repeat visits can render immediately.

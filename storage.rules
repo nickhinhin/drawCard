@@ -27,7 +27,17 @@ service firebase.storage {
       // Create only — no overwrite/delete so proofs stay auditable.
       allow create: if signedIn()
         && request.auth.uid == uid
-        && isSafeImage();
+        && request.resource.size < 2 * 1024 * 1024
+        && request.resource.contentType in [
+          "image/jpeg",
+          "image/jpg",
+          "image/png",
+          "image/webp"
+        ]
+        && firestore.exists(/databases/(default)/documents/tokenRequests/$(fileName))
+        && firestore.get(/databases/(default)/documents/tokenRequests/$(fileName)).data.uid == uid
+        && firestore.get(/databases/(default)/documents/tokenRequests/$(fileName)).data.status == "awaiting_upload"
+        && firestore.get(/databases/(default)/documents/tokenRequests/$(fileName)).data.proofPath == "token-proofs/" + uid + "/" + fileName;
       allow update, delete: if false;
     }
 

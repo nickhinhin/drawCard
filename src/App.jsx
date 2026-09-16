@@ -4,6 +4,7 @@ import {
   Bell,
   Boxes,
   Check,
+  ChevronDown,
   ChevronLeft,
   Clock3,
   Copy,
@@ -76,7 +77,6 @@ import {
 } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { auth, db, googleProvider, storage } from "./firebase";
-import { SF_PICKUP_POINTS, SF_PICKUP_POINTS_UPDATED_AT } from "./sfPickupPoints";
 
 const DEFAULT_DRAW = {
   title: "Tonight Live Card Draw",
@@ -112,6 +112,8 @@ const statusLabels = {
   pending: "待審核",
   approved: "已批准",
   rejected: "已駁回",
+  awaiting_upload: "上傳付款證明中",
+  scheduled: "直播預告",
   live: "直播中",
   completed: "已結束",
   assigned: "已完成",
@@ -126,6 +128,17 @@ const betaCollectionStatuses = ["pending", "shipping", "shipped", "converted"];
 const CONVERSION_RATE = 0.8;
 const CHAT_COOLDOWN_MS = 3000;
 const PUBLIC_CARD_SHOWCASE_LIMIT = 12;
+const MY_RECORDS_PAGE_SIZE = 6;
+const TOKEN_REQUEST_COOLDOWN_MS = 10 * 60 * 1000;
+const TOKEN_REQUEST_WINDOW_MS = 24 * 60 * 60 * 1000;
+const TOKEN_REQUEST_DAILY_LIMIT = 5;
+const TOKEN_REQUEST_PENDING_LIMIT = 2;
+const SHIPPING_REGIONS = [
+  { id: "hong-kong", label: "香港", sfAvailable: true },
+  { id: "macau", label: "澳門", sfAvailable: false },
+  { id: "mainland-china", label: "中國內地", sfAvailable: false },
+  { id: "taiwan", label: "台灣", sfAvailable: false },
+];
 
 function TokenAmount({ value, suffix = "", className = "" }) {
   return (
@@ -157,6 +170,7 @@ const SHARE_MODE_PRICE_KEYS = {
   "1/10": "tenth",
 };
 const SHARE_MODES = Object.keys(SHARE_MODE_PRICE_KEYS);
+const DEFAULT_CARD_MARGIN_RATE = 1.2;
 
 // Cards without an explicit setting predate this feature and remain available in every odds mode.
 function getCardAllowedShareModes(card) {
@@ -182,6 +196,21 @@ function getCardModePrices(card) {
     half: Math.max(1, Number(card?.modePrices?.half || fallback)),
     fifth: Math.max(1, Number(card?.modePrices?.fifth || fallback)),
     tenth: Math.max(1, Number(card?.modePrices?.tenth || fallback)),
+  };
+}
+
+// Prices are derived from the selected heaven/hell pair and one global margin multiplier.
+function calculateAutomaticCardPrices(heavenConversionValue, hellConversionValue, marginRate = DEFAULT_CARD_MARGIN_RATE) {
+  const heaven = Number(heavenConversionValue);
+  const hell = Number(hellConversionValue);
+  const margin = Number(marginRate);
+  if (![heaven, hell, margin].every(Number.isFinite) || heaven < 0 || hell < 0 || margin <= 0) return null;
+
+  const roundPrice = (value) => Math.round(value * 100) / 100;
+  return {
+    half: Math.max(0.01, roundPrice((heaven * 0.5 + hell * 0.5) * margin)),
+    fifth: Math.max(0.01, roundPrice((heaven * 0.2 + hell * 0.8) * margin)),
+    tenth: Math.max(0.01, roundPrice((heaven * 0.1 + hell * 0.9) * margin)),
   };
 }
 
@@ -312,11 +341,16 @@ const DEFAULT_VIP_TIERS = [
   { id: "vip4", name: "VIP4", threshold: 300000, rewardCardId: "", rewardName: "升級實體卡獎勵" },
 ];
 
+function getVipRewardCardId(tier) {
+  return String(tier?.rewardCardId || `vip-reward-${tier?.id || "reward"}`);
+}
+
 const ADMIN_SECTIONS = [
   { id: "rooms", label: "房間管理", eyebrow: "Rooms", icon: Gavel },
   { id: "create-room", label: "建立房間", eyebrow: "New draw", icon: Plus },
   { id: "cards", label: "卡牌庫", eyebrow: "Card library", icon: ImagePlus },
   { id: "requests", label: "代幣審核", eyebrow: "Review queue", icon: BadgeDollarSign },
+  { id: "promos", label: "推廣碼", eyebrow: "Promotion codes", icon: Gift },
   { id: "packages", label: "套餐設定", eyebrow: "Token packages", icon: Ticket },
   { id: "vip", label: "VIP 設定", eyebrow: "VIP program", icon: Crown },
   { id: "records", label: "購買紀錄", eyebrow: "Room records", icon: ListChecks },
@@ -336,6 +370,25 @@ const BETA_DUMMY_PAYMENT_SETTINGS = {
   fpsName: "LiveDraw Demo（測試）",
   isDummy: true,
 };
+
+const PROMO_CODE_PATTERN = /^([A-Z]{1,24})-?([1-9]\d{0,6})$/;
+
+function normalizePromoCode(value) {
+  return String(value || "").trim().toUpperCase().replace(/\s+/g, "");
+}
+
+function parsePromoCode(value) {
+  const code = normalizePromoCode(value);
+  const match = code.match(PROMO_CODE_PATTERN);
+  if (!match) return null;
+  const amount = Number(match[2]);
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1000000) return null;
+  return { code: `${match[1]}-${amount}`, prefix: match[1], amount };
+}
+
+function getPromoRedemptionId(code, uid) {
+  return `${code}_${uid}`;
+}
 const EMPTY_PAYMENT_SETTINGS = {
   fpsIdentifier: "",
   fpsName: "",
@@ -566,6 +619,9 @@ function App() {
   const tabs = useMemo(
     () => [
       { id: "draw", label: "抽卡", icon: Gavel },
+      ...(isBeta
+        ? [{ id: "archive", label: "過往直播及賽果", icon: Clock3 }]
+        : []),
       { id: "tokens", label: "申請代幣", icon: BadgeDollarSign },
       { id: "history", label: "我的紀錄", icon: ListChecks },
       { id: "collection", label: "我的卡牌", icon: Boxes },
@@ -638,6 +694,14 @@ function App() {
     event.preventDefault();
     const homeUrl = `${window.location.origin}${window.location.pathname}`;
     window.history.pushState({}, "", homeUrl);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    setActiveTab("draw");
+    setMobileOpen(false);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function openArchivedRoom(room) {
+    window.history.pushState({}, "", makeRoomLink(room.id));
     window.dispatchEvent(new PopStateEvent("popstate"));
     setActiveTab("draw");
     setMobileOpen(false);
@@ -736,6 +800,8 @@ function App() {
             <section className="workspace beta-public-workspace">
               {activeTab === "draw" ? (
                 <DrawCard profile={null} />
+              ) : activeTab === "archive" ? (
+                <LiveArchivePage onOpenRoom={openArchivedRoom} />
               ) : (
                 <BetaGuestGate
                   activeTab={activeTab}
@@ -767,6 +833,7 @@ function App() {
             )}
             <section className="workspace">
               {activeTab === "draw" && <DrawCard profile={activeProfile} />}
+              {activeTab === "archive" && <LiveArchivePage onOpenRoom={openArchivedRoom} />}
               {activeTab === "tokens" && <TokenRequest profile={activeProfile} />}
               {activeTab === "history" && <MyRecords profile={activeProfile} />}
               {activeTab === "collection" && <CollectionPage profile={activeProfile} />}
@@ -792,6 +859,7 @@ function App() {
 
 function BetaGuestGate({ activeTab, authError, onLogin }) {
   const labels = {
+    archive: "過往直播及賽果",
     tokens: "申請代幣",
     history: "我的紀錄",
     collection: "我的卡牌",
@@ -1396,7 +1464,7 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
 
   function openPickRoom(record) {
     const room = roomsById[record.drawId];
-    if (!room || room.status !== "live") return;
+    if (!isRoomPurchasable(room)) return;
     window.history.pushState({}, "", makeRoomLink(room.id));
     window.dispatchEvent(new PopStateEvent("popstate"));
     setActiveTab("draw");
@@ -1555,7 +1623,7 @@ function PickSection({ children, count, isOpen, label, onToggle }) {
 }
 
 function isActivePickRecord(record, room) {
-  return !record.cardId && room?.status === "live";
+  return !record.cardId && isRoomPurchasable(room);
 }
 
 function FileUpload({ id, label, file, onChange, required = false, disabled = false }) {
@@ -1607,6 +1675,8 @@ function DrawCard({ profile }) {
   const [selectedSlotNumber, setSelectedSlotNumber] = useState(null);
   const [selectedRound, setSelectedRound] = useState("");
   const [purchaseStep, setPurchaseStep] = useState(1);
+  const [mobileChatOpen, setMobileChatOpen] = useState(false);
+  const pendingRoomRoundRef = useRef("");
 
   useEffect(() => {
     const drawsQuery = query(
@@ -1695,13 +1765,35 @@ function DrawCard({ profile }) {
   const currentBetaLive = isBeta
     ? rooms.find((room) => room.status === "live") || rooms.find((room) => room.status === "draft") || null
     : null;
-  const archivedBetaRooms = isBeta
-    ? rooms.filter((room) => room.id !== currentBetaLive?.id && room.status === "completed")
-    : [];
   const viewingArchivedBetaRoom = Boolean(isBeta && selectedRoom?.status === "completed");
   const selectedRoomDefaultRound = getDefaultRoomRound(selectedRoom);
 
   const roundOptions = useMemo(() => getRoomRoundOptions(selectedRoom), [selectedRoom]);
+  const availableRoomDates = useMemo(
+    () => rooms
+      .filter((room) => room.status === "live" || room.status === "scheduled")
+      .map((room) => {
+        const rounds = getRoomRoundOptions(room);
+        const firstRoundId = rounds[0];
+        const firstDateGroup = getRoundsByDate(room, [firstRoundId])[0];
+        return {
+          ...firstDateGroup,
+          rounds,
+          room,
+          roomId: room.id,
+          firstRoundId,
+          schedule: getRoundSchedule(room, firstRoundId),
+        };
+      })
+      .sort((left, right) => {
+        if (left.room.status === "live" && right.room.status !== "live") return -1;
+        if (right.room.status === "live" && left.room.status !== "live") return 1;
+        const leftTime = left.schedule instanceof Date ? left.schedule.getTime() : Number.MAX_SAFE_INTEGER;
+        const rightTime = right.schedule instanceof Date ? right.schedule.getTime() : Number.MAX_SAFE_INTEGER;
+        return leftTime - rightTime;
+      }),
+    [rooms],
+  );
   const activeRoundId = useMemo(
     () => selectedRound || getDefaultRoomRound(selectedRoom),
     [selectedRoom, selectedRound],
@@ -1729,11 +1821,23 @@ function DrawCard({ profile }) {
   );
 
   useEffect(() => {
+    const pendingRound = pendingRoomRoundRef.current;
+    pendingRoomRoundRef.current = "";
     setSelectedCardId("");
     setSelectedSlotNumber(null);
-    setSelectedRound(selectedRoomDefaultRound);
+    setSelectedRound(roundOptions.includes(pendingRound) ? pendingRound : selectedRoomDefaultRound);
     setPurchaseStep(1);
-  }, [selectedRoomDefaultRound, selectedRoomId]);
+    setMobileChatOpen(false);
+  }, [roundOptions, selectedRoomDefaultRound, selectedRoomId]);
+
+  useEffect(() => {
+    if (!mobileChatOpen) return undefined;
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setMobileChatOpen(false);
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [mobileChatOpen]);
 
   useEffect(() => {
     setSelectedSlotNumber(null);
@@ -1789,7 +1893,7 @@ function DrawCard({ profile }) {
   }, [profile?.uid, selectedSlotNumber, slots]);
 
   function openPurchaseConfirmation(slot) {
-    if (!selectedRoom || selectedRoom.status !== "live") return;
+    if (!isRoomPurchasable(selectedRoom)) return;
     if (getRoundSortValue(activeRoundId) < getRoomCurrentRound(selectedRoom)) {
       alert("此場次已完結，不能再購買號碼。");
       return;
@@ -1969,6 +2073,44 @@ function DrawCard({ profile }) {
     });
   }
 
+  // Every unfinished round in the same live session can be purchased in advance.
+  // Keep an already selected card only when that card is also enabled for the new round's odds.
+  function selectPurchaseRound(roundId) {
+    const nextRoundCards = buildRoomCards(selectedRoom, cardLibrary, roundId);
+    const cardRemainsAvailable = nextRoundCards.some((card) => card.id === selectedCardId);
+
+    setSelectedRound(roundId);
+    setSelectedSlotNumber(null);
+    if (cardRemainsAvailable) {
+      setPurchaseStep(2);
+      window.requestAnimationFrame(() => {
+        document.getElementById("number-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+      return;
+    }
+
+    setSelectedCardId("");
+    setPurchaseStep(1);
+    window.requestAnimationFrame(() => {
+      document.getElementById("card-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
+  function selectRoomDate(option) {
+    if (option.roomId === selectedRoom.id) {
+      selectPurchaseRound(option.firstRoundId);
+      return;
+    }
+
+    pendingRoomRoundRef.current = option.firstRoundId;
+    window.history.pushState({}, "", makeRoomLink(option.roomId));
+    setRoomSlug(option.roomId);
+    setPurchaseStep(1);
+    window.setTimeout(() => {
+      document.querySelector(".room-round-overview")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 80);
+  }
+
   if (!isBeta && !roomSlug) {
     return (
       <RoomList
@@ -2036,17 +2178,13 @@ function DrawCard({ profile }) {
       {isBeta && profile?.uid && (
         <RoomRecordsDrawer currentRoomId={selectedRoom.id} profile={profile} />
       )}
-      {isBeta && archivedBetaRooms.length > 0 && (
-        <LiveArchiveList rooms={archivedBetaRooms} onOpenRoom={openRoom} />
-      )}
       {!isBeta && <button className="small-btn back-link" type="button" onClick={backToRooms}>返回房間列表</button>}
       <div className={`draw-layout purchase-step-${purchaseStep}`}>
         <section className="panel room-stream-panel">
           <div className="section-heading">
             <Gavel size={24} />
             <div>
-              {isBeta && <span className="beta-live-label">直播中</span>}
-              <h1>{isBeta ? <><em>LIVE</em> 抽卡大廳</> : selectedRoom.title}</h1>
+              <h1>{isBeta ? "直播抽卡大廳" : selectedRoom.title}</h1>
               {isBeta && myActiveRoundNumbers.length > 0 && (
                 <span className="beta-my-live-numbers">
                   已買：{myActiveRoundNumbers.map((number) => `#${number}`).join("、")}
@@ -2069,13 +2207,10 @@ function DrawCard({ profile }) {
           <RoomRoundOverview
             draw={selectedRoom}
             activeRoundId={activeRoundId}
+            availableRoomDates={availableRoomDates}
             roundOptions={roundOptions}
-            onRoundChange={(roundId) => {
-              setSelectedRound(roundId);
-              if (getRoundDisplayStatus(selectedRoom, roundId).key !== "upcoming") {
-                setPurchaseStep(2);
-              }
-            }}
+            onDateChange={selectRoomDate}
+            onRoundChange={selectPurchaseRound}
           />
         )}
         {isBeta && purchaseStep === 1 && (
@@ -2114,20 +2249,39 @@ function DrawCard({ profile }) {
             onBuy={() => openPurchaseConfirmation(selectedSlot)}
           />
         )}
-        {selectedRoom.status === "live" &&
-          (profile?.uid && !profile?.isDemo ? (
-            <div id="hall-chat" className="hall-chat-anchor"><ChatRoom drawId={selectedRoom.id} profile={profile} /></div>
-          ) : (
-            <section id="hall-chat" className="panel chat-panel guest-chat-panel">
+        {selectedRoom.status === "live" && (
+          <div
+            id="hall-chat"
+            className={`hall-chat-anchor ${mobileChatOpen ? "mobile-chat-open" : ""}`}
+            role={mobileChatOpen ? "dialog" : undefined}
+            aria-modal={mobileChatOpen ? "true" : undefined}
+            aria-label={mobileChatOpen ? "大廳聊天室" : undefined}
+          >
+            <button
+              className="mobile-chat-close"
+              type="button"
+              onClick={() => setMobileChatOpen(false)}
+              aria-label="關閉大廳聊天室"
+            >
+              <X size={20} />
+            </button>
+            {profile?.uid && !profile?.isDemo ? (
+              <ChatRoom drawId={selectedRoom.id} profile={profile} />
+            ) : (
+              <section className="panel chat-panel guest-chat-panel">
               <div className="section-heading compact beta-live-chat-heading">
                 <div><span>LIVE CHAT</span><h2>大廳聊天</h2></div>
               </div>
               <p className="muted">登入後即可查看及參與大廳聊天。</p>
-            </section>
-          ))}
+              </section>
+            )}
+          </div>
+        )}
       </div>
       {isBeta && (
         <BetaStickyControls
+          actionBarVisible={purchaseStep === 1}
+          onOpenChat={() => setMobileChatOpen(true)}
           onOpenNumbers={openNumberOccupancy}
           profile={profile}
         />
@@ -2259,6 +2413,56 @@ function BetaSingleHallIntro({ cards, rooms, onOpenRoom, onSelectCard }) {
   );
 }
 
+// Keeps completed broadcasts off the draw homepage and exposes them on a dedicated public page.
+function LiveArchivePage({ onOpenRoom }) {
+  const [rooms, setRooms] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const roomsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
+    return onSnapshot(roomsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+      setRooms(snapshot.docs
+        .map((item) => ({ id: item.id, ...item.data() }))
+        .filter((room) => room.status === "completed"));
+      setError("");
+      if (isSnapshotReady(snapshot)) setLoading(false);
+    }, (snapshotError) => {
+      console.error("Archive room listener failed.", snapshotError);
+      setError(getSafeErrorMessage(snapshotError, "未能載入過往直播及賽果。"));
+      setLoading(false);
+    });
+  }, []);
+
+  if (loading) return <InlineLoading label="正在載入過往直播及賽果..." />;
+
+  if (error) {
+    return (
+      <section className="panel empty-state">
+        <Clock3 size={36} />
+        <h1>過往直播及賽果</h1>
+        <p className="muted">{error}</p>
+      </section>
+    );
+  }
+
+  if (!rooms.length) {
+    return (
+      <section className="panel empty-state">
+        <Clock3 size={36} />
+        <h1>過往直播及賽果</h1>
+        <p className="muted">暫時未有已封存直播。</p>
+      </section>
+    );
+  }
+
+  return (
+    <div className="live-archive-page">
+      <LiveArchiveList rooms={rooms} onOpenRoom={onOpenRoom} />
+    </div>
+  );
+}
+
 // Lists completed live sessions without exposing private purchase records.
 function LiveArchiveList({ rooms, onOpenRoom }) {
   return (
@@ -2321,10 +2525,22 @@ function ArchivedLiveRoom({ activeRoundId, loading, onBack, onRoundChange, profi
           {loading ? <InlineLoading label="正在載入號碼紀錄..." /> : slots.map((slot) => {
             const occupied = slot.status !== "available";
             const mine = occupied && slot.uid === profile?.uid;
+            const ownerLabel = mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選";
+            const savedResultSide = room.roundResultSides?.[activeRoundId]?.[String(slot.number)];
+            const resultSide = occupied && ["heaven", "hell"].includes(savedResultSide)
+              ? savedResultSide
+              : "";
             return (
-              <div className={mine ? "mine" : occupied ? "occupied" : ""} key={slot.id}>
-                <strong>{slot.number}</strong>
-                <small>{mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選"}</small>
+              <div
+                aria-label={`號碼 ${slot.number}，${mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選"}${resultSide ? `，${getResultSideLabel(resultSide)}` : ""}`}
+                className={[mine ? "mine" : occupied ? "occupied" : "", resultSide ? `result-${resultSide}` : ""].filter(Boolean).join(" ")}
+                key={slot.id}
+              >
+                <strong className={resultSide ? `archive-slot-outcome ${resultSide}` : ""}>
+                  {resultSide && <i aria-hidden="true" />}
+                  {resultSide ? getResultSideLabel(resultSide) : slot.number}
+                </strong>
+                <small>{resultSide ? `#${slot.number} · ${ownerLabel}` : ownerLabel}</small>
               </div>
             );
           })}
@@ -2334,11 +2550,7 @@ function ArchivedLiveRoom({ activeRoundId, loading, onBack, onRoundChange, profi
   );
 }
 
-function BetaStickyControls({ onOpenNumbers, profile }) {
-  function scrollToChat() {
-    document.getElementById("hall-chat")?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
-
+function BetaStickyControls({ actionBarVisible = false, onOpenChat, onOpenNumbers, profile }) {
   function openRecords() {
     if (!profile?.uid) {
       alert("登入後即可查看我的紀錄。");
@@ -2349,7 +2561,7 @@ function BetaStickyControls({ onOpenNumbers, profile }) {
 
   return (
     <>
-      <nav className="beta-desktop-sticky-controls" aria-label="桌面直播快捷功能">
+      <nav className={`beta-desktop-sticky-controls${actionBarVisible ? " action-bar-visible" : ""}`} aria-label="桌面直播快捷功能">
         <button className="support" type="button" onClick={() => window.dispatchEvent(new CustomEvent("beta-open-support"))}>
           <Headphones size={17} /><span>聯絡客服</span>
         </button>
@@ -2357,14 +2569,14 @@ function BetaStickyControls({ onOpenNumbers, profile }) {
           <ListChecks size={17} /><span>我的紀錄</span>
         </button>
       </nav>
-      <nav className="beta-mobile-sticky-controls" aria-label="直播快捷功能">
+      <nav className={`beta-mobile-sticky-controls${actionBarVisible ? " action-bar-visible" : ""}`} aria-label="直播快捷功能">
       <button className="support" type="button" onClick={() => window.dispatchEvent(new CustomEvent("beta-open-support"))}>
         <Headphones size={15} /><span>聯絡客服</span>
       </button>
       <button className="numbers" type="button" onClick={onOpenNumbers}>
         <Hash size={15} /><span>號碼使用情況</span>
       </button>
-      <button className="chat" type="button" onClick={scrollToChat}>
+      <button className="chat" type="button" onClick={onOpenChat}>
         <MessageCircle size={15} /><span>大廳聊天</span>
       </button>
       <button className="records" type="button" onClick={openRecords}>
@@ -2401,7 +2613,9 @@ function DesktopNumberOccupancy({ activeRoundId, loading, profile, slots }) {
               key={slot.id}
               type="button"
             >
-              <strong>{slot.number}</strong>
+              {occupied && !mine
+                ? <X className="number-taken-cross" aria-hidden="true" />
+                : <strong>{slot.number}</strong>}
               <small>{mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選"}</small>
             </button>
           );
@@ -2409,7 +2623,7 @@ function DesktopNumberOccupancy({ activeRoundId, loading, profile, slots }) {
       </div>
       <div className="desktop-number-legend">
         <span><i />未選</span>
-        <span><i />已被選</span>
+        <span><i className="taken" aria-hidden="true" />已被選</span>
         <span><i />我的號碼</span>
       </div>
     </aside>
@@ -2897,7 +3111,7 @@ const CardPoolPreview = memo(function CardPoolPreview({
     <section id="card-selection" className="panel card-pool-preview">
       <div>
         <p className="eyebrow">第一步</p>
-        <h2>選擇卡牌</h2>
+        <h2>選擇卡牌（保底隨機PSA10卡）</h2>
       </div>
       <span>共 {cards.length || draw.cardCount || 0} 張可選</span>
       {loading ? (
@@ -2981,27 +3195,53 @@ const CardPoolPreview = memo(function CardPoolPreview({
 });
 
 // Keeps every live date and round visible beneath the stream, matching the single-hall layout.
-function RoomRoundOverview({ draw, activeRoundId, roundOptions, onRoundChange }) {
+function RoomRoundOverview({
+  draw,
+  activeRoundId,
+  availableRoomDates = [],
+  roundOptions,
+  onDateChange,
+  onRoundChange,
+}) {
   const groups = getRoundsByDate(draw, roundOptions);
-  const activeGroup = groups.find((group) => group.rounds.includes(activeRoundId)) || groups[0];
+  const dateOptions = availableRoomDates.length
+    ? availableRoomDates
+    : groups.map((group) => ({
+      ...group,
+      room: draw,
+      roomId: draw.id,
+      firstRoundId: group.rounds[0],
+    }));
+  const activeGroup = dateOptions.find(
+    (option) => option.roomId === draw.id && option.rounds.includes(activeRoundId),
+  ) || dateOptions.find((option) => option.roomId === draw.id) || dateOptions[0];
   const activeRoundStatus = getRoundDisplayStatus(draw, activeRoundId);
   const activeResultImage = draw.roundResultImages?.[activeRoundId] || "";
 
   return (
     <section className="room-round-overview" aria-label="抽卡場次">
       <div className="room-round-date-navigation">
-        <strong>按日期查看場次／過往賽果</strong>
         <div className="room-round-date-tabs" aria-label="選擇直播日期">
-          {groups.map((group) => (
+          {dateOptions.map((option) => {
+            const groupStatuses = option.rounds.map((roundId) => getRoundDisplayStatus(option.room, roundId));
+            const dateStatusLabel = groupStatuses.some((status) => status.key === "live")
+              ? "直播中"
+              : groupStatuses.every((status) => status.key === "completed")
+                ? "已結束"
+                : "直播預告";
+            return (
             <button
-              className={group.key === activeGroup?.key ? "active" : ""}
-              key={group.key}
+              aria-label={`${option.fullLabel}，${dateStatusLabel}`}
+              className={option.roomId === draw.id && option.key === activeGroup?.key ? "active" : ""}
+              key={`${option.roomId}-${option.key}`}
               type="button"
-              onClick={() => onRoundChange(group.rounds[0])}
+              onClick={() => onDateChange ? onDateChange(option) : onRoundChange(option.firstRoundId)}
             >
-              {group.fullLabel}
+              <span>{option.fullLabel}</span>
+              <small>{dateStatusLabel}</small>
             </button>
-          ))}
+            );
+          })}
         </div>
       </div>
       <div className="room-round-card-strip">
@@ -3059,7 +3299,7 @@ function NumberGrid({
 }) {
   const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
 
-  if (draw.status !== "live") {
+  if (!isRoomPurchasable(draw)) {
     return (
       <section className="panel empty-state compact-empty">
         <Gavel size={32} />
@@ -3174,7 +3414,9 @@ function NumberGrid({
               type="button"
               onClick={() => onSelectNumber(slot.number)}
             >
-              <strong>{slot.number}</strong>
+              {locked && !mine
+                ? <X className="number-taken-cross" aria-hidden="true" />
+                : <strong>{slot.number}</strong>}
               <small>
                 {mine
                   ? "你的號碼"
@@ -3196,7 +3438,7 @@ function NumberGrid({
       </div>
       <div className="number-legend">
         <span><i />可選</span>
-        <span><i />已被選走</span>
+        <span><i className="taken" aria-hidden="true" />已被選走</span>
         <span><i />我的號碼</span>
       </div>
       <div className="number-divider" />
@@ -3244,17 +3486,67 @@ function NumberGrid({
 
 const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
   const [isMuted, setIsMuted] = useState(true);
+  const [isCompactPlayer, setIsCompactPlayer] = useState(() => (
+    typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches
+  ));
+  const [mobilePlaybackUrl, setMobilePlaybackUrl] = useState("");
+  const [mobilePlayerFailed, setMobilePlayerFailed] = useState(false);
   const embedUrl = useMemo(() => {
     const playerUrl = toKickEmbedUrl(kickUrl);
+    const autoplay = isCompactPlayer ? "false" : "true";
+    const muted = isCompactPlayer ? "false" : String(isMuted);
     return playerUrl
-      ? `${playerUrl}?autoplay=true&muted=${isMuted}&allowfullscreen=true`
+      ? `${playerUrl}?autoplay=${autoplay}&muted=${muted}&allowfullscreen=true`
       : "";
-  }, [isMuted, kickUrl]);
+  }, [isCompactPlayer, isMuted, kickUrl]);
   const frameWrapRef = useRef(null);
   const playerFrameRef = useRef(null);
   const inlinePlayerSizeRef = useRef(null);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
+  const [isMobileFullscreen, setIsMobileFullscreen] = useState(false);
   const [fullscreenScale, setFullscreenScale] = useState(1);
+  const isFullscreen = isNativeFullscreen || isMobileFullscreen;
+
+  useEffect(() => {
+    const compactQuery = window.matchMedia("(max-width: 760px)");
+    function syncPlayerMode(event) {
+      setIsCompactPlayer(event.matches);
+    }
+
+    compactQuery.addEventListener?.("change", syncPlayerMode);
+    return () => compactQuery.removeEventListener?.("change", syncPlayerMode);
+  }, []);
+
+  useEffect(() => {
+    if (!isCompactPlayer) return undefined;
+
+    const channel = getKickChannel(kickUrl);
+    if (!channel) return undefined;
+    const controller = new AbortController();
+    setMobilePlaybackUrl("");
+    setMobilePlayerFailed(false);
+
+    // The mobile player uses Kick's public channel response so iOS can control
+    // one native video directly. This avoids reloading a cross-origin iframe
+    // when the viewer unmutes or enters fullscreen.
+    fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`, {
+      credentials: "omit",
+      signal: controller.signal,
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error("Kick channel unavailable");
+        return response.json();
+      })
+      .then((channelData) => {
+        if (!channelData?.playback_url) throw new Error("Kick playback unavailable");
+        setMobilePlaybackUrl(channelData.playback_url);
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError") setMobilePlayerFailed(true);
+      });
+
+    return () => controller.abort();
+  }, [isCompactPlayer, kickUrl]);
 
   useEffect(() => {
     function fitExistingPlayerToFullscreen() {
@@ -3265,10 +3557,10 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
 
     function syncFullscreenState() {
       const fullscreen = document.fullscreenElement === frameWrapRef.current;
-      setIsFullscreen(fullscreen);
+      setIsNativeFullscreen(fullscreen);
       if (fullscreen) {
         window.requestAnimationFrame(fitExistingPlayerToFullscreen);
-      } else {
+      } else if (!isMobileFullscreen) {
         setFullscreenScale(1);
       }
     }
@@ -3279,15 +3571,58 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
       document.removeEventListener("fullscreenchange", syncFullscreenState);
       window.removeEventListener("resize", fitExistingPlayerToFullscreen);
     };
-  }, []);
+  }, [isMobileFullscreen]);
+
+  useEffect(() => {
+    if (!isMobileFullscreen) return undefined;
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.requestAnimationFrame(() => {
+      const size = inlinePlayerSizeRef.current;
+      if (size?.width && size?.height) {
+        setFullscreenScale(Math.min(window.innerWidth / size.width, window.innerHeight / size.height));
+      }
+    });
+
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setIsMobileFullscreen(false);
+    }
+
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", closeOnEscape);
+      setFullscreenScale(1);
+    };
+  }, [isMobileFullscreen]);
 
   if (!embedUrl) {
     return <div className="stream-fallback">尚未設定有效的 Kick 頻道</div>;
   }
 
   async function toggleFullscreen() {
+    if (isMobileFullscreen) {
+      setIsMobileFullscreen(false);
+      return;
+    }
+
+    if (isNativeFullscreen) {
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen?.();
+      } catch {
+        // Fall through to the local state reset below.
+      } finally {
+        // Some mobile browsers leave fullscreen before updating React. Always
+        // let a second tap restore the inline player instead of reopening it.
+        setIsNativeFullscreen(false);
+        setFullscreenScale(1);
+      }
+      return;
+    }
+
     try {
-      if (document.fullscreenElement === frameWrapRef.current) {
+      if (document.fullscreenElement) {
         await document.exitFullscreen?.();
       } else {
         const playerRect = playerFrameRef.current?.getBoundingClientRect();
@@ -3297,37 +3632,83 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
             height: playerRect.height,
           };
         }
-        await frameWrapRef.current?.requestFullscreen?.();
+        if (frameWrapRef.current?.requestFullscreen && document.fullscreenEnabled !== false) {
+          await frameWrapRef.current.requestFullscreen();
+        } else {
+          setIsMobileFullscreen(true);
+        }
       }
     } catch {
-      // Browsers may reject fullscreen changes; the player remains usable inline.
+      // iPhone Safari does not support fullscreen on arbitrary elements, so use
+      // the same single player in a fixed full-viewport layer instead.
+      setIsMobileFullscreen(true);
     }
   }
 
+  function toggleMute() {
+    const player = playerFrameRef.current;
+    if (isCompactPlayer && player instanceof HTMLVideoElement) {
+      const nextMuted = !player.muted;
+      player.muted = nextMuted;
+      setIsMuted(nextMuted);
+      if (player.paused) player.play().catch(() => {});
+      return;
+    }
+    setIsMuted((current) => !current);
+  }
+
+  const usesNativeMobilePlayer = isCompactPlayer && !mobilePlayerFailed;
+
   return (
-    <div className="kick-frame-wrap" ref={frameWrapRef}>
-      <iframe
-        className="kick-frame"
-        ref={playerFrameRef}
-        src={embedUrl}
-        style={isFullscreen && inlinePlayerSizeRef.current ? {
-          width: `${inlinePlayerSizeRef.current.width}px`,
-          height: `${inlinePlayerSizeRef.current.height}px`,
-          maxWidth: "none",
-          maxHeight: "none",
-          transform: `scale(${fullscreenScale})`,
-        } : undefined}
-        title={`${title} Kick stream`}
-        allow="autoplay; fullscreen; picture-in-picture"
-        sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
-        referrerPolicy="strict-origin-when-cross-origin"
-        scrolling="no"
-        allowFullScreen
-      />
+    <div className={`kick-frame-wrap${isMobileFullscreen ? " is-mobile-fullscreen" : ""}${usesNativeMobilePlayer ? " uses-native-mobile-player" : ""}`} ref={frameWrapRef}>
+      {usesNativeMobilePlayer ? (
+        mobilePlaybackUrl ? (
+          <video
+            className="kick-frame"
+            ref={playerFrameRef}
+            src={mobilePlaybackUrl}
+            style={isFullscreen && inlinePlayerSizeRef.current ? {
+              width: `${inlinePlayerSizeRef.current.width}px`,
+              height: `${inlinePlayerSizeRef.current.height}px`,
+              maxWidth: "none",
+              maxHeight: "none",
+              transform: `scale(${fullscreenScale})`,
+            } : undefined}
+            title={`${title} Kick stream`}
+            autoPlay
+            muted={isMuted}
+            playsInline
+            preload="auto"
+            onError={() => setMobilePlayerFailed(true)}
+          />
+        ) : (
+          <div className="stream-fallback">正在載入直播…</div>
+        )
+      ) : (
+        <iframe
+          key={embedUrl}
+          className="kick-frame"
+          ref={playerFrameRef}
+          src={embedUrl}
+          style={isFullscreen && inlinePlayerSizeRef.current ? {
+            width: `${inlinePlayerSizeRef.current.width}px`,
+            height: `${inlinePlayerSizeRef.current.height}px`,
+            maxWidth: "none",
+            maxHeight: "none",
+            transform: `scale(${fullscreenScale})`,
+          } : undefined}
+          title={`${title} Kick stream`}
+          allow="autoplay *; fullscreen *; picture-in-picture *"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
+          referrerPolicy="strict-origin-when-cross-origin"
+          scrolling="no"
+          allowFullScreen
+        />
+      )}
       <button
         className="stream-mute-btn"
         type="button"
-        onClick={() => setIsMuted((current) => !current)}
+        onClick={toggleMute}
         aria-label={isMuted ? "開啟直播聲音" : "將直播靜音"}
         aria-pressed={isMuted}
         title={isMuted ? "開啟聲音" : "靜音"}
@@ -3525,8 +3906,89 @@ function RoomThumbnail({ draw }) {
   );
 }
 
-function VipProgramPanel({ deposit, tiers }) {
+function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
   const vip = getVipState(tiers, deposit);
+  const [claimingId, setClaimingId] = useState("");
+  const rewardsByTier = useMemo(
+    () => new Map(rewards.map((reward) => [reward.vipTierId, reward])),
+    [rewards],
+  );
+
+  async function claimReward(tier, tierIndex, reward) {
+    if (!tier?.id || profile?.isDemo) return;
+    const rewardId = reward?.id || `vip_${profile.uid}_${tier.id}`;
+    setClaimingId(rewardId);
+    try {
+      await runTransaction(db, async (transaction) => {
+        const rewardRef = doc(db, "drawRecords", rewardId);
+        const rewardSnapshot = await transaction.get(rewardRef);
+
+        if (rewardSnapshot.exists()) {
+          const savedReward = rewardSnapshot.data();
+          if (savedReward.uid !== profile.uid || savedReward.source !== "vip") {
+            throw new Error("VIP 獎勵記錄不正確，請聯絡客服。");
+          }
+          if (savedReward.cardId || savedReward.vipRewardStatus === "claimed") return;
+          if (savedReward.vipRewardStatus !== "claimable" || !savedReward.targetCardId) {
+            throw new Error("呢份 VIP 獎勵暫時未能領取。");
+          }
+          transaction.update(rewardRef, {
+            vipRewardStatus: "claimed",
+            cardId: savedReward.targetCardId,
+            cardName: savedReward.targetCardName || "VIP 升級獎勵",
+            cardCategory: "VIP 獎勵",
+            cardImageUrl: savedReward.targetCardImageUrl || "",
+            cardValue: Number(savedReward.targetCardValue || 0),
+            cardConversionValue: Number(savedReward.targetCardValue || 0),
+            collectionStatus: "pending",
+            claimedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          return;
+        }
+
+        const targetCardId = getVipRewardCardId(tier);
+        const rewardName = tier.rewardName || "VIP 升級獎勵";
+        const rewardValue = Number(tier.rewardConversionValue || 0);
+        transaction.set(rewardRef, {
+          source: "vip",
+          vipTierId: tier.id,
+          vipTierIndex: tierIndex,
+          uid: profile.uid,
+          username: profile.username || profile.displayName || "VIP member",
+          drawId: "vip-program",
+          drawTitle: `${tier.name} 升級獎勵`,
+          roomSlug: "vip-program",
+          roomLink: "",
+          round: "vip-reward",
+          roundSort: 0,
+          number: tierIndex + 1,
+          tokenCost: 0,
+          targetCardId,
+          targetCardName: rewardName,
+          targetCardImageUrl: tier.rewardImageUrl || "",
+          targetCardValue: rewardValue,
+          vipRewardStatus: "claimed",
+          cardId: targetCardId,
+          cardName: rewardName,
+          cardCategory: "VIP 獎勵",
+          cardImageUrl: tier.rewardImageUrl || "",
+          cardValue: rewardValue,
+          cardConversionValue: rewardValue,
+          collectionStatus: "pending",
+          unlockedAt: serverTimestamp(),
+          claimedAt: serverTimestamp(),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      });
+      alert("VIP 卡牌獎勵已領取，已加入「我的卡牌」。");
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setClaimingId("");
+    }
+  }
 
   return (
     <section className="vip-program-panel">
@@ -3557,25 +4019,46 @@ function VipProgramPanel({ deposit, tiers }) {
         </div>
       </div>
       <div className="vip-tier-grid">
-        {vip.tiers.map((tier, index) => (
-          <article
-            className={`vip-tier-card ${tier.done ? "done" : ""} ${tier.active ? "active" : ""}`}
+        {vip.tiers.map((tier, index) => {
+          const reward = rewardsByTier.get(tier.id);
+          const rewardClaimed = Boolean(reward?.cardId || reward?.vipRewardStatus === "claimed");
+          const rewardClaimable = Boolean(tier.done && !rewardClaimed);
+          const rewardId = reward?.id || `vip_${profile.uid}_${tier.id}`;
+          const tierState = rewardClaimed
+            ? "已領取"
+            : rewardClaimable
+              ? "可領取"
+              : tier.done
+                ? "已達成"
+                : tier.active ? `${Math.round(tier.progress)}%` : "未解鎖";
+
+          return <article
+            className={`vip-tier-card ${tier.done ? "done" : ""} ${tier.active ? "active" : ""} ${rewardClaimable ? "claimable" : ""}`}
             key={tier.id}
           >
             <div className="vip-tier-rail">
               <i style={{ width: `${tier.progress}%` }} />
             </div>
             <div className="vip-shield">{index}</div>
-            <div className="vip-tier-state">
-              {tier.done ? "已達成" : tier.active ? `${Math.round(tier.progress)}%` : "未解鎖"}
-            </div>
+            <div className="vip-tier-state">{tierState}</div>
             <div className="vip-tier-detail">
               <strong>{tier.name}</strong>
               <b>HK${formatTokenNumber(tier.threshold)}</b>
               <span>{tier.rewardName || "待設定升級獎勵"}</span>
+              {rewardClaimable && (
+                <button
+                  className="vip-claim-btn"
+                  type="button"
+                  disabled={claimingId === rewardId}
+                  onClick={() => claimReward(tier, index, reward)}
+                >
+                  <Gift size={14} />{claimingId === rewardId ? "領取中..." : "領取"}
+                </button>
+              )}
+              {rewardClaimed && <small className="vip-claimed-label"><Check size={13} />已加入我的卡牌</small>}
             </div>
-          </article>
-        ))}
+          </article>;
+        })}
       </div>
     </section>
   );
@@ -3590,16 +4073,20 @@ function TokenRequest({ profile }) {
   const [customHkd, setCustomHkd] = useState("");
   const [proof, setProof] = useState(null);
   const [promoCode, setPromoCode] = useState("");
+  const [requestMethod, setRequestMethod] = useState("");
   const [fpsIdentifier, setFpsIdentifier] = useState("");
   const [fpsName, setFpsName] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [requests, setRequests] = useState([]);
+  const [vipRewards, setVipRewards] = useState([]);
   const [requestsLoading, setRequestsLoading] = useState(true);
   const usingCustomAmount = selectedPackage === "custom";
   const hkdAmount = usingCustomAmount ? Number(customHkd || 0) : Number(selectedPackage);
   const tokenAmount = usingCustomAmount
     ? calculateTokenAmount(hkdAmount)
     : tokenPackages.find((item) => item.hkd === hkdAmount)?.tokens || 0;
+  const parsedPromoCode = parsePromoCode(promoCode);
+  const requestedTokenAmount = requestMethod === "promo" ? (parsedPromoCode?.amount || 0) : tokenAmount;
   const baseTokens = Math.max(0, Math.floor(hkdAmount));
   const bonusTokens = Math.max(0, tokenAmount - baseTokens);
   const bonusRate = baseTokens > 0 ? Math.round((bonusTokens / baseTokens) * 100) : 0;
@@ -3651,6 +4138,25 @@ function TokenRequest({ profile }) {
     return stopRequests;
   }, [profile.isDemo, profile.uid]);
 
+  useEffect(() => {
+    if (profile.isDemo) {
+      setVipRewards([]);
+      return undefined;
+    }
+    const rewardsQuery = query(
+      collection(db, "drawRecords"),
+      where("uid", "==", profile.uid),
+    );
+    return onSnapshot(rewardsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+      setVipRewards(snapshot.docs
+        .map((item) => ({ id: item.id, ...item.data() }))
+        .filter((item) => item.source === "vip"));
+    }, (error) => {
+      console.error("VIP reward listener failed.", error);
+      setVipRewards([]);
+    });
+  }, [profile.isDemo, profile.uid]);
+
   async function submitRequest(event) {
     event.preventDefault();
 
@@ -3659,51 +4165,145 @@ function TokenRequest({ profile }) {
       return;
     }
 
-    if (!Number.isSafeInteger(hkdAmount) || hkdAmount < 500 || hkdAmount > 1000000 || tokenAmount < 1 || tokenAmount > 1000000) {
+    if (!requestMethod) {
+      alert("請先選擇付款購買代幣，或推廣活動兌換代幣。");
+      return;
+    }
+    if (requestMethod === "payment" && (!Number.isSafeInteger(hkdAmount) || hkdAmount < 500 || hkdAmount > 1000000 || tokenAmount < 1 || tokenAmount > 1000000)) {
       alert("請選擇套餐，或輸入最少 HK$500 的自訂金額。");
       return;
     }
-    const cleanPromoCode = promoCode.trim();
-    if (!proof && !cleanPromoCode) {
-      alert("請上傳付款證明，或輸入活動碼供管理員審核。");
+    const cleanPromoCode = parsedPromoCode?.code || normalizePromoCode(promoCode);
+    if (requestMethod === "payment" && !proof) {
+      alert("請上傳付款證明供管理員審核。");
       return;
     }
-    const requestFpsIdentifier = isBeta ? paymentSettings.fpsIdentifier : fpsIdentifier.trim();
-    const requestFpsName = isBeta ? paymentSettings.fpsName : fpsName.trim();
-    if (proof && (!requestFpsIdentifier || !requestFpsName)) {
+    if (requestMethod === "promo" && !parsedPromoCode) {
+      alert("邀請碼格式不正確。請輸入「英文字母-代幣數目」，例如 EVENT-500。");
+      return;
+    }
+    if (requestMethod === "payment" && proof?.size > 2 * 1024 * 1024) {
+      alert("付款證明圖片不可超過 2MB。");
+      return;
+    }
+    if (requestMethod === "payment" && proof && !["image/jpeg", "image/jpg", "image/png", "image/webp"].includes(proof.type || "")) {
+      alert("付款證明必須是 JPEG、PNG 或 WebP 圖片。");
+      return;
+    }
+    const requestFpsIdentifier = requestMethod === "payment"
+      ? (isBeta ? paymentSettings.fpsIdentifier : fpsIdentifier.trim())
+      : "";
+    const requestFpsName = requestMethod === "payment"
+      ? (isBeta ? paymentSettings.fpsName : fpsName.trim())
+      : "";
+    if (requestMethod === "payment" && (!requestFpsIdentifier || !requestFpsName)) {
       alert(isBeta
         ? "平台尚未設定 FPS 收款資料，請聯絡管理員。"
         : "請輸入轉數快識別碼及收款人姓名，方便管理員核對。");
       return;
     }
 
+    const now = Date.now();
+    const pendingRequestCount = requests.filter((request) => ["awaiting_upload", "pending"].includes(request.status)).length;
+    const recentRequestTimes = requests.map((request) => toMillis(request.createdAt)).filter(Boolean);
+    const latestRequestAt = Math.max(0, ...recentRequestTimes);
+    const dailyRequestCount = recentRequestTimes.filter((createdAt) => now - createdAt < TOKEN_REQUEST_WINDOW_MS).length;
+    if (pendingRequestCount >= TOKEN_REQUEST_PENDING_LIMIT) {
+      alert(`最多只可以同時有 ${TOKEN_REQUEST_PENDING_LIMIT} 個待處理代幣申請。`);
+      return;
+    }
+    if (latestRequestAt && now - latestRequestAt < TOKEN_REQUEST_COOLDOWN_MS) {
+      alert("每次代幣申請需要相隔最少 10 分鐘。");
+      return;
+    }
+    if (dailyRequestCount >= TOKEN_REQUEST_DAILY_LIMIT) {
+      alert("24 小時內最多只可以提交 5 次代幣申請。");
+      return;
+    }
+
     setSubmitting(true);
     try {
       const claimedUsername = await ensureUsernameClaim(profile.uid, profile.username);
+      const requestRef = doc(collection(db, "tokenRequests"));
+      const isPaymentRequest = requestMethod === "payment";
+      let verifiedPromo = null;
+      let promoRedemptionRef = null;
+      if (!isPaymentRequest) {
+        const promoRef = doc(db, "promoCodes", parsedPromoCode.code);
+        promoRedemptionRef = doc(db, "promoRedemptions", getPromoRedemptionId(parsedPromoCode.code, profile.uid));
+        const [promoSnapshot, redemptionSnapshot] = await Promise.all([
+          getDoc(promoRef),
+          getDoc(promoRedemptionRef),
+        ]);
+        if (!promoSnapshot.exists() || promoSnapshot.data().active !== true
+          || promoSnapshot.data().code !== parsedPromoCode.code
+          || Number(promoSnapshot.data().amount || 0) !== parsedPromoCode.amount) {
+          throw new Error("邀請碼未啟用、已停用或代幣數目不正確。");
+        }
+        if (redemptionSnapshot.exists()) {
+          throw new Error("你已經使用過呢個邀請碼，每位用戶只可以使用一次。");
+        }
+        verifiedPromo = promoSnapshot.data();
+      }
+      const safeProofName = isPaymentRequest ? getSafeProofName(proof) : "";
+      const proofPath = isPaymentRequest ? `token-proofs/${profile.uid}/${requestRef.id}` : "";
+      const profileWindowStartedAt = toMillis(profile.tokenRequestWindowStartedAt);
+      const activeWindow = profileWindowStartedAt > 0 && now - profileWindowStartedAt < TOKEN_REQUEST_WINDOW_MS;
+      const batch = writeBatch(db);
 
-      const proofInfo = proof
-        ? await createProofInfo({ proof, profile })
-        : { proofMode: "promo", proofPath: "", proofFileName: "", proofUrl: "" };
-
-      await addDoc(collection(db, "tokenRequests"), {
+      batch.set(requestRef, {
         uid: profile.uid,
         username: claimedUsername,
         email: profile.email || "",
-        amount: tokenAmount,
-        hkdAmount,
-        exchangeRate: tokenAmount / hkdAmount,
-        packageType: usingCustomAmount ? "custom" : "preset",
+        amount: isPaymentRequest ? tokenAmount : verifiedPromo.amount,
+        hkdAmount: isPaymentRequest ? hkdAmount : 0,
+        exchangeRate: isPaymentRequest ? tokenAmount / hkdAmount : 0,
+        packageType: isPaymentRequest ? (usingCustomAmount ? "custom" : "preset") : "promo",
         fpsIdentifier: requestFpsIdentifier,
         fpsName: requestFpsName,
-        ...proofInfo,
-        status: "pending",
+        proofMode: isPaymentRequest ? "storage" : "promo",
+        proofPath,
+        proofFileName: safeProofName,
+        proofUrl: "",
+        status: isPaymentRequest ? "awaiting_upload" : "pending",
         adminNote: "",
-        promoCode: cleanPromoCode,
+        promoCode: isPaymentRequest ? "" : cleanPromoCode,
+        promoCodeId: isPaymentRequest ? "" : parsedPromoCode.code,
+        quotaVersion: 1,
         createdAt: serverTimestamp(),
       });
+      if (!isPaymentRequest) {
+        batch.set(promoRedemptionRef, {
+          uid: profile.uid,
+          promoCodeId: parsedPromoCode.code,
+          code: parsedPromoCode.code,
+          amount: verifiedPromo.amount,
+          requestId: requestRef.id,
+          createdAt: serverTimestamp(),
+        });
+      }
+      batch.update(doc(db, "users", profile.uid), {
+        lastTokenRequestId: requestRef.id,
+        lastTokenRequestAt: serverTimestamp(),
+        pendingTokenRequestCount: Number(profile.pendingTokenRequestCount || 0) + 1,
+        tokenRequestWindowStartedAt: activeWindow ? profile.tokenRequestWindowStartedAt : serverTimestamp(),
+        tokenRequestWindowCount: activeWindow ? Number(profile.tokenRequestWindowCount || 0) + 1 : 1,
+        updatedAt: serverTimestamp(),
+      });
+      await batch.commit();
+
+      if (isPaymentRequest) {
+        const proofInfo = await createProofInfo({ proof, profile, requestId: requestRef.id });
+        await updateDoc(requestRef, {
+          status: "pending",
+          proofUrl: proofInfo.proofUrl,
+          uploadedAt: serverTimestamp(),
+        });
+      }
 
       setProof(null);
       setPromoCode("");
+      setRequestMethod("");
       setFpsIdentifier("");
       setFpsName("");
       setSelectedPackage(tokenPackages[0].hkd);
@@ -3717,7 +4317,7 @@ function TokenRequest({ profile }) {
 
   return (
     <div className="token-page">
-      {!isBeta && <VipProgramPanel deposit={cumulativeDeposit} tiers={vipTiers} />}
+      {!isBeta && <VipProgramPanel deposit={cumulativeDeposit} profile={profile} rewards={vipRewards} tiers={vipTiers} />}
       <div className="split-layout token-request-layout">
       <section className="panel token-request-panel">
         <div className="section-heading">
@@ -3728,6 +4328,39 @@ function TokenRequest({ profile }) {
           </div>
         </div>
         <form className="stack-form" onSubmit={submitRequest}>
+          <fieldset className="token-request-methods">
+            <legend>選擇申請方式</legend>
+            <div role="radiogroup" aria-label="代幣申請方式">
+              <button
+                aria-checked={requestMethod === "payment"}
+                className={requestMethod === "payment" ? "selected" : ""}
+                role="radio"
+                type="button"
+                onClick={() => {
+                  setRequestMethod("payment");
+                  setPromoCode("");
+                }}
+              >
+                <BadgeDollarSign size={22} />
+                <span><strong>付款購買代幣</strong><small>查看付款資料並上載付款證明</small></span>
+              </button>
+              <button
+                aria-checked={requestMethod === "promo"}
+                className={requestMethod === "promo" ? "selected" : ""}
+                role="radio"
+                type="button"
+                onClick={() => {
+                  setRequestMethod("promo");
+                  setProof(null);
+                }}
+              >
+                <Gift size={22} />
+                <span><strong>推廣活動兌換代幣</strong><small>使用推廣活動邀請碼申請</small></span>
+              </button>
+            </div>
+          </fieldset>
+          {requestMethod && <>
+          {requestMethod === "payment" && <>
           <div className="form-field">
             <span>選擇充值金額</span>
             <div className="token-package-grid">
@@ -3776,11 +4409,9 @@ function TokenRequest({ profile }) {
             </div>
             <strong><span className="coin-dot">D</span>{formatTokenNumber(tokenAmount)}</strong>
             <small>付款金額 HK${formatTokenNumber(hkdAmount)}</small>
-            <p>
-              基本 1:1 = {formatTokenNumber(baseTokens)} 代幣 ＋ 額外 {bonusRate}% = {formatTokenNumber(bonusTokens)} 代幣
-            </p>
           </div>
-          {isBeta ? (
+          </>}
+          {requestMethod === "payment" && (isBeta ? (
             <div className="platform-fps-panel">
               <div>
                 <span>平台 FPS 識別碼</span>
@@ -3803,45 +4434,57 @@ function TokenRequest({ profile }) {
             <>
               <label>
                 轉數快識別碼
-                <input value={fpsIdentifier} onChange={(event) => setFpsIdentifier(event.target.value)} placeholder="請輸入 FPS 識別碼" required={Boolean(proof)} />
+                <input value={fpsIdentifier} onChange={(event) => setFpsIdentifier(event.target.value)} placeholder="請輸入 FPS 識別碼" required />
               </label>
               <label>
                 收款人姓名
-                <input value={fpsName} onChange={(event) => setFpsName(event.target.value)} placeholder="請輸入收款人姓名" required={Boolean(proof)} />
+                <input value={fpsName} onChange={(event) => setFpsName(event.target.value)} placeholder="請輸入收款人姓名" required />
               </label>
             </>
+          ))}
+          {requestMethod === "payment" ? (
+            <>
+              <FileUpload
+                label="付款證明圖片"
+                file={proof}
+                onChange={setProof}
+                required
+              />
+              <p className="form-note">請按以上資料付款，再上載付款證明；所有申請須經人工審核。</p>
+            </>
+          ) : (
+            <label>
+              推廣活動邀請碼
+              <input
+                value={promoCode}
+                onChange={(event) => setPromoCode(normalizePromoCode(event.target.value))}
+                placeholder="例如 EVENT-500"
+                pattern="[A-Za-z]{1,24}-?[1-9][0-9]{0,6}"
+                maxLength="32"
+                required
+              />
+            </label>
           )}
-        <FileUpload
-            label="付款證明圖片"
-            file={proof}
-            onChange={setProof}
-          />
-          <p className="form-note">付款證明或活動碼擇一提供；所有申請須經人工審核，批准後才會發放代幣。</p>
-          <label>
-            推廣活動邀請碼
-            <input
-              value={promoCode}
-              onChange={(event) => setPromoCode(event.target.value)}
-              placeholder="輸入推廣活動邀請碼（選填）"
-            />
-          </label>
           {isBeta && (
             <div className="claimable-token-field">
               <span>可領取的代幣</span>
-              <strong><TokenAmount value={tokenAmount} /></strong>
+              <strong>{requestedTokenAmount ? <TokenAmount value={requestedTokenAmount} /> : "輸入有效邀請碼"}</strong>
             </div>
           )}
-          <p className="form-note">
-            基本兌換率 HK$1：1 代幣；入金愈多，額外代幣百分比愈高。批准後代幣會加入帳戶；只有核實的付款會計入 VIP 累積入金。
-          </p>
+          {requestMethod === "promo" && (
+            <p className="form-note">
+              每位用戶每個完整邀請碼只可使用一次。批准後代幣會加入帳戶，活動獎勵不會計入 VIP 累積入金。
+            </p>
+          )}
           <button className="primary-btn" type="submit" disabled={submitting}>
             <FileImage size={18} />
             {submitting ? "提交中..." : "提交申請"}
           </button>
+          </>}
         </form>
       </section>
 
-      <section className="panel">
+      <section className="panel token-request-history-panel">
         <div className="section-heading compact">
           <Clock3 size={22} />
           <div>
@@ -3849,15 +4492,21 @@ function TokenRequest({ profile }) {
             <h2>我的代幣申請</h2>
           </div>
         </div>
-        <RequestList requests={requests} loading={requestsLoading} />
+        <div className="token-request-history-scroll" role="region" aria-label="我的代幣申請記錄" tabIndex="0">
+          <RequestList requests={requests} loading={requestsLoading} />
+        </div>
       </section>
       </div>
-      {isBeta && <VipProgramPanel deposit={cumulativeDeposit} tiers={vipTiers} />}
+      {isBeta && <VipProgramPanel deposit={cumulativeDeposit} profile={profile} rewards={vipRewards} tiers={vipTiers} />}
     </div>
   );
 }
 
-async function createProofInfo({ proof, profile }) {
+function getSafeProofName(proof) {
+  return proof.name.replace(/[^\w.-]+/g, "_").slice(0, 80) || "proof.jpg";
+}
+
+async function createProofInfo({ proof, profile, requestId }) {
   if (!proof) {
     throw new Error("請上傳 JPEG、PNG 或 WebP 付款證明。");
   }
@@ -3867,9 +4516,12 @@ async function createProofInfo({ proof, profile }) {
   if (!allowedTypes.has(contentType)) {
     throw new Error("付款證明必須是 JPEG、PNG 或 WebP 圖片。");
   }
+  if (proof.size > 2 * 1024 * 1024) {
+    throw new Error("付款證明圖片不可超過 2MB。");
+  }
 
-  const safeName = proof.name.replace(/[^\w.-]+/g, "_").slice(0, 80) || "proof.jpg";
-  const proofPath = `token-proofs/${profile.uid}/${Date.now()}-${safeName}`;
+  const safeName = getSafeProofName(proof);
+  const proofPath = `token-proofs/${profile.uid}/${requestId}`;
   const proofRef = ref(storage, proofPath);
   await uploadBytes(proofRef, proof, { contentType });
 
@@ -3917,16 +4569,16 @@ function RequestList({ requests, loading = false, adminMode = false, onApprove, 
               </a>
             )}
             {adminMode && request.status === "pending" && (
-              <>
                 <button className="small-btn" type="button" onClick={() => onApprove(request)}>
                   <Check size={15} />
                   批准
                 </button>
+            )}
+            {adminMode && ["awaiting_upload", "pending"].includes(request.status) && (
                 <button className="small-btn danger" type="button" onClick={() => onReject(request)}>
                   <X size={15} />
                   駁回
                 </button>
-              </>
             )}
           </div>
         </article>
@@ -3943,6 +4595,9 @@ function MyRecords({ profile }) {
   const [recordsError, setRecordsError] = useState("");
   const [recordsLoading, setRecordsLoading] = useState(true);
   const [historyRoomsLoading, setHistoryRoomsLoading] = useState(true);
+  const [activePage, setActivePage] = useState(1);
+  const [completedPage, setCompletedPage] = useState(1);
+  const [historyPage, setHistoryPage] = useState(1);
   const demoCards = useBetaDemoCards(Boolean(profile.isDemo));
 
   useEffect(() => {
@@ -4053,16 +4708,18 @@ function MyRecords({ profile }) {
     [records, roomsById, slotRecords],
   );
   const historyLoading = recordsLoading || historyRoomsLoading;
+  const activeRecords = mergedRecords.filter((record) => {
+    const room = roomsById[record.drawId];
+    return !record.cardId && isRoomPurchasable(room);
+  });
+  const completedRecords = mergedRecords.filter(
+    (record) => !activeRecords.some((active) => active.id === record.id),
+  );
+  const activeRecordsPage = getPaginationPage(activeRecords, activePage, MY_RECORDS_PAGE_SIZE);
+  const completedRecordsPage = getPaginationPage(completedRecords, completedPage, MY_RECORDS_PAGE_SIZE);
+  const allRecordsPage = getPaginationPage(mergedRecords, historyPage, MY_RECORDS_PAGE_SIZE);
 
   if (isBeta) {
-    const activeRecords = mergedRecords.filter((record) => {
-      const room = roomsById[record.drawId];
-      return !record.cardId && room?.status === "live";
-    });
-    const completedRecords = mergedRecords.filter(
-      (record) => !activeRecords.some((active) => active.id === record.id),
-    );
-
     return (
       <section className="panel beta-history-page">
         <div className="section-heading">
@@ -4081,7 +4738,7 @@ function MyRecords({ profile }) {
           <h2>正在抽卡</h2>
           {activeRecords.length ? (
             <div className="beta-active-record-grid">
-              {activeRecords.map((record) => (
+              {activeRecordsPage.items.map((record) => (
                 <article className="beta-active-record" key={record.id}>
                   <span className="beta-record-card-image">
                     {record.targetCardImageUrl || record.cardImageUrl ? (
@@ -4108,6 +4765,12 @@ function MyRecords({ profile }) {
           ) : (
             <p className="muted">暫時沒有正在抽卡的紀錄。</p>
           )}
+          <RecordPagination
+            label="正在抽卡"
+            page={activeRecordsPage.page}
+            totalPages={activeRecordsPage.totalPages}
+            onChange={setActivePage}
+          />
         </div>
         <div className="beta-history-section">
           <h2>已完成</h2>
@@ -4116,7 +4779,7 @@ function MyRecords({ profile }) {
               <div className="history-head">
                 <span>房間</span><span>中獎卡牌</span><span>天堂地獄號碼</span><span>售價</span><span>結果</span>
               </div>
-              {completedRecords.map((record) => (
+              {completedRecordsPage.items.map((record) => (
                 <article className="history-row" key={record.id}>
                   <span>{record.drawTitle || record.roomSlug || record.drawId}</span>
                   <span className="beta-history-card-cell">
@@ -4143,6 +4806,12 @@ function MyRecords({ profile }) {
           ) : (
             <p className="muted">暫時沒有已完成紀錄。</p>
           )}
+          <RecordPagination
+            label="已完成紀錄"
+            page={completedRecordsPage.page}
+            totalPages={completedRecordsPage.totalPages}
+            onChange={setCompletedPage}
+          />
         </div>
           </>
         )}
@@ -4171,7 +4840,7 @@ function MyRecords({ profile }) {
             <span>入場費</span>
             <span>狀態</span>
           </div>
-          {mergedRecords.map((record) => (
+          {allRecordsPage.items.map((record) => (
             <article className="history-row" key={record.id}>
               <span>{record.roomSlug || record.drawId}</span>
               <strong>{record.targetCardName || record.cardName || record.drawTitle}</strong>
@@ -4182,12 +4851,38 @@ function MyRecords({ profile }) {
               </span>
             </article>
           ))}
+          <RecordPagination
+            label="我的紀錄"
+            page={allRecordsPage.page}
+            totalPages={allRecordsPage.totalPages}
+            onChange={setHistoryPage}
+          />
         </div>
       ) : (
         <p className="muted">你已購買的抽卡號碼會顯示在這裡。</p>
       )}
     </section>
   );
+}
+
+// Keeps long user history readable without loading every row into one continuous page.
+function RecordPagination({ label, page, totalPages, onChange }) {
+  if (totalPages <= 1) return null;
+
+  return (
+    <nav className="record-pagination" aria-label={`${label}分頁`}>
+      <button type="button" disabled={page <= 1} onClick={() => onChange(page - 1)}>上一頁</button>
+      <span>第 {page} / {totalPages} 頁</span>
+      <button type="button" disabled={page >= totalPages} onClick={() => onChange(page + 1)}>下一頁</button>
+    </nav>
+  );
+}
+
+function getPaginationPage(items, requestedPage, pageSize) {
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const page = Math.min(Math.max(1, requestedPage), totalPages);
+  const startIndex = (page - 1) * pageSize;
+  return { items: items.slice(startIndex, startIndex + pageSize), page, totalPages };
 }
 
 function CollectionPage({ profile }) {
@@ -4201,37 +4896,15 @@ function CollectionPage({ profile }) {
   const [shippingForm, setShippingForm] = useState({
     name: "",
     phone: "",
+    region: "hong-kong",
     method: "sf-door",
     address: "",
     note: "",
   });
-  const [pickupSearch, setPickupSearch] = useState("");
-  const [pickupRegion, setPickupRegion] = useState("all");
-  const [pickupDistrict, setPickupDistrict] = useState("all");
-  const [selectedPickupCode, setSelectedPickupCode] = useState("");
   const [shippingBusy, setShippingBusy] = useState(false);
   const demoCards = useBetaDemoCards(Boolean(profile.isDemo));
-
-  // Build the second-level district menu from the currently selected territory.
-  const pickupDistricts = useMemo(() => (
-    [...new Set(
-      SF_PICKUP_POINTS
-        .filter((point) => pickupRegion === "all" || point.region === pickupRegion)
-        .map((point) => point.district),
-    )].sort((a, b) => a.localeCompare(b, "zh-HK"))
-  ), [pickupRegion]);
-
-  // Filter the bundled official SF Store list locally so the player never leaves the app.
-  const pickupResults = useMemo(() => {
-    const keyword = pickupSearch.trim().toLocaleLowerCase("zh-HK");
-    return SF_PICKUP_POINTS.filter((point) => {
-      const matchesRegion = pickupRegion === "all" || point.region === pickupRegion;
-      const matchesDistrict = pickupDistrict === "all" || point.district === pickupDistrict;
-      const searchableText = `${point.code} ${point.region} ${point.district} ${point.name} ${point.address}`
-        .toLocaleLowerCase("zh-HK");
-      return matchesRegion && matchesDistrict && (!keyword || searchableText.includes(keyword));
-    }).slice(0, 12);
-  }, [pickupDistrict, pickupRegion, pickupSearch]);
+  const shippingRegion = SHIPPING_REGIONS.find((region) => region.id === shippingForm.region)
+    || SHIPPING_REGIONS[0];
 
   useEffect(() => {
     if (profile.isDemo) {
@@ -4372,14 +5045,11 @@ function CollectionPage({ profile }) {
     setShippingForm({
       name: profile.displayName || profile.username || "",
       phone: profile.phoneNumber || "",
+      region: "hong-kong",
       method: "sf-door",
       address: "",
       note: "",
     });
-    setPickupSearch("");
-    setPickupRegion("all");
-    setPickupDistrict("all");
-    setSelectedPickupCode("");
   }
 
   async function submitShippingRequest(event) {
@@ -4388,8 +5058,11 @@ function CollectionPage({ profile }) {
       alert("請填寫收件人、電話及完整地址。");
       return;
     }
-    if (shippingForm.method === "sf-pickup" && !selectedPickupCode) {
-      alert("請從清單選擇順豐自提點。");
+    const validMethod = shippingRegion.sfAvailable
+      ? ["sf-door", "sf-pickup"].includes(shippingForm.method)
+      : shippingForm.method === "address-delivery";
+    if (!validMethod) {
+      alert("配送地區與配送方式不相符，請重新選擇。");
       return;
     }
     if (profile.isDemo) {
@@ -4407,6 +5080,7 @@ function CollectionPage({ profile }) {
           shippingRequested: true,
           shippingRecipient: shippingForm.name.trim(),
           shippingPhone: shippingForm.phone.trim(),
+          shippingRegion: shippingForm.region,
           shippingMethod: shippingForm.method,
           shippingAddress: shippingForm.address.trim(),
           shippingNote: shippingForm.note.trim(),
@@ -4511,9 +5185,19 @@ function CollectionPage({ profile }) {
                 <div>
                   <strong>{record.cardName}</strong>
                   {isBeta ? (
-                    <span className="collection-room-meta">
-                      {record.drawTitle || record.roomSlug || "抽卡房"} · {formatRoundLabel(record.round)}
-                    </span>
+                    <>
+                      <span className="collection-room-meta">
+                        {record.drawTitle || record.roomSlug || "抽卡房"} · {formatRoundLabel(record.round)}
+                      </span>
+                      {record.source !== "vip" && (
+                        <span className="collection-heaven-card">
+                          <small>當日所選天堂卡</small>
+                          <b title={record.targetCardName || "舊紀錄未有保存天堂卡名稱"}>
+                            {record.targetCardName || (record.resultSide === "heaven" ? record.cardName : "舊紀錄未記錄")}
+                          </b>
+                        </span>
+                      )}
+                    </>
                   ) : (
                     <>
                       <span>{record.cardCategory || "其他"}</span>
@@ -4590,101 +5274,54 @@ function CollectionPage({ profile }) {
             </button>
 
             <h2 id="shipping-dialog-title">申請配送</h2>
-            <p className="muted">共 {shippingIds.length} 張卡牌，請填寫順豐收件資料。</p>
+            <p className="muted">共 {shippingIds.length} 張卡牌，請選擇配送地區並填寫收件資料。</p>
             <form className="stack-form" onSubmit={submitShippingRequest}>
               <label>收件人姓名<input value={shippingForm.name} onChange={(event) => setShippingForm((current) => ({ ...current, name: event.target.value }))} required /></label>
               <label>聯絡電話<input type="tel" value={shippingForm.phone} onChange={(event) => setShippingForm((current) => ({ ...current, phone: event.target.value }))} required /></label>
               <label>
-                配送方式
+                配送地區
                 <select
-                  value={shippingForm.method}
+                  value={shippingForm.region}
                   onChange={(event) => {
-                    setShippingForm((current) => ({ ...current, method: event.target.value, address: "" }));
-                    setSelectedPickupCode("");
+                    const nextRegion = SHIPPING_REGIONS.find((region) => region.id === event.target.value);
+                    setShippingForm((current) => ({
+                      ...current,
+                      region: event.target.value,
+                      method: nextRegion?.sfAvailable ? "sf-door" : "address-delivery",
+                      address: "",
+                    }));
                   }}
                 >
-                  <option value="sf-door">順豐上門</option>
-                  <option value="sf-pickup">順豐自提點</option>
+                  {SHIPPING_REGIONS.map((region) => (
+                    <option value={region.id} key={region.id}>{region.label}</option>
+                  ))}
                 </select>
               </label>
-              {shippingForm.method === "sf-pickup" && (
-                <div className="sf-pickup-finder">
-                  <div className="sf-pickup-heading">
-                    <div>
-                      <strong>選擇順豐站</strong>
-                      <small>搜尋地區、街道、大廈或網點編號</small>
-                    </div>
-                    <span>{SF_PICKUP_POINTS.length} 個網點</span>
-                  </div>
-                  <div className="sf-pickup-search-row">
-                    <select
-                      value={pickupRegion}
-                      onChange={(event) => {
-                        setPickupRegion(event.target.value);
-                        setPickupDistrict("all");
-                      }}
-                      aria-label="篩選順豐站區域"
-                    >
-                      <option value="all">全港區域</option>
-                      <option value="香港島">香港島</option>
-                      <option value="九龍">九龍</option>
-                      <option value="新界">新界</option>
-                    </select>
-                    <select value={pickupDistrict} onChange={(event) => setPickupDistrict(event.target.value)} aria-label="篩選順豐站分區">
-                      <option value="all">所有分區</option>
-                      {pickupDistricts.map((district) => (
-                        <option value={district} key={district}>{district}</option>
-                      ))}
-                    </select>
-                    <label className="sf-pickup-search">
-                      <Search size={17} aria-hidden="true" />
-                      <input
-                        type="search"
-                        value={pickupSearch}
-                        onChange={(event) => setPickupSearch(event.target.value)}
-                        placeholder="例如：旺角、海港城、852E"
-                        aria-label="搜尋順豐站"
-                      />
-                    </label>
-                  </div>
-                  <div className="sf-pickup-results" role="listbox" aria-label="順豐站搜尋結果">
-                    {pickupResults.length ? pickupResults.map((point) => (
-                      <button
-                        className={`sf-pickup-option${selectedPickupCode === point.code ? " selected" : ""}`}
-                        type="button"
-                        role="option"
-                        aria-selected={selectedPickupCode === point.code}
-                        key={point.code}
-                        onClick={() => {
-                          setSelectedPickupCode(point.code);
-                          setShippingForm((current) => ({
-                            ...current,
-                            address: `${point.code}｜${point.name}\n${point.address}`,
-                          }));
-                        }}
-                      >
-                        <span className="sf-pickup-code">{point.code}</span>
-                        <span className="sf-pickup-details">
-                          <strong>{point.name}</strong>
-                          <small>{point.address}</small>
-                        </span>
-                        <Check size={18} aria-hidden="true" />
-                      </button>
-                    )) : (
-                      <p className="sf-pickup-empty">搵唔到相關順豐站，請試另一個地區或關鍵字。</p>
-                    )}
-                  </div>
-                  <p className="sf-pickup-source">順豐香港官方網點資料，更新：{SF_PICKUP_POINTS_UPDATED_AT}</p>
-                </div>
+              {shippingRegion.sfAvailable ? (
+                <label>
+                  配送方式
+                  <select
+                    value={shippingForm.method}
+                    onChange={(event) => setShippingForm((current) => ({ ...current, method: event.target.value, address: "" }))}
+                  >
+                    <option value="sf-door">順豐上門</option>
+                    <option value="sf-pickup">順豐自提點</option>
+                  </select>
+                </label>
+              ) : (
+                <p className="form-note shipping-region-note">請直接填寫{shippingRegion.label}完整收件地址。</p>
               )}
               <label>
-                {shippingForm.method === "sf-pickup" ? "已選自提點" : "配送地址"}
+                {shippingForm.method === "sf-pickup" ? "自提點資料" : "配送地址"}
                 <textarea
                   rows={3}
                   value={shippingForm.address}
                   onChange={(event) => setShippingForm((current) => ({ ...current, address: event.target.value }))}
-                  placeholder={shippingForm.method === "sf-pickup" ? "請從上方清單選擇順豐站" : "請輸入完整順豐配送地址"}
-                  readOnly={shippingForm.method === "sf-pickup"}
+                  placeholder={shippingForm.method === "sf-pickup"
+                    ? "請輸入香港順豐站、智能櫃或服務中心名稱、地址或編號"
+                    : shippingRegion.sfAvailable
+                      ? "請輸入香港完整順豐配送地址"
+                      : `請輸入${shippingRegion.label}完整收件地址`}
                   required
                 />
               </label>
@@ -4809,9 +5446,8 @@ function AdminPanel({ profile }) {
   }, [activeAdminSection]);
 
   async function approveRequest(request) {
-    // Review codes manually; only verified bank payments count towards VIP deposits.
+    // Promo requests can be approved directly; only verified bank payments count towards VIP deposits.
     const isPromo = request.proofMode === "promo";
-    if (isPromo && !window.confirm(`確認已人工核實活動碼「${request.promoCode}」的有效性、使用資格及使用紀錄，並批准 ${formatTokenNumber(request.amount)} 代幣？活動碼獎勵不計入 VIP 入金。`)) return;
     const verifiedInput = isPromo ? "0" : window.prompt("請先核對銀行實際入帳及付款證明，再輸入實際收到的港幣金額：");
     if (verifiedInput === null) return;
     const verifiedHkdAmount = Number(verifiedInput);
@@ -4828,7 +5464,7 @@ function AdminPanel({ profile }) {
         const userSnap = await transaction.get(userRef);
         const packagesSnap = await transaction.get(doc(db, "settings", "tokenPackages"));
 
-        if (!requestSnap.exists() || requestSnap.data().status !== "pending") {
+        if (!requestSnap.exists() || !["awaiting_upload", "pending"].includes(requestSnap.data().status)) {
           throw new Error("This request has already been reviewed.");
         }
         if (!userSnap.exists()) {
@@ -4839,6 +5475,21 @@ function AdminPanel({ profile }) {
         if (requestData.proofMode !== request.proofMode || requestData.promoCode !== request.promoCode || requestData.amount !== request.amount) {
           throw new Error("申請資料已變更，請重新審核。");
         }
+        if (isPromo) {
+          const promoSnapshot = await transaction.get(doc(db, "promoCodes", requestData.promoCodeId || "invalid"));
+          const redemptionSnapshot = await transaction.get(doc(
+            db,
+            "promoRedemptions",
+            getPromoRedemptionId(requestData.promoCodeId || "invalid", requestData.uid),
+          ));
+          if (!promoSnapshot.exists() || promoSnapshot.data().active !== true
+            || promoSnapshot.data().code !== requestData.promoCode
+            || Number(promoSnapshot.data().amount || 0) !== Number(requestData.amount || 0)
+            || !redemptionSnapshot.exists()
+            || redemptionSnapshot.data().requestId !== request.id) {
+            throw new Error("邀請碼未啟用、資料不符，或缺少使用紀錄，暫時不可批准。");
+          }
+        }
         const userData = userSnap.data();
         const packageSettings = packagesSnap.exists() ? packagesSnap.data() : null;
         const approvedTokens = getVerifiedTokenGrant(requestData, verifiedHkdAmount, packageSettings);
@@ -4848,8 +5499,7 @@ function AdminPanel({ profile }) {
         const attainedTiers = isPromo ? [] : vipTiers.filter(
           (tier, index) =>
             index > previousVipLevel &&
-            index <= vipState.currentIndex &&
-            tier.rewardCardId,
+            index <= vipState.currentIndex,
         );
 
         transaction.update(requestRef, {
@@ -4865,6 +5515,10 @@ function AdminPanel({ profile }) {
           totalDeposits,
           vipLevel: isPromo ? previousVipLevel : vipState.currentIndex,
           lastVipRewardTier: attainedTiers.at(-1)?.id || userData.lastVipRewardTier || "",
+          ...(requestData.quotaVersion === 1 ? {
+            pendingTokenRequestCount: Math.max(0, Number(userData.pendingTokenRequestCount || 0) - 1),
+            lastTokenRequestClosedId: request.id,
+          } : {}),
           updatedAt: serverTimestamp(),
         });
 
@@ -4879,6 +5533,7 @@ function AdminPanel({ profile }) {
           transaction.set(rewardRef, {
             source: "vip",
             vipTierId: tier.id,
+            vipTierIndex: vipTiers.findIndex((item) => item.id === tier.id),
             uid: request.uid,
             username: requestData.username || userData.username || "VIP member",
             drawId: "vip-program",
@@ -4889,18 +5544,12 @@ function AdminPanel({ profile }) {
             roundSort: 0,
             number: vipTiers.findIndex((item) => item.id === tier.id) + 1,
             tokenCost: 0,
-            targetCardId: tier.rewardCardId,
+            targetCardId: getVipRewardCardId(tier),
             targetCardName: rewardName,
             targetCardImageUrl: rewardImageUrl,
             targetCardValue: rewardConversionValue,
-            cardId: tier.rewardCardId,
-            cardName: rewardName,
-            cardCategory: "VIP 獎勵",
-            cardImageUrl: rewardImageUrl,
-            cardValue: rewardConversionValue,
-            cardConversionValue: rewardConversionValue,
-            collectionStatus: "pending",
-            assignedAt: serverTimestamp(),
+            vipRewardStatus: "claimable",
+            unlockedAt: serverTimestamp(),
             assignedBy: profile.uid,
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
@@ -4917,11 +5566,30 @@ function AdminPanel({ profile }) {
     if (reason === null) return;
 
     try {
-      await updateDoc(doc(db, "tokenRequests", request.id), {
-        status: "rejected",
-        adminNote: reason,
-        reviewedAt: serverTimestamp(),
-        reviewedBy: profile.uid,
+      await runTransaction(db, async (transaction) => {
+        const requestRef = doc(db, "tokenRequests", request.id);
+        const requestSnap = await transaction.get(requestRef);
+        if (!requestSnap.exists() || requestSnap.data().status !== "pending") {
+          throw new Error("這個申請已經處理。");
+        }
+        const requestData = requestSnap.data();
+        const userRef = requestData.quotaVersion === 1 ? doc(db, "users", requestData.uid) : null;
+        const userSnap = userRef ? await transaction.get(userRef) : null;
+        if (userRef && !userSnap.exists()) throw new Error("找不到申請用戶。");
+
+        transaction.update(requestRef, {
+          status: "rejected",
+          adminNote: reason,
+          reviewedAt: serverTimestamp(),
+          reviewedBy: profile.uid,
+        });
+        if (userRef && userSnap) {
+          transaction.update(userRef, {
+            pendingTokenRequestCount: Math.max(0, Number(userSnap.data().pendingTokenRequestCount || 0) - 1),
+            lastTokenRequestClosedId: request.id,
+            updatedAt: serverTimestamp(),
+          });
+        }
       });
     } catch (error) {
       showSafeError(error, "未能駁回申請，請稍後再試。");
@@ -4997,6 +5665,11 @@ function AdminPanel({ profile }) {
       {activeAdminSection === "packages" && (
         <div className="admin-section narrow-admin-section">
           <TokenPackageManager profile={profile} />
+        </div>
+      )}
+      {activeAdminSection === "promos" && (
+        <div className="admin-section narrow-admin-section">
+          <PromoCodeManager profile={profile} />
         </div>
       )}
       {isBeta && activeAdminSection === "payment" && (
@@ -5076,10 +5749,69 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
   const [draftSides, setDraftSides] = useState({});
   const [previewOpen, setPreviewOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [legacySyncMessage, setLegacySyncMessage] = useState("");
+  const legacySyncKeyRef = useRef("");
   const purchaseRecords = useMemo(
     () => records.filter((record) => record.uid && record.number).sort(compareRoomRoundRecords),
     [records],
   );
+
+  // Older assignments stored the result only on each private purchase record.
+  // Copy missing sides into the public room summary without replacing newer saved results.
+  useEffect(() => {
+    if (loading || !profile?.uid || !draws.length || !purchaseRecords.length) return;
+
+    const drawsById = new Map(draws.map((draw) => [draw.id, draw]));
+    const repairsByDraw = new Map();
+    purchaseRecords.forEach((record) => {
+      if (!record.cardId || !["heaven", "hell"].includes(record.resultSide)) return;
+      const draw = drawsById.get(record.drawId);
+      if (!draw || draw.status !== "completed") return;
+      const roundId = record.round || "round-001";
+      const number = String(record.number);
+      const savedSides = draw.roundResultSides?.[roundId] || {};
+      if (["heaven", "hell"].includes(savedSides[number])) return;
+
+      if (!repairsByDraw.has(draw.id)) repairsByDraw.set(draw.id, new Map());
+      const roundRepairs = repairsByDraw.get(draw.id);
+      if (!roundRepairs.has(roundId)) roundRepairs.set(roundId, { ...savedSides });
+      if (!roundRepairs.get(roundId)[number]) {
+        roundRepairs.get(roundId)[number] = record.resultSide;
+      }
+    });
+
+    if (!repairsByDraw.size) return;
+    const syncKey = JSON.stringify(Array.from(repairsByDraw, ([drawId, rounds]) => [
+      drawId,
+      Array.from(rounds, ([roundId, sides]) => [roundId, sides]),
+    ]));
+    if (legacySyncKeyRef.current === syncKey) return;
+    legacySyncKeyRef.current = syncKey;
+    setLegacySyncMessage("正在同步舊天堂／地獄記錄到封存頁...");
+
+    const syncLegacyResults = async () => {
+      const entries = Array.from(repairsByDraw.entries());
+      for (let start = 0; start < entries.length; start += 400) {
+        const batch = writeBatch(db);
+        entries.slice(start, start + 400).forEach(([drawId, rounds]) => {
+          const updates = { updatedAt: serverTimestamp(), updatedBy: profile.uid };
+          rounds.forEach((sides, roundId) => {
+            updates[`roundResultSides.${roundId}`] = sides;
+          });
+          batch.update(doc(db, "draws", drawId), updates);
+        });
+        await batch.commit();
+      }
+      const repairedRounds = Array.from(repairsByDraw.values())
+        .reduce((total, rounds) => total + rounds.size, 0);
+      setLegacySyncMessage(`已同步 ${repairedRounds} 個舊場次，封存頁會顯示天堂／地獄。`);
+    };
+
+    syncLegacyResults().catch((error) => {
+      legacySyncKeyRef.current = "";
+      setLegacySyncMessage(`未能同步舊賽果：${getSafeErrorMessage(error)}`);
+    });
+  }, [draws, loading, profile?.uid, purchaseRecords]);
   const sessions = useMemo(() => {
     const sessionMap = new Map();
     purchaseRecords.forEach((record) => {
@@ -5252,6 +5984,7 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
           <p className="muted">一次標記所有已售號碼嘅天堂／地獄結果，預覽完整表格後先正式確認。</p>
         </div>
       </div>
+      {legacySyncMessage && <p className="form-note">{legacySyncMessage}</p>}
       {sessions.length ? (
         <>
           <div className="batch-result-toolbar">
@@ -5281,6 +6014,14 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
               return (
                 <article className={`batch-number-result ${side || "unselected"} ${record?.cardId ? "locked" : ""}`} key={number}>
                   <header><strong>#{number}</strong><small>{record.username || "已售"}</small></header>
+                  <p className="batch-number-target" title={record.targetCardName || "未記錄所選卡牌"}>
+                    {record.targetCardImageUrl ? (
+                      <img src={record.targetCardImageUrl} alt="" loading="lazy" decoding="async" />
+                    ) : (
+                      <span aria-hidden="true"><Package size={14} /></span>
+                    )}
+                    <span><small>所選卡牌</small><strong>{record.targetCardName || "未記錄"}</strong></span>
+                  </p>
                   <div>
                     <button className={side === "heaven" ? "active" : ""} type="button" onClick={() => chooseSide(number, "heaven")} disabled={Boolean(record?.cardId)}>天堂</button>
                     <button className={side === "hell" ? "active" : ""} type="button" onClick={() => chooseSide(number, "hell")} disabled={Boolean(record?.cardId)}>地獄</button>
@@ -5327,6 +6068,7 @@ function AdminRoundResultConfirmModal({ drawTitle, roundId, numberList, recordsB
                 <strong>#{number}</strong>
                 <span>{side === "heaven" ? "天堂" : "地獄"}</span>
                 <small>{record.username || "已售"}</small>
+                <em title={record.targetCardName || "未記錄所選卡牌"}>所選：{record.targetCardName || "未記錄"}</em>
               </div>
             );
           })}
@@ -5430,7 +6172,8 @@ function ShippingRequestManager({ records, loading = false }) {
                 <div><dt>電話</dt><dd>{record.shippingPhone || "--"}</dd></div>
               </dl>
               <dl className="shipping-address-details">
-                <div><dt>配送方式</dt><dd>{record.shippingMethod === "sf-pickup" ? "順豐自提點" : "順豐上門"}</dd></div>
+                <div><dt>配送地區</dt><dd>{getShippingRegionLabel(record.shippingRegion)}</dd></div>
+                <div><dt>配送方式</dt><dd>{getShippingMethodLabel(record.shippingMethod)}</dd></div>
                 <div className="shipping-address-row"><dt>地址</dt><dd>{record.shippingAddress || "--"}</dd></div>
                 {record.shippingNote && <div className="shipping-address-row"><dt>備註</dt><dd>{record.shippingNote}</dd></div>}
               </dl>
@@ -5740,24 +6483,14 @@ function UserRecordAuditModal({ records, user, onClose }) {
   );
 }
 
-// Beta uses one permanent live hall; older draw documents stay untouched as historical records.
+// New dates are managed as rounds in one hall; legacy scheduled rooms remain editable until completed.
 function SingleLiveManagement({ cards, draws, loading = false, profile }) {
   const live = draws.find((draw) => draw.status === "live")
     || draws.find((draw) => draw.status === "draft")
-    || draws[0]
+    || draws.find((draw) => draw.status === "scheduled")
     || null;
   const archivedLives = draws.filter((draw) => draw.id !== live?.id && draw.status === "completed");
-  const [title, setTitle] = useState(live?.title || "LiveDraw 直播抽卡大廳");
-  const [kickUrl, setKickUrl] = useState(live?.kickUrl || "");
-  const [status, setStatus] = useState(live?.status || "draft");
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    setTitle(live?.title || "LiveDraw 直播抽卡大廳");
-    setKickUrl(live?.kickUrl || "");
-    setStatus(live?.status || "draft");
-  }, [live?.id, live?.kickUrl, live?.status, live?.title]);
-
+  const scheduledLives = getScheduledLiveRooms(draws);
   if (loading) return <InlineLoading label="正在載入直播設定..." />;
 
   if (!live) {
@@ -5772,103 +6505,22 @@ function SingleLiveManagement({ cards, draws, loading = false, profile }) {
     );
   }
 
-  const currentRoundId = toRoundId(getRoomCurrentRound(live));
-  const buyingBlocked = isRoundBuyingBlocked(live, currentRoundId);
-  const detailsChanged =
-    title.trim() !== String(live.title || "") ||
-    getKickChannel(kickUrl) !== String(live.kickUrl || "") ||
-    status !== String(live.status || "draft");
-
-  async function saveLiveDetails() {
-    const cleanTitle = title.trim();
-    const cleanKickChannel = getKickChannel(kickUrl);
-    if (!cleanTitle) {
-      alert("請輸入直播名稱。");
-      return;
-    }
-    if (!cleanKickChannel) {
-      alert("請輸入有效的 Kick 頻道名稱。");
-      return;
-    }
-
-    setSaving(true);
-    try {
-      await updateDoc(doc(db, "draws", live.id), {
-        title: cleanTitle,
-        kickUrl: cleanKickChannel,
-        status,
-        updatedAt: serverTimestamp(),
-        updatedBy: profile.uid,
-      });
-    } catch (error) {
-      showSafeError(error);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function toggleBuying() {
-    const nextBlockedRounds = buyingBlocked
-      ? (live.buyingBlockedRounds || []).filter((roundId) => roundId !== currentRoundId)
-      : [...new Set([...(live.buyingBlockedRounds || []), currentRoundId])];
-    const action = buyingBlocked ? "重新開放" : "停止";
-    if (!window.confirm(`確認${action}${formatRoundLabel(currentRoundId)}購買？`)) return;
-
-    try {
-      await updateDoc(doc(db, "draws", live.id), {
-        buyingBlockedRounds: nextBlockedRounds,
-        buyingBlockedRound: buyingBlocked ? "" : currentRoundId,
-        updatedAt: serverTimestamp(),
-      });
-    } catch (error) {
-      showSafeError(error);
-    }
-  }
-
   return (
     <div className="single-live-admin">
-      <section className="panel single-live-settings">
+      <section className="panel single-live-section">
         <div className="section-heading compact">
-          <Gavel size={22} />
-          <div>
-            <h2>唯一直播大廳</h2>
-            <p className="muted">所有直播日期、場次、號碼及賽果都使用同一個直播。</p>
-          </div>
+          <Clock3 size={22} />
+          <div><h2>直播日期、場次與賽果</h2><p className="muted">未來直播以場次加入同一個大廳，每場都可以獨立設定時間、機率及賽果相片。</p></div>
         </div>
-        <div className="single-live-form">
-          <label>
-            直播名稱
-            <input value={title} onChange={(event) => setTitle(event.target.value)} />
-          </label>
-          <label>
-            Kick 頻道名稱
-            <input value={kickUrl} onChange={(event) => setKickUrl(event.target.value)} placeholder="例如 livedrawtcg" />
-          </label>
-          <label>
-            直播狀態
-            <select value={status} onChange={(event) => setStatus(event.target.value)}>
-              <option value="draft">未開播</option>
-              <option value="live">直播中</option>
-              <option value="completed">已暫停</option>
-            </select>
-          </label>
-          <button className="primary-btn" type="button" onClick={saveLiveDetails} disabled={saving || !detailsChanged}>
-            <Save size={16} />{saving ? "儲存中..." : "儲存直播設定"}
-          </button>
-          <button className={buyingBlocked ? "small-btn" : "small-btn danger"} type="button" onClick={toggleBuying}>
-            <Lock size={15} />{buyingBlocked ? "重開本場購買" : "停止本場購買"}
-          </button>
-        </div>
+        <AddBroadcastForm cards={cards} currentLive={live} profile={profile} />
+        <LiveRoundSettingsList
+          allDraws={draws}
+          cards={cards}
+          currentLive={live}
+          profile={profile}
+          scheduledLives={scheduledLives}
+        />
       </section>
-      <section className="panel single-live-section">
-        <div className="section-heading compact"><Clock3 size={22} /><div><h2>直播日期、場次與賽果</h2></div></div>
-        <RoomRoundSettings draw={live} />
-      </section>
-      <section className="panel single-live-section">
-        <div className="section-heading compact"><Boxes size={22} /><div><h2>直播卡池</h2></div></div>
-        <RoomPoolEditor draw={live} cards={cards} singleLive />
-      </section>
-      <NewLiveSessionForm cards={cards} currentLive={live} draws={draws} profile={profile} />
       {archivedLives.length > 0 && (
         <section className="panel single-live-section admin-live-archive">
           <div className="section-heading compact">
@@ -5889,25 +6541,333 @@ function SingleLiveManagement({ cards, draws, loading = false, profile }) {
   );
 }
 
-// Atomically archives active sessions and creates a clean live session with fresh round slots.
-function NewLiveSessionForm({ cards, currentLive, draws, profile }) {
+function BroadcastDetailsEditor({ draw, profile }) {
+  const [title, setTitle] = useState(draw.title || "LiveDraw 直播抽卡大廳");
+  const [kickUrl, setKickUrl] = useState(draw.kickUrl || "");
+  const [saving, setSaving] = useState(false);
+  const currentRoundId = toRoundId(getRoomCurrentRound(draw));
+  const buyingBlocked = isRoundBuyingBlocked(draw, currentRoundId);
+  const detailsChanged =
+    title.trim() !== String(draw.title || "") ||
+    getKickChannel(kickUrl) !== String(draw.kickUrl || "");
+
+  useEffect(() => {
+    setTitle(draw.title || "LiveDraw 直播抽卡大廳");
+    setKickUrl(draw.kickUrl || "");
+  }, [draw.id, draw.kickUrl, draw.title]);
+
+  async function saveDetails() {
+    const cleanTitle = title.trim();
+    const cleanKickChannel = getKickChannel(kickUrl);
+    if (!cleanTitle) {
+      alert("請輸入直播名稱。");
+      return;
+    }
+    if (!cleanKickChannel) {
+      alert("請輸入有效的 Kick 頻道名稱。");
+      return;
+    }
+    setSaving(true);
+    try {
+      await updateDoc(doc(db, "draws", draw.id), {
+        title: cleanTitle,
+        kickUrl: cleanKickChannel,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      });
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function toggleBuying() {
+    const nextBlockedRounds = buyingBlocked
+      ? (draw.buyingBlockedRounds || []).filter((roundId) => roundId !== currentRoundId)
+      : [...new Set([...(draw.buyingBlockedRounds || []), currentRoundId])];
+    const action = buyingBlocked ? "重新開放" : "停止";
+    if (!window.confirm(`確認${action}${formatRoundLabel(currentRoundId)}購買？`)) return;
+
+    try {
+      await updateDoc(doc(db, "draws", draw.id), {
+        buyingBlockedRounds: nextBlockedRounds,
+        buyingBlockedRound: buyingBlocked ? "" : currentRoundId,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      showSafeError(error);
+    }
+  }
+
+  return (
+    <div className="live-broadcast-detail-editor">
+      <label>
+        直播名稱
+        <input value={title} onChange={(event) => setTitle(event.target.value)} />
+      </label>
+      <label>
+        Kick 頻道名稱
+        <input value={kickUrl} onChange={(event) => setKickUrl(event.target.value)} placeholder="例如 livedrawtcg" />
+      </label>
+      <button className="primary-btn" type="button" onClick={saveDetails} disabled={saving || !detailsChanged}>
+        <Save size={16} />{saving ? "儲存中..." : "儲存直播設定"}
+      </button>
+      {draw.status === "live" && (
+        <button className={buyingBlocked ? "small-btn" : "small-btn danger"} type="button" onClick={toggleBuying}>
+          <Lock size={15} />{buyingBlocked ? "重開本場購買" : "停止本場購買"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Creates independently purchasable future broadcasts and promotes them without losing preorders.
+export function FutureLiveScheduleManager({ draw, draws, profile }) {
+  const [title, setTitle] = useState("LiveDraw 直播");
+  const [liveDate, setLiveDate] = useState(() => getDateInputValue(addLocalDays(new Date(), 1)));
+  const [liveHour, setLiveHour] = useState("20");
+  const [liveMinute, setLiveMinute] = useState("00");
+  const [saving, setSaving] = useState(false);
+  const futureLives = getScheduledLiveRooms(draws);
+  const selectedDate = buildLocalDateTime(liveDate, liveHour, liveMinute);
+
+  async function addFutureLive(event) {
+    event.preventDefault();
+    const cleanTitle = title.trim();
+    const date = buildLocalDateTime(liveDate, liveHour, liveMinute);
+    if (!cleanTitle || !date) {
+      alert("請輸入直播名稱同日期時間。");
+      return;
+    }
+    if (date.getTime() <= Date.now()) {
+      alert("未來直播時間必須遲過而家。");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const newDrawRef = doc(collection(db, "draws"));
+      const totalRounds = getRoomRoundCount(draw);
+      const cardCount = Math.max(4, Math.min(100, Math.round(Number(draw.cardCount) || 20)));
+      const shareMode = String(draw.shareMode || "1/2");
+      const poolCards = normalizeRoomCards(draw.poolCards).map(roomCardPayload);
+      const roundSchedules = Object.fromEntries(
+        rangeNumbers(1, totalRounds).map((roundNumber) => [
+          toRoundId(roundNumber),
+          new Date(date.getTime() + (roundNumber - 1) * 40 * 60 * 1000).toISOString(),
+        ]),
+      );
+      const roundShareModes = Object.fromEntries(
+        rangeNumbers(1, totalRounds).map((roundNumber) => [toRoundId(roundNumber), shareMode]),
+      );
+
+      await setDoc(newDrawRef, {
+        title: cleanTitle,
+        slug: normalizeSlug(`${cleanTitle}-${Date.now()}`),
+        kickUrl: String(draw.kickUrl || ""),
+        cardCount,
+        tokenCost: Number(draw.tokenCost || 10),
+        totalRounds,
+        currentRound: 1,
+        round: toRoundId(1),
+        status: "scheduled",
+        scheduledAt: Timestamp.fromDate(date),
+        preorderOpen: true,
+        shareMode,
+        roundShareModes,
+        roundSchedules,
+        futureLives: [],
+        roundResultImages: {},
+        buyingBlockedRounds: [],
+        buyingBlockedRound: "",
+        poolText: String(draw.poolText || ""),
+        poolCards,
+        poolCardIds: poolCards.length
+          ? poolCards.map((card) => card.id).filter(Boolean)
+          : Array.isArray(draw.poolCardIds) ? draw.poolCardIds : [],
+        poolCardValues: poolCards.length
+          ? Object.fromEntries(poolCards.filter((card) => card.id).map((card) => [card.id, Number(card.tokenValue || 0)]))
+          : draw.poolCardValues || {},
+        thumbnailUrl: "",
+        roomLink: makeRoomLink(newDrawRef.id),
+        previousLiveId: draw.id,
+        createdBy: profile.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      });
+      await ensureRoomRoundSlots(newDrawRef.id, rangeNumbers(1, totalRounds), cardCount);
+      setTitle("LiveDraw 直播");
+      setLiveDate(getDateInputValue(addLocalDays(new Date(), 1)));
+      setLiveHour("20");
+      setLiveMinute("00");
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeFutureLive(item) {
+    if (!window.confirm(`確認取消「${item.title}」？只有未有預購記錄嘅直播先可以取消。`)) return;
+    setSaving(true);
+    try {
+      const purchases = await getDocs(query(collection(db, "drawRecords"), where("drawId", "==", item.id)));
+      if (!purchases.empty) {
+        alert("呢個未來直播已經有預購記錄，唔可以取消。請先處理相關訂單。");
+        return;
+      }
+      await updateDoc(doc(db, "draws", item.id), {
+        status: "cancelled",
+        preorderOpen: false,
+        cancelledAt: serverTimestamp(),
+        cancelledBy: profile.uid,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function startFutureLive(item) {
+    if (!window.confirm(`確認開始「${item.title}」？目前直播會封存，預購號碼會完整保留。`)) return;
+    setSaving(true);
+    try {
+      const batch = writeBatch(db);
+      draws.filter((candidate) => candidate.status === "live").forEach((candidate) => {
+        batch.update(doc(db, "draws", candidate.id), {
+          status: "completed",
+          archivedAt: serverTimestamp(),
+          archivedBy: profile.uid,
+          updatedAt: serverTimestamp(),
+        });
+      });
+      batch.update(doc(db, "draws", item.id), {
+        status: "live",
+        preorderOpen: true,
+        startedAt: serverTimestamp(),
+        chatStartedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      });
+      await batch.commit();
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="future-live-admin">
+      <form className="future-live-form" onSubmit={addFutureLive}>
+        <label className="future-live-title-field">
+          直播名稱
+          <input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={80} required />
+        </label>
+        <fieldset className="future-live-picker" aria-label="直播日期及時間">
+          <div className="future-live-picker-controls">
+            <label>
+              <span>日期</span>
+              <input
+                type="date"
+                min={getDateInputValue(new Date())}
+                value={liveDate}
+                onChange={(event) => setLiveDate(event.target.value)}
+                required
+              />
+            </label>
+            <label>
+              <span>時</span>
+              <select value={liveHour} onChange={(event) => setLiveHour(event.target.value)}>
+                {Array.from({ length: 24 }, (_, hour) => String(hour).padStart(2, "0")).map((hour) => (
+                  <option key={hour} value={hour}>{hour}</option>
+                ))}
+              </select>
+            </label>
+            <span className="future-live-time-separator" aria-hidden="true">:</span>
+            <label>
+              <span>分</span>
+              <select value={liveMinute} onChange={(event) => setLiveMinute(event.target.value)}>
+                {["00", "15", "30", "45"].map((minute) => (
+                  <option key={minute} value={minute}>{minute}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </fieldset>
+        <output className="future-live-picker-preview">
+          <Clock3 size={14} />
+          {selectedDate ? formatFutureLiveDate(selectedDate) : "請選擇日期及時間"}
+        </output>
+        <button className="primary-btn future-live-submit" type="submit" disabled={saving}>
+          <Plus size={16} />{saving ? "儲存中..." : "新增未來直播"}
+        </button>
+      </form>
+      {futureLives.length ? (
+        <div className="future-live-admin-list">
+          {futureLives.map((item) => (
+            <article key={item.id}>
+              <div>
+                <strong>{item.title}</strong>
+                <span>{formatFutureLiveDate(item.scheduledDate)} · 獨立直播 · 預購已開放</span>
+              </div>
+              <div className="future-live-admin-actions">
+                <a className="small-btn" href={makeRoomLink(item.id)} target="_blank" rel="noreferrer">前台查看</a>
+                <button className="primary-btn" type="button" onClick={() => startFutureLive(item)} disabled={saving}>
+                  <Zap size={15} />開始直播
+                </button>
+                <button className="small-btn danger" type="button" onClick={() => removeFutureLive(item)} disabled={saving}>
+                  <Trash2 size={15} />取消
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : <p className="muted future-live-empty">暫時未設定未來直播。</p>}
+    </div>
+  );
+}
+
+// Creates an independent scheduled broadcast without changing the current live session.
+function AddBroadcastForm({ cards, currentLive, profile }) {
   const now = new Date();
-  const localDateTime = new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const initialDate = addLocalDays(now, 1);
+  initialDate.setHours(20, 0, 0, 0);
+  const localDateTime = new Date(initialDate.getTime() - initialDate.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const [open, setOpen] = useState(false);
   const [title, setTitle] = useState(`${new Intl.DateTimeFormat("zh-HK", { month: "2-digit", day: "2-digit" }).format(now)} LiveDraw 直播`);
   const [kickUrl, setKickUrl] = useState(currentLive?.kickUrl || "");
   const [firstRoundAt, setFirstRoundAt] = useState(localDateTime);
   const [totalRounds, setTotalRounds] = useState("6");
   const [cardCount, setCardCount] = useState(String(currentLive?.cardCount || 20));
   const [shareMode, setShareMode] = useState("1/2");
-  const [copyPool, setCopyPool] = useState(true);
+  const [selectedCardIds, setSelectedCardIds] = useState(() => getRoomPoolIds(currentLive));
+  const [cardSearch, setCardSearch] = useState("");
   const [creating, setCreating] = useState(false);
+  const filteredCards = useMemo(
+    () => filterCards(cards, cardSearch),
+    [cards, cardSearch],
+  );
 
   useEffect(() => {
     setKickUrl(currentLive?.kickUrl || "");
     setCardCount(String(currentLive?.cardCount || 20));
-  }, [currentLive?.cardCount, currentLive?.id, currentLive?.kickUrl]);
+    setSelectedCardIds(getRoomPoolIds(currentLive));
+  }, [currentLive]);
 
-  async function createNewLive(event) {
+  function togglePoolCard(cardId) {
+    setSelectedCardIds((current) =>
+      current.includes(cardId)
+        ? current.filter((id) => id !== cardId)
+        : [...current, cardId],
+    );
+  }
+
+  async function createBroadcast(event) {
     event.preventDefault();
     const cleanTitle = title.trim();
     const cleanKickChannel = getKickChannel(kickUrl);
@@ -5918,19 +6878,21 @@ function NewLiveSessionForm({ cards, currentLive, draws, profile }) {
       alert("請輸入直播名稱、有效 Kick 頻道及首場時間。");
       return;
     }
-    if (!window.confirm("確認封存現有直播並開啟全新直播？舊直播紀錄會保留，新的場次及號碼會由空白開始。")) return;
+    if (firstRoundDate.getTime() <= Date.now()) {
+      alert("首場時間必須遲過而家。");
+      return;
+    }
+    if (!selectedCardIds.length) {
+      alert("請最少選擇一張直播卡牌。");
+      return;
+    }
 
     setCreating(true);
     try {
       const newDrawRef = doc(collection(db, "draws"));
-      const batch = writeBatch(db);
-      const archivedDraws = draws.filter((draw) => ["live", "draft"].includes(draw.status));
-      const sourcePoolCards = copyPool ? normalizeRoomCards(currentLive?.poolCards) : [];
-      const poolCards = sourcePoolCards.length
-        ? sourcePoolCards
-        : copyPool
-          ? cards.filter((card) => (currentLive?.poolCardIds || []).includes(card.id)).map(roomCardPayload)
-          : [];
+      const poolCards = cards
+        .filter((card) => selectedCardIds.includes(card.id))
+        .map(roomCardPayload);
       const roundSchedules = Object.fromEntries(
         rangeNumbers(1, cleanTotalRounds).map((roundNumber) => [
           toRoundId(roundNumber),
@@ -5941,15 +6903,7 @@ function NewLiveSessionForm({ cards, currentLive, draws, profile }) {
         rangeNumbers(1, cleanTotalRounds).map((roundNumber) => [toRoundId(roundNumber), shareMode]),
       );
 
-      archivedDraws.forEach((draw) => {
-        batch.update(doc(db, "draws", draw.id), {
-          status: "completed",
-          archivedAt: serverTimestamp(),
-          archivedBy: profile.uid,
-          updatedAt: serverTimestamp(),
-        });
-      });
-      batch.set(newDrawRef, {
+      await setDoc(newDrawRef, {
         title: cleanTitle,
         slug: normalizeSlug(`${cleanTitle}-${Date.now()}`),
         kickUrl: cleanKickChannel,
@@ -5958,28 +6912,30 @@ function NewLiveSessionForm({ cards, currentLive, draws, profile }) {
         totalRounds: cleanTotalRounds,
         currentRound: 1,
         round: toRoundId(1),
-        status: "live",
+        status: "scheduled",
+        scheduledAt: Timestamp.fromDate(firstRoundDate),
+        preorderOpen: true,
         shareMode,
         roundShareModes,
         roundSchedules,
+        futureLives: [],
         roundResultImages: {},
         buyingBlockedRounds: [],
         buyingBlockedRound: "",
-        poolText: copyPool ? String(currentLive?.poolText || "") : "",
+        poolText: String(currentLive?.poolText || ""),
         poolCards,
         poolCardIds: poolCards.map((card) => card.id).filter(Boolean),
         poolCardValues: Object.fromEntries(poolCards.filter((card) => card.id).map((card) => [card.id, Number(card.tokenValue || 0)])),
         thumbnailUrl: "",
         roomLink: makeRoomLink(newDrawRef.id),
         previousLiveId: currentLive?.id || "",
-        chatStartedAt: serverTimestamp(),
         createdBy: profile.uid,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      await batch.commit();
       await ensureRoomRoundSlots(newDrawRef.id, rangeNumbers(1, cleanTotalRounds), cleanCardCount);
-      alert("新直播已建立；舊直播已安全封存。新場次、號碼及聊天室均由空白開始。");
+      setOpen(false);
+      alert("新直播已加入直播列表，狀態為直播預告；目前直播不受影響。");
     } catch (error) {
       showSafeError(error);
     } finally {
@@ -5988,22 +6944,51 @@ function NewLiveSessionForm({ cards, currentLive, draws, profile }) {
   }
 
   return (
-    <section className="panel single-live-section new-live-session">
-      <div className="section-heading compact">
-        <Plus size={22} />
-        <div><h2>開新直播</h2><p className="muted">現有直播會封存；玩家紀錄、場次、號碼及賽果全部保留。</p></div>
-      </div>
-      <form className="new-live-session-form" onSubmit={createNewLive}>
+    <div className={open ? "new-live-session embedded-new-live-session open" : "new-live-session embedded-new-live-session"}>
+      <button className="small-btn add-broadcast-toggle" type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+        <Plus size={17} />新增直播
+      </button>
+      {open && <form className="new-live-session-form" onSubmit={createBroadcast}>
         <label>新直播名稱<input value={title} onChange={(event) => setTitle(event.target.value)} required /></label>
         <label>Kick 頻道<input value={kickUrl} onChange={(event) => setKickUrl(event.target.value)} required /></label>
         <label>首場時間<input type="datetime-local" value={firstRoundAt} onChange={(event) => setFirstRoundAt(event.target.value)} required /></label>
         <label>總場數<input type="number" min="1" max="100" value={totalRounds} onChange={(event) => setTotalRounds(event.target.value)} required /></label>
-        <label>每場號碼<input type="number" min="4" max="100" value={cardCount} onChange={(event) => setCardCount(event.target.value)} required /></label>
+        <label>每場可購買號碼<input type="number" min="4" max="100" value={cardCount} onChange={(event) => setCardCount(event.target.value)} required /></label>
         <label>預設機率<select value={shareMode} onChange={(event) => setShareMode(event.target.value)}><option value="1/2">1/2 二份之一</option><option value="1/5">1/5 五份之一</option><option value="1/10">1/10 十分之一</option></select></label>
-        <label className="new-live-copy-pool"><input type="checkbox" checked={copyPool} onChange={(event) => setCopyPool(event.target.checked)} />沿用現有直播卡池</label>
-        <button className="primary-btn" type="submit" disabled={creating}><Plus size={17} />{creating ? "建立中..." : "封存舊直播並開新直播"}</button>
-      </form>
-    </section>
+        <div className="new-live-pool-picker">
+          <div className="room-pool-header">
+            <div><strong>直播卡池</strong><span>{selectedCardIds.length} 張已選 · 預設沿用上一場</span></div>
+          </div>
+          <div className="card-search">
+            <Search size={16} />
+            <input value={cardSearch} onChange={(event) => setCardSearch(event.target.value)} placeholder="搜尋卡名或代幣" type="search" />
+          </div>
+          <div className="mini-card-picker">
+            {filteredCards.map((card) => (
+              <button
+                className={selectedCardIds.includes(card.id) ? "mini-card selected" : "mini-card"}
+                key={card.id}
+                type="button"
+                aria-pressed={selectedCardIds.includes(card.id)}
+                onClick={() => togglePoolCard(card.id)}
+              >
+                <b className="mini-card-selection-state">
+                  {selectedCardIds.includes(card.id) ? <><Check size={12} />已選</> : "未選"}
+                </b>
+                {card.imageUrl ? <img src={card.imageUrl} alt="" /> : <span className="mini-card-placeholder"><Package size={15} /></span>}
+                <span>{card.name}</span>
+                <small><TokenAmount value={card.tokenValue || 0} /></small>
+              </button>
+            ))}
+          </div>
+          {!filteredCards.length && <span className="muted">沒有符合搜尋的卡牌。</span>}
+        </div>
+        <button className="primary-btn" type="submit" disabled={creating}>
+          <Plus size={17} />
+          {creating ? "處理中..." : "建立直播預告"}
+        </button>
+      </form>}
+    </div>
   );
 }
 
@@ -6227,6 +7212,126 @@ function TokenPackageManager({ profile }) {
       <p className="form-note">
         玩家申請代幣頁會即時使用這裡的套餐。自訂金額仍會按系統 bonus 規則自動計算。
       </p>
+    </section>
+  );
+}
+
+function PromoCodeManager({ profile }) {
+  const [promoCodes, setPromoCodes] = useState([]);
+  const [prefix, setPrefix] = useState("");
+  const [amount, setAmount] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => onSnapshot(collection(db, "promoCodes"), (snapshot) => {
+    setPromoCodes(snapshot.docs
+      .map((item) => ({ id: item.id, ...item.data() }))
+      .sort((left, right) => String(left.code).localeCompare(String(right.code))));
+  }, (error) => {
+    console.error("Promotion code listener failed.", error);
+    setPromoCodes([]);
+  }), []);
+
+  async function savePromoCode(event) {
+    event.preventDefault();
+    const normalizedPrefix = String(prefix || "").trim().toUpperCase();
+    const parsed = parsePromoCode(`${normalizedPrefix}-${amount}`);
+    if (!parsed) {
+      alert("活動碼只可使用 1 至 24 個英文字母；代幣數目必須為 1 至 1,000,000 的整數。");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const promoRef = doc(db, "promoCodes", parsed.code);
+      const existing = await getDoc(promoRef);
+      await setDoc(promoRef, {
+        code: parsed.code,
+        prefix: parsed.prefix,
+        amount: parsed.amount,
+        active: true,
+        createdAt: existing.exists() ? existing.data().createdAt : serverTimestamp(),
+        createdBy: existing.exists() ? (existing.data().createdBy || profile.uid) : profile.uid,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      });
+      setPrefix("");
+      setAmount("");
+    } catch (error) {
+      showSafeError(error, "未能儲存推廣活動邀請碼，請稍後再試。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function togglePromoCode(promo) {
+    try {
+      await updateDoc(doc(db, "promoCodes", promo.id), {
+        active: !promo.active,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      });
+    } catch (error) {
+      showSafeError(error, "未能更新邀請碼狀態，請稍後再試。");
+    }
+  }
+
+  return (
+    <section className="panel promo-code-manager">
+      <div className="section-heading compact">
+        <Gift size={22} />
+        <div>
+          <h2>推廣活動邀請碼</h2>
+          <p>完整邀請碼由英文字母及代幣數目組成，例如 EVENT-500。</p>
+        </div>
+      </div>
+      <form className="promo-code-form" onSubmit={savePromoCode}>
+        <label>
+          活動字母碼
+          <input
+            value={prefix}
+            onChange={(event) => setPrefix(event.target.value.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 24))}
+            placeholder="例如 EVENT"
+            required
+          />
+        </label>
+        <label>
+          可兌換代幣
+          <input
+            type="number"
+            min="1"
+            max="1000000"
+            step="1"
+            value={amount}
+            onChange={(event) => setAmount(event.target.value)}
+            placeholder="例如 500"
+            required
+          />
+        </label>
+        <div className="promo-code-preview">
+          <span>完整邀請碼</span>
+          <strong>{prefix && amount ? `${prefix}-${amount}` : "尚未輸入"}</strong>
+        </div>
+        <button className="primary-btn" type="submit" disabled={saving}>
+          <Plus size={17} />{saving ? "儲存中..." : "新增並啟用"}
+        </button>
+      </form>
+      <div className="promo-code-list">
+        {promoCodes.length ? promoCodes.map((promo) => (
+          <article key={promo.id} className={promo.active ? "active" : "inactive"}>
+            <div>
+              <strong>{promo.code}</strong>
+              <span><TokenAmount value={promo.amount} /></span>
+            </div>
+            <span className={`status-badge ${promo.active ? "approved" : "rejected"}`}>
+              {promo.active ? "已啟用" : "已停用"}
+            </span>
+            <button className="small-btn" type="button" onClick={() => togglePromoCode(promo)}>
+              {promo.active ? "停用" : "重新啟用"}
+            </button>
+          </article>
+        )) : <p className="muted">暫時未設定推廣活動邀請碼。</p>}
+      </div>
+      <p className="form-note">邀請碼一經用戶提交即會保留使用紀錄；停用後未審批申請亦不可批准，直至重新啟用。</p>
     </section>
   );
 }
@@ -6743,9 +7848,6 @@ function CreateCardForm({ cards, profile }) {
   const cardCategories = useCardCategories(cards);
   const [newCard, setNewCard] = useState({
     name: "",
-    modePriceHalf: 10,
-    modePriceFifth: 10,
-    modePriceTenth: 10,
     allowedShareModes: [...SHARE_MODES],
     conversionValue: 8,
     category: CARD_CATEGORIES[0],
@@ -6761,7 +7863,19 @@ function CreateCardForm({ cards, profile }) {
   const [publishingShowcase, setPublishingShowcase] = useState(false);
   const [savingCardId, setSavingCardId] = useState("");
   const [deletingCardId, setDeletingCardId] = useState("");
+  const [marginRate, setMarginRate] = useState(DEFAULT_CARD_MARGIN_RATE);
+  const [marginRateDraft, setMarginRateDraft] = useState(String(DEFAULT_CARD_MARGIN_RATE));
+  const [savingMarginRate, setSavingMarginRate] = useState(false);
   const importInputId = useId();
+
+  useEffect(() => {
+    return onSnapshot(doc(db, "settings", "cardPricing"), (snapshot) => {
+      const savedRate = Number(snapshot.data()?.marginRate || DEFAULT_CARD_MARGIN_RATE);
+      const nextRate = Number.isFinite(savedRate) && savedRate > 0 ? savedRate : DEFAULT_CARD_MARGIN_RATE;
+      setMarginRate(nextRate);
+      setMarginRateDraft(String(nextRate));
+    });
+  }, []);
 
   useEffect(() => {
     setCardDrafts((current) => {
@@ -6790,9 +7904,6 @@ function CreateCardForm({ cards, profile }) {
     return (
       String(draft.name || "") !== String(card.name || "") ||
       String(draft.category || CARD_CATEGORIES[0]) !== getCardCategory(card) ||
-      Number(draft.modePriceHalf || 0) !== getCardModePrices(card).half ||
-      Number(draft.modePriceFifth || 0) !== getCardModePrices(card).fifth ||
-      Number(draft.modePriceTenth || 0) !== getCardModePrices(card).tenth ||
       JSON.stringify(getCardAllowedShareModes(draft)) !== JSON.stringify(getCardAllowedShareModes(card)) ||
       Number(draft.conversionValue || 0) !== Number(card.conversionValue ?? card.tokenValue ?? 0) ||
       String(draft.hellCardId || "") !== String(card.hellCardId || "") ||
@@ -6812,6 +7923,112 @@ function CreateCardForm({ cards, profile }) {
         [field]: value,
       },
     }));
+  }
+
+  function getDraftCard(card) {
+    return cardDrafts[card.id] || createCardDraft(card);
+  }
+
+  function getAutomaticPrices(conversionValue, hellCardId, rate = marginRate) {
+    const hellCard = cards.find((card) => card.id === hellCardId);
+    if (!hellCard) return null;
+    const hellDraft = getDraftCard(hellCard);
+    return calculateAutomaticCardPrices(conversionValue, hellDraft.conversionValue, rate);
+  }
+
+  // Reprice every paired card together so changing a hell card or the margin cannot leave stale prices behind.
+  async function recalculateAllCardPrices(rate, saveSetting = false) {
+    const [cardSnapshot, roomSnapshot, showcaseSnapshot] = await Promise.all([
+      getDocs(collection(db, "cards")),
+      getDocs(collection(db, "draws")),
+      getDocs(collection(db, "publicCardShowcase")),
+    ]);
+    const allCards = cardSnapshot.docs
+      .map((item) => ({ id: item.id, ...item.data() }))
+      .filter((card) => !card.archived);
+    const cardsById = new Map(allCards.map((card) => [card.id, card]));
+    const pricesById = new Map();
+
+    allCards.forEach((card) => {
+      const hellCard = cardsById.get(String(card.hellCardId || ""));
+      if (!hellCard) return;
+      const prices = calculateAutomaticCardPrices(
+        card.conversionValue ?? card.tokenValue ?? 0,
+        hellCard.conversionValue ?? hellCard.tokenValue ?? 0,
+        rate,
+      );
+      if (prices) pricesById.set(card.id, prices);
+    });
+
+    const writes = [];
+    if (saveSetting) {
+      writes.push((batch) => batch.set(doc(db, "settings", "cardPricing"), {
+        marginRate: rate,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      }, { merge: true }));
+    }
+    pricesById.forEach((prices, cardId) => {
+      writes.push((batch) => batch.update(doc(db, "cards", cardId), {
+        tokenValue: prices.half,
+        modePrices: prices,
+        pricingMarginRate: rate,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      }));
+    });
+    roomSnapshot.docs.forEach((roomDoc) => {
+      const room = roomDoc.data();
+      const roomPoolIds = getRoomPoolIds(room);
+      if (!roomPoolIds.some((cardId) => pricesById.has(cardId))) return;
+      const poolCardValues = { ...(room.poolCardValues || {}) };
+      pricesById.forEach((prices, cardId) => {
+        if (roomPoolIds.includes(cardId)) poolCardValues[cardId] = prices.half;
+      });
+      const roomUpdates = { poolCardValues, updatedAt: serverTimestamp() };
+      if (Array.isArray(room.poolCards)) {
+        roomUpdates.poolCards = normalizeRoomCards(room.poolCards).map((card) => {
+          const prices = pricesById.get(card.id);
+          return prices ? { ...card, tokenValue: prices.half, modePrices: prices } : card;
+        });
+      }
+      writes.push((batch) => batch.update(roomDoc.ref, roomUpdates));
+    });
+    showcaseSnapshot.docs.forEach((showcaseDoc) => {
+      const prices = pricesById.get(showcaseDoc.id);
+      if (prices) writes.push((batch) => batch.set(showcaseDoc.ref, {
+        tokenValue: prices.half,
+        modePrices: prices,
+        updatedAt: serverTimestamp(),
+      }, { merge: true }));
+    });
+
+    for (let start = 0; start < writes.length; start += 450) {
+      const batch = writeBatch(db);
+      writes.slice(start, start + 450).forEach((write) => write(batch));
+      await batch.commit();
+    }
+    return { updated: pricesById.size, skipped: allCards.length - pricesById.size };
+  }
+
+  async function saveMarginRate() {
+    const cleanRate = Number(marginRateDraft);
+    if (!Number.isFinite(cleanRate) || cleanRate <= 0 || cleanRate > 10) {
+      alert("毛利率必須大於 0 並且不多於 10。");
+      return;
+    }
+    if (!window.confirm(`確認將毛利率改為 ${cleanRate}，並重算整個卡牌庫？`)) return;
+
+    setSavingMarginRate(true);
+    try {
+      const result = await recalculateAllCardPrices(cleanRate, true);
+      setMarginRate(cleanRate);
+      alert(`已按毛利率 ${cleanRate} 更新 ${result.updated} 張卡。${result.skipped ? `另有 ${result.skipped} 張未設定地獄對應卡，暫時保留原價。` : ""}`);
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSavingMarginRate(false);
+    }
   }
 
   function toggleAllowedShareMode(cardId, mode) {
@@ -6948,13 +8165,9 @@ function CreateCardForm({ cards, profile }) {
       alert("請先上傳卡牌圖片。");
       return;
     }
-    const modePrices = {
-      half: Number(newCard.modePriceHalf),
-      fifth: Number(newCard.modePriceFifth),
-      tenth: Number(newCard.modePriceTenth),
-    };
-    if (Object.values(modePrices).some((value) => value < 1)) {
-      alert("三種玩法的卡牌價值都最少為 1。");
+    const modePrices = getAutomaticPrices(newCard.conversionValue, newCard.hellCardId);
+    if (!modePrices) {
+      alert("請先設定地獄對應卡，系統先可以自動計算三種玩法價錢。");
       return;
     }
     if (!newCard.allowedShareModes.length) {
@@ -6990,7 +8203,7 @@ function CreateCardForm({ cards, profile }) {
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      setNewCard({ name: "", modePriceHalf: 10, modePriceFifth: 10, modePriceTenth: 10, allowedShareModes: [...SHARE_MODES], conversionValue: 8, category: CARD_CATEGORIES[0], hellCardId: "", imageFile: null });
+      setNewCard({ name: "", allowedShareModes: [...SHARE_MODES], conversionValue: 8, category: CARD_CATEGORIES[0], hellCardId: "", imageFile: null });
     } catch (error) {
       showSafeError(error);
     } finally {
@@ -7001,20 +8214,13 @@ function CreateCardForm({ cards, profile }) {
   async function saveCardEdit(card) {
     const draft = cardDrafts[card.id] || {};
     const cleanName = String(draft.name || "").trim();
-    const cleanModePrices = {
-      half: Number(draft.modePriceHalf || 0),
-      fifth: Number(draft.modePriceFifth || 0),
-      tenth: Number(draft.modePriceTenth || 0),
-    };
     const cleanConversionValue = Number(draft.conversionValue || 0);
+    const automaticPrices = getAutomaticPrices(cleanConversionValue, draft.hellCardId);
+    const cleanModePrices = automaticPrices || getCardModePrices(card);
     const allowedShareModes = getCardAllowedShareModes(draft);
 
     if (!cleanName) {
       alert("請輸入卡牌名稱。");
-      return;
-    }
-    if (Object.values(cleanModePrices).some((value) => value < 1)) {
-      alert("三種玩法的卡牌價值都最少為 1。");
       return;
     }
     if (!allowedShareModes.length) {
@@ -7071,14 +8277,12 @@ function CreateCardForm({ cards, profile }) {
         modePrices: cleanModePrices,
         allowedShareModes,
       });
+      await recalculateAllCardPrices(marginRate);
       setCardDrafts((current) => ({
         ...current,
         [card.id]: {
           name: cleanName,
           category: draft.category || CARD_CATEGORIES[0],
-          modePriceHalf: cleanModePrices.half,
-          modePriceFifth: cleanModePrices.fifth,
-          modePriceTenth: cleanModePrices.tenth,
           allowedShareModes,
           conversionValue: cleanConversionValue,
           hellCardId: draft.hellCardId || "",
@@ -7317,6 +8521,7 @@ function CreateCardForm({ cards, profile }) {
         }
       }
 
+      await recalculateAllCardPrices(marginRate);
       alert(`匯入完成：新增 ${createdCount} 張，更新 ${updatedCount} 張。`);
     } catch (error) {
       showSafeError(error);
@@ -7325,6 +8530,8 @@ function CreateCardForm({ cards, profile }) {
     }
   }
 
+  const newAutomaticPrices = getAutomaticPrices(newCard.conversionValue, newCard.hellCardId);
+
   return (
     <section className="panel card-library-panel">
       <div className="section-heading">
@@ -7332,8 +8539,29 @@ function CreateCardForm({ cards, profile }) {
         <div>
 
           <h1>卡牌庫管理</h1>
-          <p className="muted">可分開設定抽卡價值及玩家把卡牌轉回代幣的價值。</p>
+          <p className="muted">只需設定兌換價值及地獄對應卡，三種抽卡售價會按毛利率自動計算。</p>
         </div>
+      </div>
+
+      <div className="card-pricing-formula-panel">
+        <div>
+          <strong>自動定價公式</strong>
+          <span>售價 =（天堂卡兌換價值 × 天堂機率＋地獄卡兌換價值 × 地獄機率）× 毛利率</span>
+        </div>
+        <label>
+          <span>毛利率</span>
+          <input
+            type="number"
+            min="0.01"
+            max="10"
+            step="0.01"
+            value={marginRateDraft}
+            onChange={(event) => setMarginRateDraft(event.target.value)}
+          />
+        </label>
+        <button className="primary-btn" type="button" onClick={saveMarginRate} disabled={savingMarginRate}>
+          <Save size={16} />{savingMarginRate ? "重算中..." : "儲存並重算全部"}
+        </button>
       </div>
 
       <div className="card-sheet-toolbar">
@@ -7427,9 +8655,9 @@ function CreateCardForm({ cards, profile }) {
           <span>圖片</span>
           <span>卡牌名稱</span>
           <span>分類</span>
-          <span>1/2 價值</span>
-          <span>1/5 價值</span>
-          <span>1/10 價值</span>
+          <span>1/2 售價</span>
+          <span>1/5 售價</span>
+          <span>1/10 售價</span>
           <span>開放份額</span>
           <span>兌換價值</span>
           <span>地獄對應卡</span>
@@ -7466,36 +8694,24 @@ function CreateCardForm({ cards, profile }) {
             </select>
           </label>
           <label className="card-sheet-field">
-            <span>1/2 價值</span>
+            <span>1/2 售價</span>
             <input
-              type="number"
-              min="1"
-              step="any"
-              value={newCard.modePriceHalf}
-              onChange={(event) => updateNewCard("modePriceHalf", event.target.value)}
-              required
+              value={newAutomaticPrices?.half ?? "先選地獄卡"}
+              readOnly
             />
           </label>
           <label className="card-sheet-field">
-            <span>1/5 價值</span>
+            <span>1/5 售價</span>
             <input
-              type="number"
-              min="1"
-              step="any"
-              value={newCard.modePriceFifth}
-              onChange={(event) => updateNewCard("modePriceFifth", event.target.value)}
-              required
+              value={newAutomaticPrices?.fifth ?? "先選地獄卡"}
+              readOnly
             />
           </label>
           <label className="card-sheet-field">
-            <span>1/10 價值</span>
+            <span>1/10 售價</span>
             <input
-              type="number"
-              min="1"
-              step="any"
-              value={newCard.modePriceTenth}
-              onChange={(event) => updateNewCard("modePriceTenth", event.target.value)}
-              required
+              value={newAutomaticPrices?.tenth ?? "先選地獄卡"}
+              readOnly
             />
           </label>
           <fieldset className="card-sheet-field card-share-mode-field">
@@ -7540,14 +8756,13 @@ function CreateCardForm({ cards, profile }) {
               const draft = cardDrafts[card.id] || {
                 name: card.name || "",
                 category: getCardCategory(card),
-                modePriceHalf: getCardModePrices(card).half,
-                modePriceFifth: getCardModePrices(card).fifth,
-                modePriceTenth: getCardModePrices(card).tenth,
                 allowedShareModes: getCardAllowedShareModes(card),
                 conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 10),
                 hellCardId: card.hellCardId || "",
                 imageFile: null,
               };
+              const automaticPrices = getAutomaticPrices(draft.conversionValue, draft.hellCardId);
+              const displayedPrices = automaticPrices || getCardModePrices(card);
               const changed = cardDraftChanged(card, draft);
               return (
                 <div className={changed ? "card-sheet-row has-draft" : "card-sheet-row"} key={card.id}>
@@ -7578,33 +8793,27 @@ function CreateCardForm({ cards, profile }) {
                     </select>
                   </label>
                   <label className="card-sheet-field">
-                    <span>1/2 價值</span>
+                    <span>1/2 售價</span>
                     <input
-                      type="number"
-                      min="1"
-                      step="any"
-                      value={draft.modePriceHalf}
-                      onChange={(event) => updateDraft(card.id, "modePriceHalf", event.target.value)}
+                      value={displayedPrices.half}
+                      readOnly
+                      title={automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
                     />
                   </label>
                   <label className="card-sheet-field">
-                    <span>1/5 價值</span>
+                    <span>1/5 售價</span>
                     <input
-                      type="number"
-                      min="1"
-                      step="any"
-                      value={draft.modePriceFifth}
-                      onChange={(event) => updateDraft(card.id, "modePriceFifth", event.target.value)}
+                      value={displayedPrices.fifth}
+                      readOnly
+                      title={automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
                     />
                   </label>
                   <label className="card-sheet-field">
-                    <span>1/10 價值</span>
+                    <span>1/10 售價</span>
                     <input
-                      type="number"
-                      min="1"
-                      step="any"
-                      value={draft.modePriceTenth}
-                      onChange={(event) => updateDraft(card.id, "modePriceTenth", event.target.value)}
+                      value={displayedPrices.tenth}
+                      readOnly
+                      title={automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
                     />
                   </label>
                   <fieldset className="card-sheet-field card-share-mode-field">
@@ -7642,9 +8851,13 @@ function CreateCardForm({ cards, profile }) {
                       type="button"
                       onClick={() => saveCardEdit(card)}
                       disabled={savingCardId === card.id || !changed}
+                      title={savingCardId === card.id ? "儲存中" : changed ? "確認儲存" : "已儲存"}
+                      aria-label={savingCardId === card.id ? "儲存中" : changed ? "確認儲存" : "已儲存"}
                     >
                       <Save size={15} />
-                      {savingCardId === card.id ? "儲存中..." : changed ? "確認儲存" : "已儲存"}
+                      <span className="card-action-label">
+                        {savingCardId === card.id ? "儲存中..." : changed ? "確認儲存" : "已儲存"}
+                      </span>
                     </button>
                     {changed && (
                       <button
@@ -7652,9 +8865,11 @@ function CreateCardForm({ cards, profile }) {
                         type="button"
                         onClick={() => resetCardDraft(card)}
                         disabled={savingCardId === card.id}
+                        title="還原未儲存的修改"
+                        aria-label="還原未儲存的修改"
                       >
                         <RefreshCcw size={15} />
-                        還原
+                        <span className="card-action-label">還原</span>
                       </button>
                     )}
                     <button
@@ -7662,9 +8877,13 @@ function CreateCardForm({ cards, profile }) {
                       type="button"
                       onClick={() => deleteCard(card)}
                       disabled={savingCardId === card.id || deletingCardId === card.id}
+                      title={deletingCardId === card.id ? "刪除中" : "刪除卡牌"}
+                      aria-label={deletingCardId === card.id ? "刪除中" : "刪除卡牌"}
                     >
                       <Trash2 size={15} />
-                      {deletingCardId === card.id ? "刪除中..." : "刪除卡牌"}
+                      <span className="card-action-label">
+                        {deletingCardId === card.id ? "刪除中..." : "刪除卡牌"}
+                      </span>
                     </button>
                   </div>
                 </div>
@@ -7817,8 +9036,12 @@ function RoomPoolEditor({ draw, cards, singleLive = false }) {
                 className={selectedIds.includes(card.id) ? "mini-card selected" : "mini-card"}
                 key={card.id}
                 type="button"
+                aria-pressed={selectedIds.includes(card.id)}
                 onClick={() => toggleCard(card.id)}
               >
+                <b className="mini-card-selection-state">
+                  {selectedIds.includes(card.id) ? <><Check size={12} />已選</> : "未選"}
+                </b>
                 {card.imageUrl ? (
                   <img src={card.imageUrl} alt="" />
                 ) : (
@@ -7836,6 +9059,184 @@ function RoomPoolEditor({ draw, cards, singleLive = false }) {
       ) : (
         <span className="muted">請先建立卡牌。</span>
       )}
+    </div>
+  );
+}
+
+// Keeps a long schedule compact: administrators open only the broadcast they want to edit.
+function LiveRoundSettingsList({ allDraws, cards, currentLive, profile, scheduledLives }) {
+  const broadcasts = useMemo(
+    () => [currentLive, ...scheduledLives.filter((item) => item.id !== currentLive.id)],
+    [currentLive, scheduledLives],
+  );
+  const [expandedId, setExpandedId] = useState("");
+  const [updatingId, setUpdatingId] = useState("");
+
+  useEffect(() => {
+    if (expandedId && !broadcasts.some((item) => item.id === expandedId)) {
+      setExpandedId("");
+    }
+  }, [broadcasts, expandedId]);
+
+  async function setBroadcastLive(broadcast) {
+    if (broadcast.status === "live") return;
+    if (!window.confirm(`確認將「${broadcast.title || "LiveDraw 直播"}」設為直播中？其他直播中場次會同時封存。`)) return;
+
+    setUpdatingId(broadcast.id);
+    try {
+      await runTransaction(db, async (transaction) => {
+        const liveStateRef = doc(db, "settings", "liveState");
+        const targetRef = doc(db, "draws", broadcast.id);
+        const liveStateSnapshot = await transaction.get(liveStateRef);
+        const registeredLiveId = String(liveStateSnapshot.data()?.currentLiveId || "");
+        const conflictingIds = [...new Set([
+          ...allDraws
+            .filter((item) => item.id !== broadcast.id && item.status === "live")
+            .map((item) => item.id),
+          ...(registeredLiveId && registeredLiveId !== broadcast.id ? [registeredLiveId] : []),
+        ])];
+        const targetSnapshot = await transaction.get(targetRef);
+        const conflictingSnapshots = [];
+        for (const drawId of conflictingIds) {
+          const drawRef = doc(db, "draws", drawId);
+          conflictingSnapshots.push({ drawRef, snapshot: await transaction.get(drawRef) });
+        }
+
+        if (!targetSnapshot.exists() || targetSnapshot.data().status === "completed") {
+          throw new Error("所選直播已被封存，請重新整理後再試。");
+        }
+
+        conflictingSnapshots.forEach(({ drawRef, snapshot }) => {
+          if (!snapshot.exists() || snapshot.data().status !== "live") return;
+          transaction.update(drawRef, {
+            status: "completed",
+            preorderOpen: false,
+            archivedAt: serverTimestamp(),
+            archivedBy: profile.uid,
+            updatedAt: serverTimestamp(),
+          });
+        });
+        transaction.update(targetRef, {
+          status: "live",
+          preorderOpen: true,
+          startedAt: serverTimestamp(),
+          chatStartedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          updatedBy: profile.uid,
+        });
+        transaction.set(liveStateRef, {
+          currentLiveId: broadcast.id,
+          updatedAt: serverTimestamp(),
+          updatedBy: profile.uid,
+        }, { merge: true });
+      });
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setUpdatingId("");
+    }
+  }
+
+  async function archiveBroadcast(broadcast) {
+    if (broadcast.status === "live") {
+      alert("直播中嘅場次唔可以封存，請先將另一場設為直播中。");
+      return;
+    }
+    if (!window.confirm(`確認封存「${broadcast.title || "LiveDraw 直播"}」？場次、號碼、購買記錄及賽果會保留。`)) return;
+
+    setUpdatingId(broadcast.id);
+    try {
+      await runTransaction(db, async (transaction) => {
+        const liveStateRef = doc(db, "settings", "liveState");
+        const drawRef = doc(db, "draws", broadcast.id);
+        const liveStateSnapshot = await transaction.get(liveStateRef);
+        const drawSnapshot = await transaction.get(drawRef);
+        if (!drawSnapshot.exists() || drawSnapshot.data().status === "completed") return;
+        if (drawSnapshot.data().status === "live") {
+          throw new Error("直播中嘅場次唔可以封存，請先將另一場設為直播中。");
+        }
+
+        transaction.update(drawRef, {
+          status: "completed",
+          preorderOpen: false,
+          archivedAt: serverTimestamp(),
+          archivedBy: profile.uid,
+          updatedAt: serverTimestamp(),
+        });
+        if (liveStateSnapshot.data()?.currentLiveId === broadcast.id) {
+          transaction.set(liveStateRef, {
+            currentLiveId: "",
+            updatedAt: serverTimestamp(),
+            updatedBy: profile.uid,
+          }, { merge: true });
+        }
+      });
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setUpdatingId("");
+    }
+  }
+
+  return (
+    <div className="live-round-settings-list">
+      {broadcasts.map((broadcast) => {
+        const expanded = expandedId === broadcast.id;
+        const firstSchedule = getRoundSchedule(broadcast, "round-001");
+        const scheduleLabel = firstSchedule instanceof Date
+          ? formatFutureLiveDate(firstSchedule)
+          : "日期待定";
+        const isLive = broadcast.status === "live";
+        const isUpdating = updatingId === broadcast.id;
+        const statusLabel = statusLabels[broadcast.status] || broadcast.status;
+
+        return (
+          <article className={expanded ? "expanded" : ""} key={broadcast.id}>
+            <button
+              aria-expanded={expanded}
+              className="live-round-settings-toggle"
+              type="button"
+              onClick={() => setExpandedId(expanded ? "" : broadcast.id)}
+            >
+              <span>
+                <strong>{broadcast.title || "LiveDraw 直播"}</strong>
+                <small>{scheduleLabel} · {getRoomRoundCount(broadcast)} 場</small>
+              </span>
+              <b className={`status-${broadcast.status || "draft"}`}>{statusLabel}</b>
+              <ChevronDown size={20} aria-hidden="true" />
+            </button>
+            <div className="live-round-broadcast-actions">
+              {!isLive && (
+                <button className="primary-btn" type="button" disabled={Boolean(updatingId)} onClick={() => setBroadcastLive(broadcast)}>
+                  <Zap size={15} />{isUpdating ? "處理中..." : "設為直播中"}
+                </button>
+              )}
+              <button
+                className="small-btn danger"
+                type="button"
+                disabled={isLive || Boolean(updatingId)}
+                onClick={() => archiveBroadcast(broadcast)}
+                title={isLive ? "直播中場次不可封存" : "封存直播"}
+              >
+                <Package size={15} />{isUpdating ? "處理中..." : isLive ? "直播中不可封存" : "封存"}
+              </button>
+            </div>
+            {expanded && (
+              <div className="live-round-settings-content">
+                <BroadcastDetailsEditor draw={broadcast} profile={profile} />
+                <RoomRoundSettings draw={broadcast} />
+                <div className="live-round-pool-settings">
+                  <div className="section-heading compact">
+                    <Boxes size={20} />
+                    <div><h3>直播卡池</h3></div>
+                  </div>
+                  <RoomPoolEditor draw={broadcast} cards={cards} singleLive />
+                </div>
+              </div>
+            )}
+          </article>
+        );
+      })}
     </div>
   );
 }
@@ -7867,34 +9268,6 @@ function RoomRoundSettings({ draw }) {
     setRoundShareModes({ ...(draw.roundShareModes || {}) });
     setResultFiles({});
   }, [draw.id, draw.roundShareModes, savedCurrent, savedRoundSchedules, savedTotal]);
-
-  function addFutureRound() {
-    const currentTotal = Math.max(1, Math.min(100, Math.round(Number(totalRounds) || 1)));
-    if (currentTotal >= 100) {
-      alert("每個直播最多可以設定 100 場。");
-      return;
-    }
-
-    const nextRoundNumber = currentTotal + 1;
-    const previousRoundId = toRoundId(currentTotal);
-    const nextRoundId = toRoundId(nextRoundNumber);
-    const previousSchedule = roundSchedules[previousRoundId];
-    const previousDate = previousSchedule ? new Date(previousSchedule) : null;
-    const nextDate = previousDate && !Number.isNaN(previousDate.getTime())
-      ? new Date(previousDate.getTime() + 40 * 60 * 1000)
-      : new Date(Date.now() + 24 * 60 * 60 * 1000);
-    nextDate.setSeconds(0, 0);
-    const localDateTime = new Date(nextDate.getTime() - nextDate.getTimezoneOffset() * 60000)
-      .toISOString()
-      .slice(0, 16);
-
-    setTotalRounds(String(nextRoundNumber));
-    setRoundSchedules((current) => ({ ...current, [nextRoundId]: localDateTime }));
-    setRoundShareModes((current) => ({
-      ...current,
-      [nextRoundId]: current[previousRoundId] || getRoomShareMode(draw, previousRoundId),
-    }));
-  }
 
   async function saveRoundSettings() {
     const nextTotal = Math.max(1, Math.min(100, Math.round(Number(totalRounds) || 1)));
@@ -7992,15 +9365,6 @@ function RoomRoundSettings({ draw }) {
         >
           <Save size={15} />
           {saving ? "儲存中..." : "儲存場次"}
-        </button>
-        <button
-          className="small-btn future-round-add-btn"
-          type="button"
-          onClick={addFutureRound}
-          disabled={saving || Boolean(uploadingRoundId) || totalRoundNumber >= 100}
-        >
-          <Plus size={15} />
-          新增未來場次
         </button>
       </div>
       <div className="round-schedule-editor">
@@ -8572,13 +9936,9 @@ function normalizeImportedCardRows(rows) {
 }
 
 function createCardDraft(card) {
-  const modePrices = getCardModePrices(card);
   return {
     name: card.name || "",
     category: getCardCategory(card),
-    modePriceHalf: modePrices.half,
-    modePriceFifth: modePrices.fifth,
-    modePriceTenth: modePrices.tenth,
     allowedShareModes: getCardAllowedShareModes(card),
     conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 10),
     hellCardId: card.hellCardId || "",
@@ -8785,9 +10145,22 @@ function normalizeTokenPackages(packages) {
 // Calculate the grant from verified payment and protected rates; reject stale or forged claims.
 function getVerifiedTokenGrant(request, verifiedHkdAmount, settings) {
   const isPromo = request.proofMode === "promo";
-  const pricingAmount = isPromo ? request.hkdAmount : verifiedHkdAmount;
-  if (isPromo ? (!request.promoCode?.trim() || verifiedHkdAmount !== 0)
-    : (request.proofMode !== "storage" || !request.proofUrl || request.hkdAmount !== verifiedHkdAmount)) {
+  if (isPromo) {
+    if (!parsePromoCode(request.promoCode)
+      || request.promoCodeId !== request.promoCode
+      || request.packageType !== "promo"
+      || request.hkdAmount !== 0
+      || request.exchangeRate !== 0
+      || verifiedHkdAmount !== 0
+      || !Number.isSafeInteger(request.amount)
+      || request.amount < 1
+      || request.amount > 1000000) {
+      throw new Error("邀請碼申請資料不完整或代幣數目不正確，請拒絕此申請。");
+    }
+    return request.amount;
+  }
+  const pricingAmount = verifiedHkdAmount;
+  if (request.proofMode !== "storage" || !request.proofUrl || request.hkdAmount !== verifiedHkdAmount) {
     throw new Error("實際入帳金額與申請不符，或缺少付款證明。請拒絕此申請並要求重新提交。");
   }
   const savedPackages = settings ? normalizeTokenPackages(settings.packages) : TOKEN_PACKAGES;
@@ -8885,6 +10258,13 @@ function getDefaultRoomRound(room) {
   return room.status === "live" ? toRoundId(getRoomCurrentRound(room)) : "round-001";
 }
 
+function isRoomPurchasable(room) {
+  return Boolean(room && (
+    room.status === "live"
+    || (room.status === "scheduled" && room.preorderOpen === true)
+  ));
+}
+
 function isRoundBuyingBlocked(room, roundId = toRoundId(getRoomCurrentRound(room))) {
   if (!room) return false;
   const blockedRounds = Array.isArray(room.buyingBlockedRounds)
@@ -8899,7 +10279,16 @@ function getRoundDisplayStatus(room, roundId) {
   if (room?.status === "completed" || roundNumber < currentRoundNumber) {
     return { key: "completed", label: "已結束" };
   }
-  if (room?.status !== "live" || roundNumber > currentRoundNumber) {
+  if (isRoundBuyingBlocked(room, roundId)) {
+    return { key: "locked", label: "已停止" };
+  }
+  if (isRoomPurchasable(room) && roundNumber > currentRoundNumber) {
+    return { key: "available", label: room?.status === "scheduled" ? "可預購" : "可購買" };
+  }
+  if (room?.status === "scheduled" && room?.preorderOpen === true) {
+    return { key: "available", label: "可預購" };
+  }
+  if (room?.status !== "live") {
     return { key: "upcoming", label: "即將開" };
   }
   return { key: "live", label: "直播中" };
@@ -8974,6 +10363,16 @@ function getResultSideLabel(resultSide) {
   if (resultSide === "hell") return "地獄";
   if (resultSide === "heaven") return "天堂";
   return "未設定";
+}
+
+function getShippingRegionLabel(regionId) {
+  return SHIPPING_REGIONS.find((region) => region.id === regionId)?.label || "香港";
+}
+
+function getShippingMethodLabel(method) {
+  if (method === "sf-pickup") return "順豐自提點";
+  if (method === "address-delivery") return "地址配送";
+  return "順豐上門";
 }
 
 function compareRoomRoundRecords(left, right) {
@@ -9207,6 +10606,72 @@ function getRoundScheduleDrafts(room) {
       return [roundId, localDate.toISOString().slice(0, 16)];
     }),
   );
+}
+
+// Every scheduled date is a separate room so its slots, purchases, results, and chat never mix with another day.
+function getScheduledLiveRooms(rooms) {
+  return (Array.isArray(rooms) ? rooms : [])
+    .filter((room) => room?.status === "scheduled")
+    .map((room) => {
+      const scheduledDate = room.scheduledAt instanceof Timestamp
+        ? room.scheduledAt.toDate()
+        : new Date(room.scheduledAt || room.roundSchedules?.["round-001"] || "");
+      return Number.isNaN(scheduledDate.getTime()) ? null : {
+        ...room,
+        scheduledAt: scheduledDate.toISOString(),
+        scheduledDate,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.scheduledDate.getTime() - right.scheduledDate.getTime());
+}
+
+// Date picker helpers keep the administrator's local calendar date instead of converting it to UTC too early.
+function addLocalDays(value, dayCount) {
+  const date = new Date(value);
+  date.setDate(date.getDate() + dayCount);
+  return date;
+}
+
+function getDateInputValue(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function buildLocalDateTime(dateValue, hourValue, minuteValue) {
+  const parts = String(dateValue || "").split("-").map(Number);
+  if (parts.length !== 3 || parts.some((part) => !Number.isInteger(part))) return null;
+  const [year, month, day] = parts;
+  const hour = Number(hourValue);
+  const minute = Number(minuteValue);
+  const date = new Date(year, month - 1, day, hour, minute, 0, 0);
+  if (
+    Number.isNaN(date.getTime())
+    || date.getFullYear() !== year
+    || date.getMonth() !== month - 1
+    || date.getDate() !== day
+    || date.getHours() !== hour
+    || date.getMinutes() !== minute
+  ) return null;
+  return date;
+}
+
+// Formats the public schedule in Traditional Chinese with an explicit weekday and time.
+function formatFutureLiveDate(value) {
+  return new Intl.DateTimeFormat("zh-HK", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(value);
 }
 
 async function uploadCompressedImage(file, path) {
