@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "vite",
     "dev:beta": "vite --mode beta",
-    "build": "vite build",
-    "build:beta": "vite build --mode beta",
+    "build": "vite build && node scripts/assert-no-web-admin.mjs",
+    "build:beta": "vite build --mode beta && node scripts/assert-no-web-admin.mjs",
     "preview": "vite preview",
     "lint": "eslint ."
   },

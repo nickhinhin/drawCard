@@ -1,6 +1,6 @@
 import { initializeApp, deleteApp } from "firebase/app";
 import { getAuth, connectAuthEmulator, createUserWithEmailAndPassword, signOut } from "firebase/auth";
-import { collection, connectFirestoreEmulator, doc, getDoc, getDocs, getFirestore, serverTimestamp, setDoc, terminate, updateDoc, writeBatch } from "firebase/firestore";
+import { collection, collectionGroup, connectFirestoreEmulator, doc, getDoc, getDocs, getFirestore, query, serverTimestamp, setDoc, terminate, updateDoc, where, writeBatch } from "firebase/firestore";
 
 // This harness deliberately refuses live projects and non-local endpoints.
 const projectId = "demo-drawcard-security";
@@ -156,6 +156,16 @@ try {
   await check("Self-promote to administrator", false, () => updateDoc(userRef, { role: "admin" }));
   await check("Direct balance increase", false, () => updateDoc(userRef, { tokens: 1000000 }));
   await check("Read another user's profile", false, () => getDoc(doc(db, "users/victim")));
+  await check("Read own slots through consolidated history query", true, async () => {
+    await seed({ "draws/room/rounds/round-001/slots/1": purchasedSlot });
+    await getDocs(query(collectionGroup(db, "slots"), where("uid", "==", uid)));
+  });
+  await check("Scan another user's slots through consolidated history query", false, async () => {
+    await seed({
+      "draws/room/rounds/round-001/slots/2": { ...purchasedSlot, uid: "victim", username: "Victim", number: 2 },
+    });
+    await getDocs(query(collectionGroup(db, "slots"), where("uid", "==", "victim")));
+  });
   await check("Modify platform payment settings", false, () => setDoc(doc(db, "settings/payment"), { fpsIdentifier: "attacker" }));
   await check("Refund replay without changing the already-converted record", false, async () => {
     await seed({ "drawRecords/assigned": { ...assignedRecord, convertedToTokens: true, tokenRefund: 80, collectionStatus: "converted" } });
@@ -329,17 +339,17 @@ try {
     proofMode: "promo", promoCode: "STOPPED-250", promoCodeId: "STOPPED-250",
     packageType: "promo", hkdAmount: 0, amount: 250, exchangeRate: 0,
   }).commit());
-  await check("Admin assignment still allowed", true, async () => {
+  await check("Legacy web admin assignment is blocked", false, async () => {
     await seed({ [`users/${uid}`]: { ...baseUser, role: "admin" } });
     await setDoc(doc(db, "drawRecords/admin-award"), assignedRecord);
   });
-  // Exercise approval through rules as an administrator, including old forged requests.
-  for (const [label, amount, verified, allow] of [
-    ["Valid verified admin approval", 525, 500, true],
-    ["Legacy inflated request approval rejected", 1000000, 500, false],
-    ["Mismatched verified deposit rejected", 525, 1000, false],
+  // Even a legacy user document with role=admin must use the protected Function path.
+  for (const [label, amount, verified] of [
+    ["Legacy admin approval is blocked", 525, 500],
+    ["Legacy inflated request approval is blocked", 1000000, 500],
+    ["Mismatched verified deposit is blocked", 525, 1000],
   ]) {
-    await check(label, allow, async () => {
+    await check(label, false, async () => {
       await seed({ [`users/${uid}`]: { ...baseUser, role: "admin" }, "tokenRequests/review": { ...validRequest, amount, exchangeRate: amount / 500 } });
       const batch = writeBatch(db);
       batch.update(doc(db, "tokenRequests/review"), { status: "approved", verifiedHkdAmount: verified, reviewedAt: serverTimestamp(), reviewedBy: uid });
@@ -347,7 +357,7 @@ try {
       await batch.commit();
     });
   }
-  await check("Quota-tracked approval releases one pending slot", true, async () => {
+  await check("Direct quota-tracked approval is blocked", false, async () => {
     await seed({
       [`users/${uid}`]: { ...baseUser, role: "admin", pendingTokenRequestCount: 1 },
       "tokenRequests/quota-approval": { ...validRequest, quotaVersion: 1 },
@@ -362,7 +372,7 @@ try {
     });
     await batch.commit();
   });
-  await check("Incomplete proof can be rejected and release quota", true, async () => {
+  await check("Direct incomplete-proof rejection is blocked", false, async () => {
     await seed({
       [`users/${uid}`]: { ...baseUser, role: "admin", pendingTokenRequestCount: 1 },
       "tokenRequests/quota-rejection": {
@@ -391,13 +401,13 @@ try {
       status: "rejected", adminNote: "bypass", reviewedAt: serverTimestamp(), reviewedBy: uid,
     });
   });
-  for (const [label, admin, reviewed, deposit, allow] of [
-    ["Admin can approve manually reviewed promotion", true, true, 0, true],
-    ["User cannot approve own promotion", false, true, 0, false],
-    ["Promotion requires explicit admin review", true, false, 0, false],
-    ["Promotion cannot inflate VIP deposits", true, true, 500, false],
+  for (const [label, admin, reviewed, deposit] of [
+    ["Legacy admin promotion approval is blocked", true, true, 0],
+    ["User cannot approve own promotion", false, true, 0],
+    ["Promotion requires protected Function review", true, false, 0],
+    ["Promotion cannot inflate VIP deposits", true, true, 500],
   ]) {
-    await check(label, allow, async () => {
+    await check(label, false, async () => {
       await seed({
         [`users/${uid}`]: { ...baseUser, role: admin ? "admin" : "user" },
         "tokenRequests/promo-review": {

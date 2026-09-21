@@ -6,8 +6,6 @@ const api = require("/usr/local/lib/node_modules/firebase-tools/lib/apiv2.js");
 const PROJECT_ID = "drawcard-26e01";
 const DATABASE_ROOT = `projects/${PROJECT_ID}/databases/(default)`;
 const API_ROOT = `https://firestore.googleapis.com/v1/${DATABASE_ROOT}`;
-const SHOWCASE_LIMIT = 12;
-
 function readValue(value) {
   if (!value) return undefined;
   if ("stringValue" in value) return value.stringValue;
@@ -69,13 +67,12 @@ async function main() {
     listDocuments(token, "cards"),
     listDocuments(token, "publicCardShowcase"),
   ]);
-  const featuredCards = cardDocuments
+  const publicCards = cardDocuments
     .map(cardFromDocument)
     .filter((card) => card.name && card.imageUrl && card.tokenValue > 0)
-    .sort((left, right) => right.tokenValue - left.tokenValue)
-    .slice(0, SHOWCASE_LIMIT);
+    .sort((left, right) => right.tokenValue - left.tokenValue);
 
-  if (!featuredCards.length) throw new Error("No cards with valid images were found.");
+  if (!publicCards.length) throw new Error("No cards with valid images were found.");
 
   const writes = showcaseDocuments.map((document) => ({
     update: {
@@ -88,14 +85,16 @@ async function main() {
     updateMask: { fieldPaths: ["active"] },
   }));
 
-  featuredCards.forEach((card, index) => {
+  publicCards.forEach((card, index) => {
     writes.push({
       update: {
         name: `${DATABASE_ROOT}/documents/publicCardShowcase/${card.id}`,
         fields: {
           name: { stringValue: card.name },
           imageUrl: { stringValue: card.imageUrl },
-          tokenValue: { integerValue: String(Math.round(card.tokenValue)) },
+          tokenValue: Number.isInteger(card.tokenValue)
+            ? { integerValue: String(card.tokenValue) }
+            : { doubleValue: card.tokenValue },
           category: { stringValue: card.category },
           active: { booleanValue: true },
           rank: { integerValue: String(index + 1) },
@@ -112,7 +111,7 @@ async function main() {
     method: "POST",
     body: JSON.stringify({ writes }),
   });
-  console.log(`Published ${featuredCards.length} cards to the public Beta showcase.`);
+  console.log(`Published ${publicCards.length} cards to the public Beta card catalogue.`);
 }
 
 main().catch((error) => {

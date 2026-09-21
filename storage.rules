@@ -7,9 +7,7 @@ service firebase.storage {
     }
 
     function isAdmin() {
-      return signedIn()
-        && firestore.exists(/databases/(default)/documents/users/$(request.auth.uid))
-        && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == "admin";
+      return signedIn() && request.auth.token.admin == true;
     }
 
     function isSafeImage() {
@@ -43,8 +41,8 @@ service firebase.storage {
 
     match /draw-results/{drawId}/{fileName} {
       allow read: if signedIn();
-      allow create, update: if isAdmin() && isSafeImage();
-      allow delete: if isAdmin();
+      // Administrative uploads go through an App Check protected Cloud Function.
+      allow create, update, delete: if false;
     }
   }
 }

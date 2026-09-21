@@ -7,3 +7,8 @@ dist
 firebase-debug.log
 firestore-debug.log
 storage-debug.log
+functions/.env
+admin-macos/Resources/GoogleService-Info.plist
+admin-macos/*.xcodeproj
+admin-macos/.build
+admin-macos/build

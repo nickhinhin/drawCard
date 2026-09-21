@@ -7,7 +7,7 @@ export default [
   { ignores: ["dist"] },
   js.configs.recommended,
   {
-    files: ["scripts/**/*.mjs"],
+    files: ["scripts/**/*.mjs", "functions/**/*.{js,mjs}"],
     languageOptions: {
       globals: {
         ...globals.node,

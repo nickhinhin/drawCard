@@ -1001,6 +1001,32 @@ textarea:focus {
   font-weight: 600;
 }
 
+.homepage-banner-manager {
+  display: grid;
+  gap: 16px;
+}
+
+.homepage-banner-preview {
+  aspect-ratio: 1600 / 537;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--soft);
+}
+
+.homepage-banner-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.homepage-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .draw-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(360px, 504px);
@@ -1283,6 +1309,25 @@ textarea:focus {
   cursor: pointer;
 }
 
+.player-card-search,
+.card-library-search {
+  grid-column: 1 / -1;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.player-card-search > span,
+.card-library-search > span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.player-card-load-more {
+  grid-column: 1 / -1;
+  justify-self: center;
+}
+
 .room-card-picker {
   padding: 4px;
   border: 1px solid var(--line);
@@ -1525,6 +1570,36 @@ textarea:focus {
   color: var(--brand);
 }
 
+.slot.result-heaven {
+  border-color: #22a861;
+  background: #eaf8f0;
+  color: #167443;
+  box-shadow: inset 0 0 0 1px rgba(34, 168, 97, 0.12);
+}
+
+.slot.result-hell {
+  border-color: #ef1439;
+  background: #fff0f2;
+  color: #c70e2d;
+  box-shadow: inset 0 0 0 1px rgba(239, 20, 57, 0.12);
+}
+
+.number-slot-outcome {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  font-size: 1rem !important;
+}
+
+.number-slot-outcome i {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 .number-help {
   margin: 0 0 26px;
   font-size: 1rem;
@@ -1592,6 +1667,18 @@ textarea:focus {
 .number-legend span:nth-child(3) i {
   border-color: var(--brand);
   background: var(--brand);
+}
+
+.number-legend i.heaven,
+.desktop-number-legend i.heaven {
+  border-color: #22a861;
+  background: #22a861;
+}
+
+.number-legend i.hell,
+.desktop-number-legend i.hell {
+  border-color: #ef1439;
+  background: #ef1439;
 }
 
 .number-divider {
@@ -1928,6 +2015,20 @@ textarea:focus {
   color: var(--muted);
 }
 
+.history-card-title {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.record-acquired-time {
+  display: block;
+  color: var(--muted) !important;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
 .record-pagination {
   display: flex;
   align-items: center;
@@ -1993,12 +2094,18 @@ textarea:focus {
   margin: 12px 0;
 }
 
-.admin-finance-summary span {
+.admin-finance-summary > span {
   display: grid;
   gap: 3px;
   padding: 12px 14px;
   border-radius: var(--radius-sm);
   background: var(--soft);
+}
+
+.admin-finance-summary strong {
+  display: flex;
+  min-width: 0;
+  align-items: center;
 }
 
 .admin-finance-summary small {
@@ -2230,6 +2337,11 @@ textarea:focus {
 .status-badge.shipping {
   background: #dbeafe;
   color: var(--info);
+}
+
+.status-badge.shipping.awaiting-dispatch {
+  background: #fef3c7;
+  color: var(--warning);
 }
 
 .status-badge.rejected,
@@ -2505,6 +2617,11 @@ textarea:focus {
 
 .shipping-request-actions button {
   white-space: nowrap;
+}
+
+.shipping-request-actions > .status-badge {
+  grid-column: 1 / -1;
+  justify-self: start;
 }
 
 .shipping-status-tabs {
@@ -2991,6 +3108,29 @@ textarea:focus {
   cursor: default;
 }
 
+.card-price-field {
+  position: relative;
+}
+
+.card-pricing-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--brand);
+  font-size: 0.64rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.card-pricing-mode-toggle input {
+  width: 13px;
+  height: 13px;
+  min-height: 13px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--brand);
+}
+
 @media (max-width: 900px) {
   .card-pricing-formula-panel {
     grid-template-columns: 1fr;
@@ -3149,6 +3289,14 @@ textarea:focus {
   min-width: 0;
   min-height: 42px;
   padding: 0 11px;
+}
+
+.card-sheet-row .card-pricing-mode-toggle input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  min-height: 13px;
+  margin: 0;
+  padding: 0;
 }
 
 .card-share-mode-field {
@@ -3711,6 +3859,103 @@ textarea:focus {
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.05);
+}
+
+.vip-tier-artwork {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  width: 82px;
+  height: 102px;
+  justify-self: center;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 25% 20%, rgba(255, 255, 255, 0.32), transparent 31%),
+    linear-gradient(145deg, #ef173b, #781326 72%);
+  color: #fff;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28), inset 0 0 18px rgba(255, 255, 255, 0.1);
+}
+
+.vip-tier-reward-image {
+  display: grid;
+  width: 82px;
+  height: 102px;
+  justify-self: center;
+  place-items: center;
+  overflow: hidden;
+  padding: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.vip-tier-reward-image img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center;
+}
+
+.vip-tier-artwork::before {
+  position: absolute;
+  z-index: -1;
+  width: 48px;
+  height: 48px;
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  border-radius: 14px;
+  content: "";
+  transform: rotate(45deg);
+}
+
+.vip-tier-artwork::after {
+  position: absolute;
+  right: 5px;
+  bottom: 4px;
+  color: rgba(255, 255, 255, 0.78);
+  content: attr(data-level);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+}
+
+.vip-tier-artwork > svg {
+  position: relative;
+  z-index: 2;
+  filter: drop-shadow(0 3px 7px rgba(0, 0, 0, 0.35));
+}
+
+.vip-art-orbit {
+  position: absolute;
+  width: 86px;
+  height: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 50%;
+  transform: rotate(-24deg);
+}
+
+.vip-art-orbit.two {
+  transform: rotate(56deg) scale(.82);
+}
+
+.vip-tier-artwork.level-1 {
+  background: radial-gradient(circle at 25% 20%, #fff7b0, transparent 28%), linear-gradient(145deg, #ffb703, #b24c00 72%);
+}
+
+.vip-tier-artwork.level-2 {
+  background: radial-gradient(circle at 25% 20%, #ded6ff, transparent 28%), linear-gradient(145deg, #7756e8, #2d1b69 72%);
+}
+
+.vip-tier-artwork.level-3 {
+  background: radial-gradient(circle at 25% 20%, #c6f8ff, transparent 28%), linear-gradient(145deg, #1596ab, #074253 72%);
+}
+
+.vip-tier-artwork.level-4 {
+  background: radial-gradient(circle at 25% 20%, #fff4c8, transparent 28%), linear-gradient(145deg, #d59c26, #6a3d07 72%);
 }
 
 .vip-tier-card.active .vip-tier-detail {

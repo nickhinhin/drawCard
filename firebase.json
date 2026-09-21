@@ -52,6 +52,10 @@
   "storage": {
     "rules": "storage.rules"
   },
+  "functions": {
+    "source": "functions",
+    "runtime": "nodejs22"
+  },
   "emulators": {
     "auth": { "port": 9099 },
     "firestore": { "port": 8080 },

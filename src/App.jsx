@@ -60,6 +60,7 @@ import {
   Timestamp,
   addDoc,
   collection,
+  collectionGroup,
   doc,
   getDoc,
   getDocs,
@@ -119,7 +120,7 @@ const statusLabels = {
   assigned: "已完成",
   draft: "即將開播",
   shipping: "配送中",
-  shipped: "已寄出",
+  shipped: "已配送",
 };
 
 const ROUND_BUY_LOCKED_LABEL = "本場已停止購買";
@@ -127,8 +128,11 @@ const collectionStatuses = ["pending", "shipping", "shipped"];
 const betaCollectionStatuses = ["pending", "shipping", "shipped", "converted"];
 const CONVERSION_RATE = 0.8;
 const CHAT_COOLDOWN_MS = 3000;
-const PUBLIC_CARD_SHOWCASE_LIMIT = 12;
 const MY_RECORDS_PAGE_SIZE = 6;
+const MY_COLLECTION_PAGE_SIZE = 12;
+const PLAYER_CARD_BATCH_SIZE = 40;
+const ADMIN_CARD_BATCH_SIZE = 80;
+const FIRESTORE_SAFE_BATCH_SIZE = 400;
 const TOKEN_REQUEST_COOLDOWN_MS = 10 * 60 * 1000;
 const TOKEN_REQUEST_WINDOW_MS = 24 * 60 * 60 * 1000;
 const TOKEN_REQUEST_DAILY_LIMIT = 5;
@@ -197,6 +201,16 @@ function getCardModePrices(card) {
     fifth: Math.max(1, Number(card?.modePrices?.fifth || fallback)),
     tenth: Math.max(1, Number(card?.modePrices?.tenth || fallback)),
   };
+}
+
+function normalizeManualCardPrices(prices) {
+  const normalized = Object.fromEntries(
+    ["half", "fifth", "tenth"].map((key) => {
+      const value = Number(prices?.[key]);
+      return [key, Number.isFinite(value) ? Math.round(value * 100) / 100 : 0];
+    }),
+  );
+  return Object.values(normalized).every((value) => value > 0) ? normalized : null;
 }
 
 // Prices are derived from the selected heaven/hell pair and one global margin multiplier.
@@ -332,6 +346,7 @@ const TOKEN_PACKAGES = [
   { hkd: 30000, tokens: 35100 },
 ];
 const TOKEN_PACKAGE_RATE_VERSION = 2;
+const DEFAULT_HOMEPAGE_BANNER_URL = "/default-live-banner.jpg";
 
 const DEFAULT_VIP_TIERS = [
   { id: "vip0", name: "VIP0", threshold: 3000, rewardCardId: "", rewardName: "M2 卡包" },
@@ -362,6 +377,13 @@ const BETA_PAYMENT_SECTION = {
   label: "付款設定",
   eyebrow: "Payment settings",
   icon: Copy,
+};
+
+const BETA_BANNER_SECTION = {
+  id: "banner",
+  label: "Banner 設定",
+  eyebrow: "Homepage banner",
+  icon: ImagePlus,
 };
 
 const BETA_DEMO_SESSION_KEY = "livedraw-beta-demo";
@@ -415,6 +437,7 @@ const BETA_DEMO_RECORDS = [
     number: 17,
     tokenCost: 1200,
     targetCardName: "Pikachu VMAX",
+    createdAt: "2026-09-17T11:20:00+09:00",
   },
   {
     id: "demo-complete",
@@ -428,6 +451,8 @@ const BETA_DEMO_RECORDS = [
     targetCardName: "Charizard ex",
     cardId: "demo-card-charizard",
     cardName: "Charizard ex",
+    createdAt: "2026-09-15T18:35:00+09:00",
+    assignedAt: "2026-09-15T19:10:00+09:00",
   },
 ];
 const BETA_DEMO_COLLECTION = [
@@ -450,7 +475,25 @@ const BETA_DEMO_COLLECTION = [
     cardName: "Mew VMAX",
     cardValue: 650,
     collectionStatus: "shipping",
+    deliveryStatus: "in_transit",
     trackingNumber: "DEMO123456789",
+    createdAt: "2026-09-12T14:10:00+09:00",
+    assignedAt: "2026-09-12T14:50:00+09:00",
+  },
+  {
+    id: "demo-card-awaiting-shipping",
+    uid: BETA_DEMO_PROFILE.uid,
+    drawTitle: "Saturday Live Draw",
+    roomSlug: "saturday-live-draw",
+    round: "round-002",
+    number: 12,
+    cardId: "demo-card-awaiting",
+    cardName: "Pikachu ex",
+    cardValue: 580,
+    collectionStatus: "shipping",
+    shippingRequested: true,
+    createdAt: "2026-09-11T16:10:00+09:00",
+    assignedAt: "2026-09-11T16:45:00+09:00",
   },
   {
     id: "demo-card-processed",
@@ -463,6 +506,10 @@ const BETA_DEMO_COLLECTION = [
     cardName: "Lugia V",
     cardValue: 500,
     collectionStatus: "shipped",
+    deliveryStatus: "delivered",
+    deliveredAt: "2026-09-10T13:20:00+09:00",
+    createdAt: "2026-09-08T20:15:00+09:00",
+    assignedAt: "2026-09-08T20:45:00+09:00",
   },
 ];
 
@@ -608,7 +655,6 @@ function App() {
     };
   }, [authUser, profile?.username]);
 
-  const isAdmin = profile?.role === "admin";
   const signedIn = Boolean(authUser || demoMode);
   const activeProfile = demoMode ? BETA_DEMO_PROFILE : profile;
   const needsUsername = Boolean(
@@ -625,11 +671,11 @@ function App() {
       { id: "tokens", label: "申請代幣", icon: BadgeDollarSign },
       { id: "history", label: "我的紀錄", icon: ListChecks },
       { id: "collection", label: "我的卡牌", icon: Boxes },
-      ...(isAdmin || (isBeta && !signedIn)
-        ? [{ id: "admin", label: "管理後台", icon: Shield }]
+      ...(isBeta && signedIn
+        ? [{ id: "account", label: "帳戶", icon: UserRoundPlus }]
         : []),
     ],
-    [isAdmin, isBeta, signedIn],
+    [isBeta, signedIn],
   );
 
   async function handleLogin() {
@@ -829,7 +875,7 @@ function App() {
         ) : (
           <>
             {!isBeta && (
-              <AccountPanel authUser={authUser} profile={profile} isAdmin={isAdmin} setActiveTab={setActiveTab} />
+              <AccountPanel authUser={authUser} profile={profile} setActiveTab={setActiveTab} />
             )}
             <section className="workspace">
               {activeTab === "draw" && <DrawCard profile={activeProfile} />}
@@ -837,7 +883,9 @@ function App() {
               {activeTab === "tokens" && <TokenRequest profile={activeProfile} />}
               {activeTab === "history" && <MyRecords profile={activeProfile} />}
               {activeTab === "collection" && <CollectionPage profile={activeProfile} />}
-              {activeTab === "admin" && isAdmin && <AdminPanel profile={activeProfile} />}
+              {activeTab === "account" && isBeta && (
+                <BetaAccountSettings authUser={authUser} profile={activeProfile} />
+              )}
             </section>
           </>
         )}
@@ -863,7 +911,7 @@ function BetaGuestGate({ activeTab, authError, onLogin }) {
     tokens: "申請代幣",
     history: "我的紀錄",
     collection: "我的卡牌",
-    admin: "管理後台",
+    account: "帳戶設定",
   };
 
   return (
@@ -1383,22 +1431,39 @@ function UsernameGate({ authUser, profile, conflict = false }) {
   );
 }
 
-function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
-  const [recentPicks, setRecentPicks] = useState([]);
-  const [recentPicksLoading, setRecentPicksLoading] = useState(true);
-  const [roomsById, setRoomsById] = useState({});
-  const [accountRoomsLoading, setAccountRoomsLoading] = useState(true);
+// Keeps the editable player name available in the beta layout without rewriting any historical snapshots.
+function BetaAccountSettings({ authUser, profile }) {
+  return (
+    <section className="panel beta-account-settings">
+      <div className="section-heading">
+        <UserRoundPlus size={24} />
+        <div>
+          <p className="eyebrow">Account</p>
+          <h1>帳戶設定</h1>
+        </div>
+      </div>
+      <div className="profile-row">
+        <span className="avatar-initial">
+          {(profile?.username || authUser?.displayName || "P").trim().charAt(0).toUpperCase()}
+        </span>
+        <div>
+          <strong>{profile?.username || "玩家"}</strong>
+          <span>{authUser?.email || ""}</span>
+        </div>
+      </div>
+      {profile?.isDemo ? (
+        <p className="muted">示範帳戶不會儲存名稱；請使用正式帳戶登入後更改。</p>
+      ) : (
+        <UsernameEditForm authUser={authUser} profile={profile} />
+      )}
+    </section>
+  );
+}
+
+function UsernameEditForm({ authUser, profile }) {
   const [username, setUsername] = useState(profile?.username || "");
   const [savingUsername, setSavingUsername] = useState(false);
   const [usernameSaved, setUsernameSaved] = useState(false);
-  const [pickSectionsOpen, setPickSectionsOpen] = useState({
-    active: true,
-    completed: false,
-  });
-  const initial = (profile?.username || authUser.displayName || authUser.email || "D")
-    .trim()
-    .charAt(0)
-    .toUpperCase();
 
   useEffect(() => {
     setUsername(profile?.username || "");
@@ -1422,6 +1487,48 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
       setSavingUsername(false);
     }
   }
+
+  return (
+    <form className="stack-form username-edit-form" onSubmit={saveUsername}>
+      <label>
+        玩家名稱
+        <input
+          value={username}
+          onChange={(event) => {
+            setUsername(event.target.value);
+            setUsernameSaved(false);
+          }}
+          placeholder="e.g. nick_draws"
+          maxLength={24}
+          pattern="[A-Za-z0-9_]{3,24}"
+          title="只可使用英文字母、數字及底線"
+          required
+        />
+      </label>
+      <p className="muted username-edit-hint">
+        名稱必須獨有；改名不會更改以往抽卡、交易或聊天紀錄內保存的名稱。
+      </p>
+      <button className="small-btn" type="submit" disabled={savingUsername}>
+        <Pencil size={16} />
+        {savingUsername ? "儲存中..." : usernameSaved ? "已儲存" : "更改名稱"}
+      </button>
+    </form>
+  );
+}
+
+function AccountPanel({ authUser, profile, setActiveTab }) {
+  const [recentPicks, setRecentPicks] = useState([]);
+  const [recentPicksLoading, setRecentPicksLoading] = useState(true);
+  const [roomsById, setRoomsById] = useState({});
+  const [accountRoomsLoading, setAccountRoomsLoading] = useState(true);
+  const [pickSectionsOpen, setPickSectionsOpen] = useState({
+    active: true,
+    completed: false,
+  });
+  const initial = (profile?.username || authUser.displayName || authUser.email || "D")
+    .trim()
+    .charAt(0)
+    .toUpperCase();
 
   useEffect(() => {
     if (!profile?.uid) return undefined;
@@ -1448,7 +1555,10 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
   }, [profile?.uid]);
 
   useEffect(() => {
-    const roomsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
+    const roomsQuery = query(
+      collection(db, "draws"),
+      where("status", "in", ["scheduled", "live"]),
+    );
     const stopRooms = onSnapshot(roomsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setRoomsById(
         Object.fromEntries(snapshot.docs.map((item) => [item.id, { id: item.id, ...item.data() }])),
@@ -1542,28 +1652,7 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
         </div>
       </div>
 
-      <form className="stack-form username-edit-form" onSubmit={saveUsername}>
-        <label>
-          玩家名稱
-          <input
-            value={username}
-            onChange={(event) => {
-              setUsername(event.target.value);
-              setUsernameSaved(false);
-            }}
-            placeholder="e.g. nick_draws"
-            maxLength={24}
-            pattern="[A-Za-z0-9_]{3,24}"
-            title="只可使用英文字母、數字及底線"
-            required
-          />
-        </label>
-        <p className="muted username-edit-hint">名稱必須獨有；更改後會釋放舊名稱。</p>
-        <button className="small-btn" type="submit" disabled={savingUsername}>
-          <Pencil size={16} />
-          {savingUsername ? "儲存中..." : usernameSaved ? "已儲存" : "更改名稱"}
-        </button>
-      </form>
+      <UsernameEditForm authUser={authUser} profile={profile} />
 
       <div className="wallet-card">
         <span>代幣</span>
@@ -1603,7 +1692,7 @@ function AccountPanel({ authUser, profile, isAdmin, setActiveTab }) {
 
       <div className="role-chip">
         <Shield size={16} />
-        {isAdmin ? "管理員" : "玩家"}
+        玩家
       </div>
     </aside>
   );
@@ -1675,6 +1764,7 @@ function DrawCard({ profile }) {
   const [selectedSlotNumber, setSelectedSlotNumber] = useState(null);
   const [selectedRound, setSelectedRound] = useState("");
   const [purchaseStep, setPurchaseStep] = useState(1);
+  const [completedRoundView, setCompletedRoundView] = useState(false);
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const pendingRoomRoundRef = useRef("");
 
@@ -1827,6 +1917,7 @@ function DrawCard({ profile }) {
     setSelectedSlotNumber(null);
     setSelectedRound(roundOptions.includes(pendingRound) ? pendingRound : selectedRoomDefaultRound);
     setPurchaseStep(1);
+    setCompletedRoundView(false);
     setMobileChatOpen(false);
   }, [roundOptions, selectedRoomDefaultRound, selectedRoomId]);
 
@@ -1844,7 +1935,7 @@ function DrawCard({ profile }) {
   }, [activeRoundId, selectedCardId]);
 
   useEffect(() => {
-    if (!selectedRoom?.id || !activeRoundId) {
+    if (!selectedRoom?.id || !activeRoundId || !profile?.uid || profile.isDemo) {
       setSlots([]);
       setSlotsLoading(false);
       return undefined;
@@ -1882,7 +1973,7 @@ function DrawCard({ profile }) {
     );
 
     return stopSlots;
-  }, [activeRoundId, selectedRoom?.id]);
+  }, [activeRoundId, profile?.isDemo, profile?.uid, selectedRoom?.id]);
 
   useEffect(() => {
     if (!selectedSlotNumber) return;
@@ -2076,6 +2167,15 @@ function DrawCard({ profile }) {
   // Every unfinished round in the same live session can be purchased in advance.
   // Keep an already selected card only when that card is also enabled for the new round's odds.
   function selectPurchaseRound(roundId) {
+    if (isBeta && getRoundDisplayStatus(selectedRoom, roundId).key === "completed") {
+      setSelectedRound(roundId);
+      setSelectedSlotNumber(null);
+      setCompletedRoundView(true);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+
+    setCompletedRoundView(false);
     const nextRoundCards = buildRoomCards(selectedRoom, cardLibrary, roundId);
     const cardRemainsAvailable = nextRoundCards.some((card) => card.id === selectedCardId);
 
@@ -2106,6 +2206,7 @@ function DrawCard({ profile }) {
     window.history.pushState({}, "", makeRoomLink(option.roomId));
     setRoomSlug(option.roomId);
     setPurchaseStep(1);
+    setCompletedRoundView(false);
     window.setTimeout(() => {
       document.querySelector(".room-round-overview")?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 80);
@@ -2146,6 +2247,26 @@ function DrawCard({ profile }) {
         loading={slotsLoading}
         onBack={() => currentBetaLive ? openRoom(currentBetaLive) : backToRooms()}
         onRoundChange={setSelectedRound}
+        profile={profile}
+        room={selectedRoom}
+        roundOptions={roundOptions}
+        slots={slots}
+      />
+    );
+  }
+
+  if (isBeta && completedRoundView) {
+    return (
+      <CompletedRoundResultView
+        activeRoundId={activeRoundId}
+        loading={slotsLoading}
+        onBack={() => {
+          setCompletedRoundView(false);
+          setSelectedRound(toRoundId(getRoomCurrentRound(selectedRoom)));
+          setPurchaseStep(1);
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        }}
+        onRoundChange={selectPurchaseRound}
         profile={profile}
         room={selectedRoom}
         roundOptions={roundOptions}
@@ -2216,6 +2337,7 @@ function DrawCard({ profile }) {
         {isBeta && purchaseStep === 1 && (
           <DesktopNumberOccupancy
             activeRoundId={activeRoundId}
+            draw={selectedRoom}
             loading={slotsLoading}
             profile={profile}
             slots={slots}
@@ -2407,9 +2529,19 @@ function BetaSingleHallIntro({ cards, rooms, onOpenRoom, onSelectCard }) {
           ))}
         </div>
       </div>
-      <div className="banner-slot" />
+      <HomepageBanner />
       <BetaPsaCarousel cards={cards} rooms={rooms} onOpenRoom={onOpenRoom} onSelectCard={onSelectCard} />
     </section>
+  );
+}
+
+function HomepageBanner() {
+  const banner = useHomepageBanner();
+
+  return (
+    <div className="banner-slot">
+      <img src={banner.imageUrl} alt="LiveDraw TCG 直播預告" />
+    </div>
   );
 }
 
@@ -2550,6 +2682,60 @@ function ArchivedLiveRoom({ activeRoundId, loading, onBack, onRoundChange, profi
   );
 }
 
+// Opens a finished round from the live schedule as a focused, read-only result page.
+function CompletedRoundResultView({ activeRoundId, loading, onBack, onRoundChange, profile, room, roundOptions, slots }) {
+  const occupiedCount = slots.filter((slot) => slot.status !== "available").length;
+
+  return (
+    <div className="archived-live-page completed-round-result-page">
+      <button className="small-btn back-link" type="button" onClick={onBack}>
+        <ChevronLeft size={17} />返回直播抽卡
+      </button>
+      <section className="panel archived-live-header">
+        <div>
+          <p className="eyebrow">已完成場次</p>
+          <h1>{room.title || "直播抽卡"} · {formatRoundLabel(activeRoundId)}</h1>
+          <span>賽果、天堂／地獄及所有已選號碼均為唯讀。</span>
+        </div>
+        <b>賽果</b>
+      </section>
+      <RoomRoundOverview
+        draw={room}
+        activeRoundId={activeRoundId}
+        roundOptions={roundOptions}
+        onRoundChange={onRoundChange}
+      />
+      <section className="panel archived-number-records" aria-label={`${formatRoundLabel(activeRoundId)}號碼賽果`}>
+        <header>
+          <div><h2>{formatRoundLabel(activeRoundId)}號碼賽果</h2><span>{occupiedCount} / {slots.length || room.cardCount || 20} 已選</span></div>
+          <small>唯讀</small>
+        </header>
+        <div className="archive-slot-grid">
+          {loading ? <InlineLoading label="正在載入號碼賽果..." /> : slots.map((slot) => {
+            const occupied = slot.status !== "available";
+            const mine = occupied && slot.uid === profile?.uid;
+            const ownerLabel = mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選";
+            const resultSide = getRoundSlotResultSide(room, activeRoundId, slot);
+            return (
+              <div
+                aria-label={`號碼 ${slot.number}，${ownerLabel}${resultSide ? `，${getResultSideLabel(resultSide)}` : ""}`}
+                className={[mine ? "mine" : occupied ? "occupied" : "", resultSide ? `result-${resultSide}` : ""].filter(Boolean).join(" ")}
+                key={slot.id}
+              >
+                <strong className={resultSide ? `archive-slot-outcome ${resultSide}` : ""}>
+                  {resultSide && <i aria-hidden="true" />}
+                  {resultSide ? getResultSideLabel(resultSide) : slot.number}
+                </strong>
+                <small>{resultSide ? `#${slot.number} · ${ownerLabel}` : ownerLabel}</small>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function BetaStickyControls({ actionBarVisible = false, onOpenChat, onOpenNumbers, profile }) {
   function openRecords() {
     if (!profile?.uid) {
@@ -2588,7 +2774,7 @@ function BetaStickyControls({ actionBarVisible = false, onOpenChat, onOpenNumber
 }
 
 // Keeps the current round's number usage visible beside the card list on desktop.
-function DesktopNumberOccupancy({ activeRoundId, loading, profile, slots }) {
+function DesktopNumberOccupancy({ activeRoundId, draw, loading, profile, slots }) {
   const occupiedCount = slots.filter((slot) => slot.status !== "available").length;
 
   return (
@@ -2606,17 +2792,22 @@ function DesktopNumberOccupancy({ activeRoundId, loading, profile, slots }) {
         ) : slots.map((slot) => {
           const occupied = slot.status !== "available";
           const mine = occupied && slot.uid === profile?.uid;
+          const resultSide = getRoundSlotResultSide(draw, activeRoundId, slot);
+          const ownerLabel = mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選";
           return (
             <button
-              className={mine ? "mine" : occupied ? "occupied" : ""}
+              aria-label={`號碼 ${slot.number}，${ownerLabel}${resultSide ? `，${getResultSideLabel(resultSide)}` : ""}`}
+              className={[mine ? "mine" : occupied ? "occupied" : "", resultSide ? `result-${resultSide}` : ""].filter(Boolean).join(" ")}
               disabled
               key={slot.id}
               type="button"
             >
-              {occupied && !mine
+              {resultSide
+                ? <strong className={`number-slot-outcome ${resultSide}`}><i aria-hidden="true" />{getResultSideLabel(resultSide)}</strong>
+                : occupied && !mine
                 ? <X className="number-taken-cross" aria-hidden="true" />
                 : <strong>{slot.number}</strong>}
-              <small>{mine ? "我的號碼" : occupied ? slot.username || "已選" : "未選"}</small>
+              <small>{resultSide ? `#${slot.number} · ${ownerLabel}` : ownerLabel}</small>
             </button>
           );
         })}
@@ -2625,6 +2816,8 @@ function DesktopNumberOccupancy({ activeRoundId, loading, profile, slots }) {
         <span><i />未選</span>
         <span><i className="taken" aria-hidden="true" />已被選</span>
         <span><i />我的號碼</span>
+        <span><i className="heaven" aria-hidden="true" />天堂</span>
+        <span><i className="hell" aria-hidden="true" />地獄</span>
       </div>
     </aside>
   );
@@ -2948,7 +3141,7 @@ function RoomList({ rooms, cards = [], error, loading, onOpenRoom, profile }) {
       <section className="panel empty-state">
         <Gavel size={36} />
         <h2>暫時沒有房間</h2>
-        <p className="muted">管理員可於管理後台建立新的抽卡房間。</p>
+        <p className="muted">管理員可於獨立管理 App 建立新的抽卡房間。</p>
       </section>
     );
   }
@@ -2973,9 +3166,7 @@ function RoomList({ rooms, cards = [], error, loading, onOpenRoom, profile }) {
           </div>
         </div>
       )}
-      <div className="banner-slot">
-
-      </div>
+      <HomepageBanner />
       {isBeta && <BetaPsaCarousel cards={cards} rooms={rooms} onOpenRoom={onOpenRoom} />}
       {isBeta && (
         <div className="beta-room-filters" aria-label="房間篩選">
@@ -3086,26 +3277,40 @@ const CardPoolPreview = memo(function CardPoolPreview({
 }) {
   const [categoryFilter, setCategoryFilter] = useState("全部");
   const [priceSort, setPriceSort] = useState("high");
+  const [cardSearch, setCardSearch] = useState("");
+  const [visibleLimit, setVisibleLimit] = useState(PLAYER_CARD_BATCH_SIZE);
   const cardGridRef = useRef(null);
   const categories = useMemo(
     () => getCardCategories(cards, cardCategories),
     [cardCategories, cards],
   );
-  const visibleCards = useMemo(
+  const filteredCards = useMemo(
     () =>
       cards
         .filter((card) => categoryFilter === "全部" || getCardCategory(card) === categoryFilter)
+        .filter((card) => {
+          const keyword = cardSearch.trim().toLocaleLowerCase("zh-HK");
+          if (!keyword) return true;
+          return String(card.name || "").toLocaleLowerCase("zh-HK").includes(keyword)
+            || getCardCategory(card).toLocaleLowerCase("zh-HK").includes(keyword)
+            || String(card.tokenValue || "").includes(keyword);
+        })
         .sort((a, b) =>
           priceSort === "high"
             ? Number(b.tokenValue || 0) - Number(a.tokenValue || 0)
             : Number(a.tokenValue || 0) - Number(b.tokenValue || 0),
         ),
-    [cards, categoryFilter, priceSort],
+    [cardSearch, cards, categoryFilter, priceSort],
+  );
+  const visibleCards = useMemo(
+    () => filteredCards.slice(0, visibleLimit),
+    [filteredCards, visibleLimit],
   );
 
   useEffect(() => {
+    setVisibleLimit(PLAYER_CARD_BATCH_SIZE);
     cardGridRef.current?.scrollTo({ left: 0, top: 0, behavior: "smooth" });
-  }, [categoryFilter, priceSort]);
+  }, [cardSearch, categoryFilter, priceSort]);
 
   return (
     <section id="card-selection" className="panel card-pool-preview">
@@ -3148,6 +3353,16 @@ const CardPoolPreview = memo(function CardPoolPreview({
               </button>
             </div>
           </div>
+          <div className="card-search player-card-search">
+            <Search size={17} />
+            <input
+              value={cardSearch}
+              onChange={(event) => setCardSearch(event.target.value)}
+              placeholder="搜尋卡名、分類或代幣"
+              type="search"
+            />
+            <span>{visibleCards.length} / {filteredCards.length}</span>
+          </div>
           <div className="card-step-action">
             <div>
               <span>已選卡牌</span>
@@ -3184,6 +3399,18 @@ const CardPoolPreview = memo(function CardPoolPreview({
               </button>
             ))}
           </div>
+          {!filteredCards.length && (
+            <p className="form-note">沒有符合搜尋條件的卡牌。</p>
+          )}
+          {visibleCards.length < filteredCards.length && (
+            <button
+              className="small-btn player-card-load-more"
+              type="button"
+              onClick={() => setVisibleLimit((current) => current + PLAYER_CARD_BATCH_SIZE)}
+            >
+              顯示更多（尚有 {filteredCards.length - visibleCards.length} 張）
+            </button>
+          )}
         </>
       ) : draw.poolText ? (
         <p>{draw.poolText}</p>
@@ -3249,6 +3476,7 @@ function RoomRoundOverview({
           const roundStatus = getRoundDisplayStatus(draw, roundId);
           return (
             <button
+              aria-label={`${roundStatus.label} ${formatRoundLabel(roundId)}${roundStatus.key === "completed" ? "，查看賽果" : ""}`}
               className={activeRoundId === roundId ? "active" : ""}
               key={roundId}
               type="button"
@@ -3262,7 +3490,7 @@ function RoomRoundOverview({
           );
         })}
       </div>
-      {activeRoundStatus.key === "completed" && (
+      {(activeResultImage || activeRoundStatus.key === "completed") && (
         <section className="round-overview-result" aria-label={`${formatRoundLabel(activeRoundId)}過往賽果`}>
           <div>
             <FileImage size={17} />
@@ -3398,9 +3626,12 @@ function NumberGrid({
           const locked = slot.status !== "available";
           const mine = locked && slot.uid === profile?.uid;
           const selected = roundIsPurchasable && !buyingBlocked && !locked && slot.number === selectedSlotNumber;
+          const resultSide = getRoundSlotResultSide(draw, activeRoundId, slot);
+          const ownerLabel = mine ? "你的號碼" : locked ? slot.username || "已被選走" : "";
           return (
             <button
-              className={
+              aria-label={`號碼 ${slot.number}${ownerLabel ? `，${ownerLabel}` : ""}${resultSide ? `，${getResultSideLabel(resultSide)}` : ""}`}
+              className={`${
                 mine
                   ? "slot mine"
                   : locked
@@ -3408,17 +3639,21 @@ function NumberGrid({
                     : selected
                       ? "slot selected"
                       : "slot"
-              }
+              }${resultSide ? ` result-${resultSide}` : ""}`}
               disabled={!roundIsPurchasable || buyingBlocked || !selectedCard || locked || buyingNumber === slot.number}
               key={slot.id}
               type="button"
               onClick={() => onSelectNumber(slot.number)}
             >
-              {locked && !mine
+              {resultSide
+                ? <strong className={`number-slot-outcome ${resultSide}`}><i aria-hidden="true" />{getResultSideLabel(resultSide)}</strong>
+                : locked && !mine
                 ? <X className="number-taken-cross" aria-hidden="true" />
                 : <strong>{slot.number}</strong>}
               <small>
-                {mine
+                {resultSide
+                  ? `#${slot.number} · ${ownerLabel}`
+                  : mine
                   ? "你的號碼"
                   : locked
                     ? slot.username || "已被選走"
@@ -3440,9 +3675,11 @@ function NumberGrid({
         <span><i />可選</span>
         <span><i className="taken" aria-hidden="true" />已被選走</span>
         <span><i />我的號碼</span>
+        <span><i className="heaven" aria-hidden="true" />天堂</span>
+        <span><i className="hell" aria-hidden="true" />地獄</span>
       </div>
       <div className="number-divider" />
-      {(roundHasEnded || draw.status === "completed") && roundResultImage && (
+      {roundResultImage && (
         <section className="room-round-result after-grid" aria-label={`${formatRoundLabel(activeRoundId)}賽果相片`}>
           <div className="room-round-result-heading">
             <FileImage size={18} />
@@ -3906,9 +4143,35 @@ function RoomThumbnail({ draw }) {
   );
 }
 
+// Shows the exact reward card selected by the administrator, with a decorative fallback.
+function VipTierArtwork({ tierIndex, imageUrl, rewardName }) {
+  const ArtworkIcon = [Gift, Zap, Crown, Shield, Crown][tierIndex % 5] || Crown;
+
+  if (imageUrl) {
+    return (
+      <div className="vip-tier-reward-image">
+        <img src={imageUrl} alt={rewardName || `VIP${tierIndex} 獎勵卡牌`} />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      aria-hidden="true"
+      className={`vip-tier-artwork level-${tierIndex % 5}`}
+      data-level={`VIP ${tierIndex}`}
+    >
+      <i className="vip-art-orbit one" />
+      <i className="vip-art-orbit two" />
+      <ArtworkIcon size={31} strokeWidth={1.8} />
+    </div>
+  );
+}
+
 function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
   const vip = getVipState(tiers, deposit);
   const [claimingId, setClaimingId] = useState("");
+  const [claimedRewardIds, setClaimedRewardIds] = useState(() => new Set());
   const rewardsByTier = useMemo(
     () => new Map(rewards.map((reward) => [reward.vipTierId, reward])),
     [rewards],
@@ -3982,6 +4245,7 @@ function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
           updatedAt: serverTimestamp(),
         });
       });
+      setClaimedRewardIds((current) => new Set([...current, rewardId]));
       alert("VIP 卡牌獎勵已領取，已加入「我的卡牌」。");
     } catch (error) {
       showSafeError(error);
@@ -4021,9 +4285,10 @@ function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
       <div className="vip-tier-grid">
         {vip.tiers.map((tier, index) => {
           const reward = rewardsByTier.get(tier.id);
-          const rewardClaimed = Boolean(reward?.cardId || reward?.vipRewardStatus === "claimed");
-          const rewardClaimable = Boolean(tier.done && !rewardClaimed);
           const rewardId = reward?.id || `vip_${profile.uid}_${tier.id}`;
+          const rewardClaimed = claimedRewardIds.has(rewardId)
+            || Boolean(reward?.cardId || reward?.vipRewardStatus === "claimed");
+          const rewardClaimable = Boolean(tier.done && !rewardClaimed);
           const tierState = rewardClaimed
             ? "已領取"
             : rewardClaimable
@@ -4042,6 +4307,11 @@ function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
             <div className="vip-shield">{index}</div>
             <div className="vip-tier-state">{tierState}</div>
             <div className="vip-tier-detail">
+              <VipTierArtwork
+                tierIndex={index}
+                imageUrl={tier.rewardImageUrl}
+                rewardName={tier.rewardName}
+              />
               <strong>{tier.name}</strong>
               <b>HK${formatTokenNumber(tier.threshold)}</b>
               <span>{tier.rewardName || "待設定升級獎勵"}</span>
@@ -4664,25 +4934,22 @@ function MyRecords({ profile }) {
       setSlotRecords([]);
       return undefined;
     }
-    const roomIds = Object.keys(roomsById);
-    if (!roomIds.length) {
-      setSlotRecords([]);
-      return undefined;
-    }
+    const slotQuery = query(
+      collectionGroup(db, "slots"),
+      where("uid", "==", profile.uid),
+    );
 
-    const slotsByRoom = {};
-    const stops = roomIds.map((roomId) => {
-      const slotQuery = query(
-        collection(db, "draws", roomId, "slots"),
-        where("uid", "==", profile.uid),
-      );
-
-      return onSnapshot(
-        slotQuery,
-        (snapshot) => {
-          slotsByRoom[roomId] = snapshot.docs.map((item) => ({
-            id: `slot-${roomId}-${item.id}`,
+    return onSnapshot(
+      slotQuery,
+      (snapshot) => {
+        setSlotRecords(snapshot.docs.map((item) => {
+          const pathParts = item.ref.path.split("/");
+          const roomId = pathParts[1] || "";
+          const roundId = pathParts[2] === "rounds" ? pathParts[3] : "";
+          return {
+            id: `slot-${roomId}-${roundId || "legacy"}-${item.id}`,
             drawId: roomId,
+            round: roundId,
             number: Number(item.data().number || item.id),
             tokenCost: Number(item.data().tokenCost || 0),
             targetCardId: item.data().targetCardId || "",
@@ -4691,17 +4958,14 @@ function MyRecords({ profile }) {
             targetCardValue: Number(item.data().targetCardValue || item.data().tokenCost || 0),
             createdAt: item.data().updatedAt || item.data().createdAt,
             slotOnly: true,
-          }));
-          setSlotRecords(Object.values(slotsByRoom).flat());
-        },
-        (error) => {
-          console.error("Slot history listener failed.", error);
-        },
-      );
-    });
-
-    return () => stops.forEach((stop) => stop());
-  }, [profile.isDemo, profile.uid, roomsById]);
+          };
+        }));
+      },
+      (error) => {
+        console.error("Slot history listener failed.", error);
+      },
+    );
+  }, [profile.isDemo, profile.uid]);
 
   const mergedRecords = useMemo(
     () => mergePurchaseRecords(records, slotRecords, roomsById),
@@ -4758,6 +5022,7 @@ function MyRecords({ profile }) {
                     <strong>{record.drawTitle || record.roomSlug || "抽卡房"}</strong>
                     <p>{record.targetCardName || "等待開牌"}</p>
                     <small>{formatRoundLabel(record.round)} · 直播中</small>
+                    <small className="record-acquired-time">取得時間：{formatRecordAcquiredTime(record)}</small>
                   </div>
                 </article>
               ))}
@@ -4793,10 +5058,16 @@ function MyRecords({ profile }) {
                         <Package size={18} />
                       )}
                     </span>
-                    <span><strong>{record.cardName || "未分配卡牌"}</strong><small>所屬盲盒：{record.targetCardName || "未選卡牌"}</small></span>
+                    <span>
+                      <strong>{record.cardName || "未分配卡牌"}</strong>
+                      <small>所屬盲盒：{record.targetCardName || "未選卡牌"}</small>
+                      <small className="record-acquired-time">取得時間：{formatRecordAcquiredTime(record)}</small>
+                    </span>
                   </span>
                   <b>#{record.number}</b>
-                  <TokenAmount value={record.cardValue || record.targetCardValue || record.tokenCost} />
+                  <span className="history-paid-token">
+                    繳付代幣：{formatTokenNumber(getOriginalDrawPrice(record))}
+                  </span>
                   <span className={`status-badge ${record.cardId ? (record.resultSide === "hell" ? "hell" : "heaven") : "pending"}`}>
                     {record.cardId ? getResultSideLabel(record.resultSide) : "待開牌"}
                   </span>
@@ -4843,7 +5114,10 @@ function MyRecords({ profile }) {
           {allRecordsPage.items.map((record) => (
             <article className="history-row" key={record.id}>
               <span>{record.roomSlug || record.drawId}</span>
-              <strong>{record.targetCardName || record.cardName || record.drawTitle}</strong>
+              <span className="history-card-title">
+                <strong>{record.targetCardName || record.cardName || record.drawTitle}</strong>
+                <small className="record-acquired-time">取得時間：{formatRecordAcquiredTime(record)}</small>
+              </span>
               <b>#{record.number}</b>
               <TokenAmount value={record.tokenCost} />
               <span className={`status-badge ${record.cardId ? "approved" : "pending"}`}>
@@ -4891,7 +5165,10 @@ function CollectionPage({ profile }) {
   const [activeStatus, setActiveStatus] = useState("pending");
   const [collectionError, setCollectionError] = useState("");
   const [collectionLoading, setCollectionLoading] = useState(true);
-  const [selectedShippingIds, setSelectedShippingIds] = useState([]);
+  const [selectedPendingIds, setSelectedPendingIds] = useState([]);
+  const [collectionPage, setCollectionPage] = useState(1);
+  const [collectionActionBusy, setCollectionActionBusy] = useState(false);
+  const [collectionActionProgress, setCollectionActionProgress] = useState("");
   const [shippingIds, setShippingIds] = useState([]);
   const [shippingForm, setShippingForm] = useState({
     name: "",
@@ -4945,6 +5222,27 @@ function CollectionPage({ profile }) {
     if (!isBeta) return (record.collectionStatus || "pending") === activeStatus;
     return getBetaCollectionRecordStatus(record) === activeStatus;
   });
+  const visibleRecordsPage = getPaginationPage(
+    visibleRecords,
+    collectionPage,
+    MY_COLLECTION_PAGE_SIZE,
+  );
+
+  useEffect(() => {
+    setCollectionPage(1);
+  }, [activeStatus]);
+
+  useEffect(() => {
+    const pendingIds = new Set(
+      records
+        .filter((record) => getBetaCollectionRecordStatus(record) === "pending")
+        .map((record) => record.id),
+    );
+    setSelectedPendingIds((current) => {
+      const next = current.filter((id) => pendingIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [records]);
   const totalValue = records.reduce(
     (sum, record) => sum + Number(record.cardValue || record.tokenCost || 0),
     0,
@@ -4960,18 +5258,17 @@ function CollectionPage({ profile }) {
   async function convertCardToTokens(record, { skipConfirm = false } = {}) {
     if (profile.isDemo) {
       alert("Demo Account 只供預覽，不會轉回代幣。");
-      return;
+      return false;
     }
     const refund = getCardConversionRefund(record);
 
-    if (!refund || record.convertedToTokens) return;
+    if (!refund || record.convertedToTokens) return false;
 
     if (!skipConfirm) {
-      const originalValue = Number(record.cardValue || record.tokenCost || 0);
       const confirmed = window.confirm(
-        `將「${record.cardName}」轉回 ${formatTokenNumber(refund)} 代幣？卡牌原值 ⚡ ${formatTokenNumber(originalValue)}。`,
+        `將「${record.cardName}」轉回 ${formatTokenNumber(refund)} 代幣？`,
       );
-      if (!confirmed) return;
+      if (!confirmed) return false;
     }
 
     try {
@@ -5008,30 +5305,50 @@ function CollectionPage({ profile }) {
           updatedAt: serverTimestamp(),
         });
       });
+      return true;
     } catch (error) {
       showSafeError(error);
+      return false;
     }
   }
 
-  async function convertVisibleCards() {
+  async function convertSelectedCards() {
     if (profile.isDemo) {
       alert("Demo Account 只供預覽，不會轉回代幣。");
       return;
     }
-    if (!visibleRecords.length) return;
+    const selectedRecords = isBeta
+      ? visibleRecords.filter((record) => selectedPendingIds.includes(record.id))
+      : visibleRecords;
+    if (!selectedRecords.length) {
+      alert("請先選擇要轉換成代幣的卡牌。");
+      return;
+    }
 
-    const totalRefund = visibleRecords.reduce(
+    const totalRefund = selectedRecords.reduce(
       (sum, record) => sum + getCardConversionRefund(record),
       0,
     );
     const confirmed = window.confirm(
-      `將目前 ${visibleRecords.length} 張卡牌按管理員設定價值轉回 ${formatTokenNumber(totalRefund)} 代幣？`,
+      `將${isBeta ? "已選的" : "目前"} ${selectedRecords.length} 張卡牌按管理員設定價值轉回 ${formatTokenNumber(totalRefund)} 代幣？`,
     );
     if (!confirmed) return;
 
-    for (const record of visibleRecords) {
-      // Keep one transaction per card so a single old record cannot block the rest.
-      await convertCardToTokens(record, { skipConfirm: true });
+    setCollectionActionBusy(true);
+    let convertedCount = 0;
+    try {
+      for (const [index, record] of selectedRecords.entries()) {
+        setCollectionActionProgress(`正在轉換 ${index + 1} / ${selectedRecords.length} 張卡牌`);
+        // Each conversion updates the same wallet. Sequential transactions avoid token-balance contention.
+        if (await convertCardToTokens(record, { skipConfirm: true })) convertedCount += 1;
+      }
+    } finally {
+      setCollectionActionBusy(false);
+      setCollectionActionProgress("");
+    }
+    setSelectedPendingIds((current) => current.filter((id) => !selectedRecords.some((record) => record.id === id)));
+    if (convertedCount && convertedCount !== selectedRecords.length) {
+      alert(`已成功轉換 ${convertedCount} / ${selectedRecords.length} 張卡牌，其餘卡牌請重新整理後再試。`);
     }
   }
 
@@ -5073,29 +5390,36 @@ function CollectionPage({ profile }) {
 
     setShippingBusy(true);
     try {
-      const batch = writeBatch(db);
-      shippingIds.forEach((recordId) => {
-        batch.update(doc(db, "drawRecords", recordId), {
-          collectionStatus: "shipping",
-          shippingRequested: true,
-          shippingRecipient: shippingForm.name.trim(),
-          shippingPhone: shippingForm.phone.trim(),
-          shippingRegion: shippingForm.region,
-          shippingMethod: shippingForm.method,
-          shippingAddress: shippingForm.address.trim(),
-          shippingNote: shippingForm.note.trim(),
-          shippingRequestedAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
+      for (let start = 0; start < shippingIds.length; start += FIRESTORE_SAFE_BATCH_SIZE) {
+        const recordIds = shippingIds.slice(start, start + FIRESTORE_SAFE_BATCH_SIZE);
+        setCollectionActionProgress(
+          `正在提交配送 ${Math.min(start + recordIds.length, shippingIds.length)} / ${shippingIds.length} 張卡牌`,
+        );
+        const batch = writeBatch(db);
+        recordIds.forEach((recordId) => {
+          batch.update(doc(db, "drawRecords", recordId), {
+            collectionStatus: "shipping",
+            shippingRequested: true,
+            shippingRecipient: shippingForm.name.trim(),
+            shippingPhone: shippingForm.phone.trim(),
+            shippingRegion: shippingForm.region,
+            shippingMethod: shippingForm.method,
+            shippingAddress: shippingForm.address.trim(),
+            shippingNote: shippingForm.note.trim(),
+            shippingRequestedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
         });
-      });
-      await batch.commit();
-      setSelectedShippingIds((current) => current.filter((id) => !shippingIds.includes(id)));
+        await batch.commit();
+      }
+      setSelectedPendingIds((current) => current.filter((id) => !shippingIds.includes(id)));
       setShippingIds([]);
       setActiveStatus("shipping");
     } catch (error) {
       showSafeError(error);
     } finally {
       setShippingBusy(false);
+      setCollectionActionProgress("");
     }
   }
 
@@ -5142,15 +5466,15 @@ function CollectionPage({ profile }) {
           </div>
           {activeStatus === "pending" && (
             <>
-              <button className="small-btn" type="button" onClick={convertVisibleCards}>
+              <button className="small-btn" type="button" onClick={convertSelectedCards}>
                 轉換為點數
               </button>
               {isBeta && (
                 <button
                   className="primary-btn"
                   type="button"
-                  onClick={() => openShippingRequest(selectedShippingIds)}
-                  disabled={!selectedShippingIds.length}
+                  onClick={() => openShippingRequest(selectedPendingIds)}
+                  disabled={!selectedPendingIds.length}
                 >
                   批次申請配送
                 </button>
@@ -5160,19 +5484,47 @@ function CollectionPage({ profile }) {
         </div>}
         {isBeta && activeStatus === "pending" && (
           <div className="beta-collection-actions">
+            <span className="beta-collection-selection-count">已選 {selectedPendingIds.length} 張</span>
+            <button
+              className="small-btn"
+              type="button"
+              disabled={collectionActionBusy || !visibleRecordsPage.items.length}
+              onClick={() => setSelectedPendingIds((current) => [
+                ...new Set([...current, ...visibleRecordsPage.items.map((record) => record.id)]),
+              ])}
+            >
+              選取本頁
+            </button>
+            <button
+              className="small-btn"
+              type="button"
+              disabled={collectionActionBusy || !selectedPendingIds.length}
+              onClick={() => setSelectedPendingIds([])}
+            >
+              清除選取
+            </button>
+            <button
+              className="small-btn"
+              type="button"
+              onClick={convertSelectedCards}
+              disabled={collectionActionBusy || !selectedPendingIds.length}
+            >
+              批量申請轉換代幣
+            </button>
             <button
               className="primary-btn"
               type="button"
-              onClick={() => openShippingRequest(selectedShippingIds)}
-              disabled={!selectedShippingIds.length}
+              onClick={() => openShippingRequest(selectedPendingIds)}
+              disabled={collectionActionBusy || !selectedPendingIds.length}
             >
               批次申請配送
             </button>
           </div>
         )}
+        {collectionActionProgress && <p className="form-note collection-action-progress">{collectionActionProgress}</p>}
         {visibleRecords.length ? (
           <div className="collection-grid">
-            {visibleRecords.map((record) => (
+            {visibleRecordsPage.items.map((record) => (
               <article className="collection-card" key={record.id}>
                 {record.cardImageUrl ? (
                   <img src={record.cardImageUrl} alt={record.cardName} />
@@ -5189,6 +5541,7 @@ function CollectionPage({ profile }) {
                       <span className="collection-room-meta">
                         {record.drawTitle || record.roomSlug || "抽卡房"} · {formatRoundLabel(record.round)}
                       </span>
+                      <span className="record-acquired-time">取得時間：{formatRecordAcquiredTime(record)}</span>
                       {record.source !== "vip" && (
                         <span className="collection-heaven-card">
                           <small>當日所選天堂卡</small>
@@ -5202,33 +5555,28 @@ function CollectionPage({ profile }) {
                     <>
                       <span>{record.cardCategory || "其他"}</span>
                       <span>{record.drawTitle} · #{record.number}</span>
+                      <span className="record-acquired-time">取得時間：{formatRecordAcquiredTime(record)}</span>
                     </>
                   )}
-                  <span className={`status-badge ${record.collectionStatus || "pending"}`}>
-                    {isBeta
-                      ? record.convertedToTokens
-                        ? "已轉回代幣"
-                        : record.collectionStatus === "shipped"
-                          ? "已配送"
-                          : getBetaCollectionStatusLabel(record.collectionStatus || "pending")
-                      : statusLabels[record.collectionStatus || "pending"]}
+                  <span className={`status-badge ${getCollectionStatusBadgeClass(record)}`}>
+                    {getCollectionDeliveryLabel(record)}
                   </span>
                   {isBeta && activeStatus === "pending" && (
                     <label className="collection-select-option">
                       <input
                         type="checkbox"
-                        checked={selectedShippingIds.includes(record.id)}
-                        onChange={(event) => setSelectedShippingIds((current) =>
+                        checked={selectedPendingIds.includes(record.id)}
+                        onChange={(event) => setSelectedPendingIds((current) =>
                           event.target.checked
                             ? [...new Set([...current, record.id])]
                             : current.filter((id) => id !== record.id),
                         )}
                       />
-                      選擇配送
+                      選擇卡牌
                     </label>
                   )}
                   {!record.convertedToTokens && activeStatus === "pending" && (
-                    <button className="small-btn" type="button" onClick={() => convertCardToTokens(record)}>
+                    <button className="small-btn" type="button" disabled={collectionActionBusy} onClick={() => convertCardToTokens(record)}>
                       轉回 {formatTokenNumber(getCardConversionRefund(record))} 代幣
                     </button>
                   )}
@@ -5257,6 +5605,12 @@ function CollectionPage({ profile }) {
         ) : (
           <p className="muted">這個狀態暫時未有卡牌。</p>
         )}
+        <RecordPagination
+          label={getBetaCollectionStatusLabel(activeStatus)}
+          page={visibleRecordsPage.page}
+          totalPages={visibleRecordsPage.totalPages}
+          onChange={setCollectionPage}
+        />
         </>
       ) : (
         <>
@@ -5337,6 +5691,8 @@ function CollectionPage({ profile }) {
   );
 }
 
+// Kept only as migration reference; Vite removes this entire block from public assets.
+// eslint-disable-next-line no-unused-vars
 function AdminPanel({ profile }) {
   const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
   const [activeAdminSection, setActiveAdminSection] = useState(isBeta ? "live" : "rooms");
@@ -5355,6 +5711,7 @@ function AdminPanel({ profile }) {
   const adminSections = isBeta
     ? [
         { id: "live", label: "直播管理", eyebrow: "Live", icon: Gavel },
+        BETA_BANNER_SECTION,
         ...ADMIN_SECTIONS.filter((section) => !["rooms", "create-room"].includes(section.id)),
         BETA_PAYMENT_SECTION,
       ]
@@ -5419,10 +5776,13 @@ function AdminPanel({ profile }) {
     const pendingShippingQuery = query(
       collection(db, "drawRecords"),
       where("shippingRequested", "==", true),
-      where("collectionStatus", "==", "shipping"),
     );
     return onSnapshot(pendingShippingQuery, (snapshot) => {
-      setPendingShippingCount(snapshot.size);
+      setPendingShippingCount(snapshot.docs.filter((item) => {
+        const record = item.data();
+        return ["shipping", "shipped"].includes(record.collectionStatus)
+          && getDeliveryStage(record) !== "delivered";
+      }).length);
     }, (error) => {
       console.error("Admin shipping badge listener failed.", error);
     });
@@ -5662,6 +6022,11 @@ function AdminPanel({ profile }) {
           <CreateCardForm cards={cards} profile={profile} />
         </div>
       )}
+      {isBeta && activeAdminSection === "banner" && (
+        <div className="admin-section narrow-admin-section">
+          <HomepageBannerManager profile={profile} />
+        </div>
+      )}
       {activeAdminSection === "packages" && (
         <div className="admin-section narrow-admin-section">
           <TokenPackageManager profile={profile} />
@@ -5860,6 +6225,14 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
       .sort((left, right) => left - right),
     [recordsByNumber],
   );
+  const totalPurchaseAmount = sessionRecords.reduce(
+    (sum, record) => sum + Number(record.tokenCost || record.targetCardValue || 0),
+    0,
+  );
+  const totalExchangeAmount = sessionRecords
+    .filter((record) => record.cardId)
+    .reduce((sum, record) => sum + Number(getCardConversionRefund(record) || 0), 0);
+  const grossProfit = totalPurchaseAmount - totalExchangeAmount;
   const shareMode = getRoomShareMode(selectedDraw || {}, selectedSession?.roundId);
   const heavenCount = numberList.filter((number) => draftSides[number] === "heaven").length;
   const hellCount = numberList.filter((number) => draftSides[number] === "hell").length;
@@ -6007,6 +6380,14 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
               <button className="small-btn" type="button" onClick={clearUnassignedSides}>清除未確認</button>
             </div>
           </div>
+          <div className="admin-finance-summary">
+            <span><small>購買總金額</small><strong><TokenAmount value={totalPurchaseAmount} /></strong></span>
+            <span><small>需要兌換總金額</small><strong><TokenAmount value={totalExchangeAmount} /></strong></span>
+            <span className={grossProfit >= 0 ? "user-profit" : "user-loss"}>
+              <small>毛利</small>
+              <strong><TokenAmount value={grossProfit} /></strong>
+            </span>
+          </div>
           <div className="batch-number-table" aria-label="已售號碼天堂地獄分配表">
             {numberList.map((number) => {
               const record = recordsByNumber.get(number);
@@ -6085,17 +6466,21 @@ function AdminRoundResultConfirmModal({ drawTitle, roundId, numberList, recordsB
 function ShippingRequestManager({ records, loading = false }) {
   const [trackingNumbers, setTrackingNumbers] = useState({});
   const [savingId, setSavingId] = useState("");
-  const [shippingView, setShippingView] = useState("pending");
+  const [shippingView, setShippingView] = useState("shipping");
   const [auditUser, setAuditUser] = useState(null);
-  const pendingRequests = records
-    .filter((record) => record.shippingRequested && record.collectionStatus === "shipping")
+  const shippingRequests = records
+    .filter((record) => (
+      record.shippingRequested
+      && ["shipping", "shipped"].includes(record.collectionStatus)
+      && getDeliveryStage(record) !== "delivered"
+    ))
     .sort((a, b) => toMillis(b.shippingRequestedAt) - toMillis(a.shippingRequestedAt));
-  const shippedRequests = records
-    .filter((record) => record.collectionStatus === "shipped" && (record.shippingRequested || record.trackingNumber))
-    .sort((a, b) => toMillis(b.shippedAt || b.updatedAt) - toMillis(a.shippedAt || a.updatedAt));
-  const visibleRequests = shippingView === "shipped" ? shippedRequests : pendingRequests;
+  const deliveredRequests = records
+    .filter((record) => getDeliveryStage(record) === "delivered" && (record.shippingRequested || record.trackingNumber))
+    .sort((a, b) => toMillis(b.deliveredAt || b.updatedAt) - toMillis(a.deliveredAt || a.updatedAt));
+  const visibleRequests = shippingView === "delivered" ? deliveredRequests : shippingRequests;
 
-  async function markShipped(record) {
+  async function markInTransit(record) {
     const trackingNumber = String(trackingNumbers[record.id] || record.trackingNumber || "").trim();
     if (!trackingNumber) {
       alert("請先輸入順豐運單號碼。");
@@ -6104,9 +6489,27 @@ function ShippingRequestManager({ records, loading = false }) {
     setSavingId(record.id);
     try {
       await updateDoc(doc(db, "drawRecords", record.id), {
-        collectionStatus: "shipped",
+        collectionStatus: "shipping",
+        deliveryStatus: "in_transit",
         trackingNumber,
+        dispatchedAt: serverTimestamp(),
         shippedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSavingId("");
+    }
+  }
+
+  async function markDelivered(record) {
+    setSavingId(record.id);
+    try {
+      await updateDoc(doc(db, "drawRecords", record.id), {
+        collectionStatus: "shipped",
+        deliveryStatus: "delivered",
+        deliveredAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     } catch (error) {
@@ -6122,25 +6525,25 @@ function ShippingRequestManager({ records, loading = false }) {
         <Bell size={22} />
         <div>
 
-          <h2>{shippingView === "shipped" ? "已配送紀錄" : "待處理配送需求"}</h2>
-          <p className="muted">處理完成後會永久保留在「已配送紀錄」。</p>
+          <h2>{shippingView === "delivered" ? "已配送紀錄" : "配送中"}</h2>
+          <p className="muted">「配送中」包括待安排配送及順豐正在配送；確認送達後才會移到「已配送」。</p>
         </div>
-        <strong className="shipping-request-count">{pendingRequests.length} 個待處理</strong>
+        <strong className="shipping-request-count">{shippingRequests.length} 個配送中</strong>
       </div>
       <div className="collection-tabs admin-status-tabs shipping-status-tabs">
         <button
-          className={shippingView === "pending" ? "active" : ""}
+          className={shippingView === "shipping" ? "active" : ""}
           type="button"
-          onClick={() => setShippingView("pending")}
+          onClick={() => setShippingView("shipping")}
         >
-          待處理 {pendingRequests.length}
+          配送中 {shippingRequests.length}
         </button>
         <button
-          className={shippingView === "shipped" ? "active" : ""}
+          className={shippingView === "delivered" ? "active" : ""}
           type="button"
-          onClick={() => setShippingView("shipped")}
+          onClick={() => setShippingView("delivered")}
         >
-          已配送紀錄 {shippedRequests.length}
+          已配送 {deliveredRequests.length}
         </button>
       </div>
       {loading ? (
@@ -6179,11 +6582,14 @@ function ShippingRequestManager({ records, loading = false }) {
               </dl>
               <dl className="shipping-time-details">
                 <div><dt>申請時間</dt><dd>{formatDate(record.shippingRequestedAt)}</dd></div>
-                {record.collectionStatus === "shipped" && (
-                  <div><dt>完成配送</dt><dd>{formatDate(record.shippedAt || record.updatedAt)}</dd></div>
+                {getDeliveryStage(record) === "in_transit" && (
+                  <div><dt>開始配送</dt><dd>{formatDate(record.dispatchedAt || record.shippedAt || record.updatedAt)}</dd></div>
+                )}
+                {getDeliveryStage(record) === "delivered" && (
+                  <div><dt>完成配送</dt><dd>{formatDate(record.deliveredAt || record.updatedAt)}</dd></div>
                 )}
               </dl>
-              {record.collectionStatus === "shipped" ? (
+              {getDeliveryStage(record) === "delivered" ? (
                 <div className="shipping-completed-details">
                   <span className="status-badge shipped">已配送</span>
                   <small>順豐單號</small>
@@ -6198,8 +6604,31 @@ function ShippingRequestManager({ records, loading = false }) {
                     </a>
                   ) : <strong>--</strong>}
                 </div>
+              ) : getDeliveryStage(record) === "in_transit" ? (
+                <div className="shipping-request-actions">
+                  <span className="status-badge shipping in-transit">正在配送</span>
+                  {record.trackingNumber && (
+                    <a
+                      className="small-btn"
+                      href={`https://htm.sf-express.com/hk/tc/dynamic_function/waybill/#search/bill-number/${encodeURIComponent(record.trackingNumber)}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <Truck size={16} />{record.trackingNumber}<ExternalLink size={14} />
+                    </a>
+                  )}
+                  <button
+                    className="primary-btn"
+                    type="button"
+                    onClick={() => markDelivered(record)}
+                    disabled={savingId === record.id}
+                  >
+                    <Check size={17} />{savingId === record.id ? "處理中..." : "標記已配送"}
+                  </button>
+                </div>
               ) : (
                 <div className="shipping-request-actions">
+                  <span className="status-badge pending">待安排配送</span>
                   <input
                     value={trackingNumbers[record.id] ?? record.trackingNumber ?? ""}
                     onChange={(event) => setTrackingNumbers((current) => ({
@@ -6211,10 +6640,10 @@ function ShippingRequestManager({ records, loading = false }) {
                   <button
                     className="primary-btn"
                     type="button"
-                    onClick={() => markShipped(record)}
+                    onClick={() => markInTransit(record)}
                     disabled={savingId === record.id}
                   >
-                    <Truck size={17} />{savingId === record.id ? "處理中..." : "標記已配送"}
+                    <Truck size={17} />{savingId === record.id ? "處理中..." : "標記正在配送"}
                   </button>
                 </div>
               )}
@@ -6223,7 +6652,7 @@ function ShippingRequestManager({ records, loading = false }) {
         </div>
       ) : (
         <p className="empty-state compact-empty">
-          {shippingView === "shipped" ? "暫時未有已配送紀錄。" : "暫時未有待處理配送需求。"}
+          {shippingView === "delivered" ? "暫時未有已配送紀錄。" : "暫時未有配送中的需求。"}
         </p>
       )}
       {auditUser && (
@@ -7336,6 +7765,95 @@ function PromoCodeManager({ profile }) {
   );
 }
 
+function HomepageBannerManager({ profile }) {
+  const banner = useHomepageBanner();
+  const [imageFile, setImageFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!imageFile) {
+      setPreviewUrl("");
+      return undefined;
+    }
+    const nextPreviewUrl = URL.createObjectURL(imageFile);
+    setPreviewUrl(nextPreviewUrl);
+    return () => URL.revokeObjectURL(nextPreviewUrl);
+  }, [imageFile]);
+
+  async function saveBanner() {
+    if (!imageFile) return;
+    setSaving(true);
+    try {
+      const bannerImageUrl = await imageFileToCompressedDataUrl(imageFile, {
+        maxWidth: 1600,
+        maxHeight: 600,
+        quality: 0.82,
+        minQuality: 0.62,
+        targetBytes: 520 * 1024,
+      });
+      await setDoc(doc(db, "publicSiteSettings", "homepage"), {
+        bannerImageUrl,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      }, { merge: true });
+      setImageFile(null);
+      alert("首頁 Banner 已更新。");
+    } catch (error) {
+      showSafeError(error, "Banner 儲存失敗，請重新選擇圖片再試。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function restoreDefaultBanner() {
+    if (!window.confirm("確認恢復預設首頁 Banner？")) return;
+    setSaving(true);
+    try {
+      await setDoc(doc(db, "publicSiteSettings", "homepage"), {
+        bannerImageUrl: "",
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      }, { merge: true });
+      setImageFile(null);
+    } catch (error) {
+      showSafeError(error, "未能恢復預設 Banner。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="panel homepage-banner-manager">
+      <div className="section-heading compact">
+        <ImagePlus size={22} />
+        <div>
+          <h2>首頁 Banner</h2>
+          <p className="muted">上載後會即時顯示俾所有訪客；建議使用約 1600 × 540 的橫向圖片。</p>
+        </div>
+      </div>
+      <div className="homepage-banner-preview">
+        <img src={previewUrl || banner.imageUrl} alt="首頁 Banner 預覽" />
+      </div>
+      <FileUpload
+        id="homepage-banner-file"
+        label="選擇新 Banner"
+        file={imageFile}
+        onChange={setImageFile}
+        disabled={saving}
+      />
+      <div className="homepage-banner-actions">
+        <button className="primary-btn" type="button" onClick={saveBanner} disabled={saving || !imageFile}>
+          <Save size={17} />{saving ? "儲存中..." : "儲存 Banner"}
+        </button>
+        <button className="small-btn" type="button" onClick={restoreDefaultBanner} disabled={saving || !banner.isCustom}>
+          <RefreshCcw size={15} />恢復預設
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function PaymentSettingsManager({ profile }) {
   const savedSettings = usePaymentSettings();
   const [form, setForm] = useState(savedSettings);
@@ -7611,6 +8129,11 @@ function AdminRoomRecordsPanel({ cards, records, profile, loading = false }) {
     setAssigningId(record.id);
     try {
       const cardValue = Number(card.tokenValue || record.targetCardValue || record.tokenCost || 0);
+      const deliveryUpdate = collectionStatus === "shipped"
+        ? { deliveryStatus: "delivered", deliveredAt: serverTimestamp() }
+        : collectionStatus === "shipping"
+          ? { deliveryStatus: "in_transit", dispatchedAt: serverTimestamp(), shippedAt: serverTimestamp() }
+          : {};
       await updateDoc(doc(db, "drawRecords", record.id), {
         cardId: card.id,
         cardName: card.name,
@@ -7621,6 +8144,7 @@ function AdminRoomRecordsPanel({ cards, records, profile, loading = false }) {
         resultSide,
         selectedHeavenCardId: selectedCard?.id || "",
         collectionStatus,
+        ...deliveryUpdate,
         assignedAt: serverTimestamp(),
         assignedBy: profile.uid,
         updatedAt: serverTimestamp(),
@@ -7852,6 +8376,8 @@ function CreateCardForm({ cards, profile }) {
     conversionValue: 8,
     category: CARD_CATEGORIES[0],
     hellCardId: "",
+    pricingMode: "formula",
+    modePrices: { half: "", fifth: "", tenth: "" },
     imageFile: null,
   });
   const [newCategoryName, setNewCategoryName] = useState("");
@@ -7863,6 +8389,8 @@ function CreateCardForm({ cards, profile }) {
   const [publishingShowcase, setPublishingShowcase] = useState(false);
   const [savingCardId, setSavingCardId] = useState("");
   const [deletingCardId, setDeletingCardId] = useState("");
+  const [librarySearch, setLibrarySearch] = useState("");
+  const [libraryVisibleLimit, setLibraryVisibleLimit] = useState(ADMIN_CARD_BATCH_SIZE);
   const [marginRate, setMarginRate] = useState(DEFAULT_CARD_MARGIN_RATE);
   const [marginRateDraft, setMarginRateDraft] = useState(String(DEFAULT_CARD_MARGIN_RATE));
   const [savingMarginRate, setSavingMarginRate] = useState(false);
@@ -7893,6 +8421,24 @@ function CreateCardForm({ cards, profile }) {
     );
   }, [cardCategories]);
 
+  const filteredLibraryCards = useMemo(() => {
+    const keyword = librarySearch.trim().toLocaleLowerCase("zh-HK");
+    if (!keyword) return cards;
+    return cards.filter((card) =>
+      String(card.name || "").toLocaleLowerCase("zh-HK").includes(keyword)
+      || getCardCategory(card).toLocaleLowerCase("zh-HK").includes(keyword)
+      || String(card.id || "").toLocaleLowerCase("zh-HK").includes(keyword),
+    );
+  }, [cards, librarySearch]);
+  const visibleLibraryCards = useMemo(
+    () => filteredLibraryCards.slice(0, libraryVisibleLimit),
+    [filteredLibraryCards, libraryVisibleLimit],
+  );
+
+  useEffect(() => {
+    setLibraryVisibleLimit(ADMIN_CARD_BATCH_SIZE);
+  }, [librarySearch]);
+
   function resetCardDraft(card) {
     setCardDrafts((current) => ({
       ...current,
@@ -7901,12 +8447,15 @@ function CreateCardForm({ cards, profile }) {
   }
 
   function cardDraftChanged(card, draft) {
+    const pricingMode = draft.pricingMode === "manual" ? "manual" : "formula";
     return (
       String(draft.name || "") !== String(card.name || "") ||
       String(draft.category || CARD_CATEGORIES[0]) !== getCardCategory(card) ||
       JSON.stringify(getCardAllowedShareModes(draft)) !== JSON.stringify(getCardAllowedShareModes(card)) ||
       Number(draft.conversionValue || 0) !== Number(card.conversionValue ?? card.tokenValue ?? 0) ||
       String(draft.hellCardId || "") !== String(card.hellCardId || "") ||
+      pricingMode !== (card.pricingMode === "manual" ? "manual" : "formula") ||
+      (pricingMode === "manual" && JSON.stringify(getCardModePrices(draft)) !== JSON.stringify(getCardModePrices(card))) ||
       Boolean(draft.imageFile)
     );
   }
@@ -7922,6 +8471,26 @@ function CreateCardForm({ cards, profile }) {
         ...(current[cardId] || {}),
         [field]: value,
       },
+    }));
+  }
+
+  function updateDraftPrice(cardId, priceKey, value) {
+    setCardDrafts((current) => ({
+      ...current,
+      [cardId]: {
+        ...(current[cardId] || {}),
+        modePrices: {
+          ...(current[cardId]?.modePrices || {}),
+          [priceKey]: value,
+        },
+      },
+    }));
+  }
+
+  function updateNewCardPrice(priceKey, value) {
+    setNewCard((current) => ({
+      ...current,
+      modePrices: { ...current.modePrices, [priceKey]: value },
     }));
   }
 
@@ -7950,6 +8519,7 @@ function CreateCardForm({ cards, profile }) {
     const pricesById = new Map();
 
     allCards.forEach((card) => {
+      if (card.pricingMode === "manual") return;
       const hellCard = cardsById.get(String(card.hellCardId || ""));
       if (!hellCard) return;
       const prices = calculateAutomaticCardPrices(
@@ -8008,7 +8578,11 @@ function CreateCardForm({ cards, profile }) {
       writes.slice(start, start + 450).forEach((write) => write(batch));
       await batch.commit();
     }
-    return { updated: pricesById.size, skipped: allCards.length - pricesById.size };
+    return {
+      updated: pricesById.size,
+      manual: allCards.filter((card) => card.pricingMode === "manual").length,
+      skipped: allCards.filter((card) => card.pricingMode !== "manual" && !pricesById.has(card.id)).length,
+    };
   }
 
   async function saveMarginRate() {
@@ -8023,7 +8597,7 @@ function CreateCardForm({ cards, profile }) {
     try {
       const result = await recalculateAllCardPrices(cleanRate, true);
       setMarginRate(cleanRate);
-      alert(`已按毛利率 ${cleanRate} 更新 ${result.updated} 張卡。${result.skipped ? `另有 ${result.skipped} 張未設定地獄對應卡，暫時保留原價。` : ""}`);
+      alert(`已按毛利率 ${cleanRate} 更新 ${result.updated} 張卡。${result.manual ? `${result.manual} 張自訂優惠價未有改動。` : ""}${result.skipped ? `另有 ${result.skipped} 張未設定地獄對應卡，暫時保留原價。` : ""}`);
     } catch (error) {
       showSafeError(error);
     } finally {
@@ -8165,9 +8739,18 @@ function CreateCardForm({ cards, profile }) {
       alert("請先上傳卡牌圖片。");
       return;
     }
-    const modePrices = getAutomaticPrices(newCard.conversionValue, newCard.hellCardId);
+    if (!newCard.hellCardId) {
+      alert("請先設定地獄對應卡。");
+      return;
+    }
+    const manualPricing = newCard.pricingMode === "manual";
+    const modePrices = manualPricing
+      ? normalizeManualCardPrices(newCard.modePrices)
+      : getAutomaticPrices(newCard.conversionValue, newCard.hellCardId);
     if (!modePrices) {
-      alert("請先設定地獄對應卡，系統先可以自動計算三種玩法價錢。");
+      alert(manualPricing
+        ? "請輸入有效的 1/2、1/5、1/10 自訂售價。"
+        : "請先設定地獄對應卡，系統先可以自動計算三種玩法價錢。");
       return;
     }
     if (!newCard.allowedShareModes.length) {
@@ -8189,11 +8772,12 @@ function CreateCardForm({ cards, profile }) {
         CARD_IMAGE_COMPRESSION,
       );
 
-      await addDoc(collection(db, "cards"), {
+      const cardData = {
         name: cleanName,
         category: newCard.category || CARD_CATEGORIES[0],
         tokenValue: modePrices.half,
         modePrices,
+        pricingMode: manualPricing ? "manual" : "formula",
         allowedShareModes: newCard.allowedShareModes,
         conversionValue: Number(newCard.conversionValue),
         hellCardId: newCard.hellCardId || "",
@@ -8202,8 +8786,13 @@ function CreateCardForm({ cards, profile }) {
         createdBy: profile.uid,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
-      setNewCard({ name: "", allowedShareModes: [...SHARE_MODES], conversionValue: 8, category: CARD_CATEGORIES[0], hellCardId: "", imageFile: null });
+      };
+      const cardRef = await addDoc(collection(db, "cards"), cardData);
+      await setDoc(doc(db, "publicCardShowcase", cardRef.id), {
+        ...getPublicCardPayload(cardData),
+        updatedBy: profile.uid,
+      }, { merge: true });
+      setNewCard({ name: "", allowedShareModes: [...SHARE_MODES], conversionValue: 8, category: CARD_CATEGORIES[0], hellCardId: "", pricingMode: "formula", modePrices: { half: "", fifth: "", tenth: "" }, imageFile: null });
     } catch (error) {
       showSafeError(error);
     } finally {
@@ -8215,8 +8804,11 @@ function CreateCardForm({ cards, profile }) {
     const draft = cardDrafts[card.id] || {};
     const cleanName = String(draft.name || "").trim();
     const cleanConversionValue = Number(draft.conversionValue || 0);
+    const manualPricing = draft.pricingMode === "manual";
     const automaticPrices = getAutomaticPrices(cleanConversionValue, draft.hellCardId);
-    const cleanModePrices = automaticPrices || getCardModePrices(card);
+    const cleanModePrices = manualPricing
+      ? normalizeManualCardPrices(draft.modePrices)
+      : automaticPrices || getCardModePrices(card);
     const allowedShareModes = getCardAllowedShareModes(draft);
 
     if (!cleanName) {
@@ -8229,6 +8821,14 @@ function CreateCardForm({ cards, profile }) {
     }
     if (cleanConversionValue < 0) {
       alert("兌換價值不能少於 0。");
+      return;
+    }
+    if (manualPricing && !draft.hellCardId) {
+      alert("自訂 Promotion 售價前，請先設定地獄對應卡。");
+      return;
+    }
+    if (!cleanModePrices) {
+      alert("請輸入有效的 1/2、1/5、1/10 自訂售價。");
       return;
     }
     if (!cardDraftChanged(card, draft)) {
@@ -8246,6 +8846,7 @@ function CreateCardForm({ cards, profile }) {
         category: draft.category || CARD_CATEGORIES[0],
         tokenValue: cleanModePrices.half,
         modePrices: cleanModePrices,
+        pricingMode: manualPricing ? "manual" : "formula",
         allowedShareModes,
         conversionValue: cleanConversionValue,
         hellCardId: draft.hellCardId || "",
@@ -8262,6 +8863,10 @@ function CreateCardForm({ cards, profile }) {
       }
 
       await updateDoc(doc(db, "cards", card.id), updates);
+      await setDoc(doc(db, "publicCardShowcase", card.id), {
+        ...getPublicCardPayload({ ...card, ...updates }),
+        updatedBy: profile.uid,
+      }, { merge: true });
       await updateAssignedRecordsForCard(card.id, {
         cardName: cleanName,
         cardCategory: draft.category || CARD_CATEGORIES[0],
@@ -8286,6 +8891,8 @@ function CreateCardForm({ cards, profile }) {
           allowedShareModes,
           conversionValue: cleanConversionValue,
           hellCardId: draft.hellCardId || "",
+          pricingMode: manualPricing ? "manual" : "formula",
+          modePrices: cleanModePrices,
           imageFile: null,
         },
       }));
@@ -8364,26 +8971,26 @@ function CreateCardForm({ cards, profile }) {
       priceHalf: getCardModePrices(card).half,
       priceFifth: getCardModePrices(card).fifth,
       priceTenth: getCardModePrices(card).tenth,
+      pricingMode: card.pricingMode === "manual" ? "manual" : "formula",
       allowedShareModes: getCardAllowedShareModes(card).join("|"),
       conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 0),
       hellCardId: card.hellCardId || "",
       imageUrl: card.imageUrl || "",
     }));
-    const csvText = createCsvText(["id", "name", "category", "priceHalf", "priceFifth", "priceTenth", "allowedShareModes", "conversionValue", "hellCardId", "imageUrl"], csvRows);
+    const csvText = createCsvText(["id", "name", "category", "priceHalf", "priceFifth", "priceTenth", "pricingMode", "allowedShareModes", "conversionValue", "hellCardId", "imageUrl"], csvRows);
     downloadTextFile(`draw-card-library-${new Date().toISOString().slice(0, 10)}.csv`, csvText);
   }
 
   async function publishHomepageShowcase() {
-    const featuredCards = [...cards]
+    const publicCards = [...cards]
       .filter((card) => card.name && card.imageUrl && Number(card.tokenValue || 0) > 0)
-      .sort((left, right) => Number(right.tokenValue || 0) - Number(left.tokenValue || 0))
-      .slice(0, PUBLIC_CARD_SHOWCASE_LIMIT);
+      .sort((left, right) => Number(right.tokenValue || 0) - Number(left.tokenValue || 0));
 
-    if (!featuredCards.length) {
+    if (!publicCards.length) {
       alert("卡牌庫未有可發佈的卡牌圖片。");
       return;
     }
-    if (!window.confirm(`確認更新首頁走馬燈的 ${featuredCards.length} 張卡牌？`)) {
+    if (!window.confirm(`確認更新公開卡牌圖片及首頁走馬燈？共 ${publicCards.length} 張卡牌。`)) {
       return;
     }
 
@@ -8395,22 +9002,15 @@ function CreateCardForm({ cards, profile }) {
       existingSnapshot.docs.forEach((item) => {
         batch.set(item.ref, { active: false, updatedAt: serverTimestamp() }, { merge: true });
       });
-      featuredCards.forEach((card, index) => {
+      publicCards.forEach((card, index) => {
         batch.set(doc(db, "publicCardShowcase", card.id), {
-          name: String(card.name || ""),
-          imageUrl: String(card.imageUrl || ""),
-          tokenValue: Number(card.tokenValue || 0),
-          modePrices: getCardModePrices(card),
-          allowedShareModes: getCardAllowedShareModes(card),
-          category: getCardCategory(card),
-          active: true,
+          ...getPublicCardPayload(card),
           rank: index + 1,
-          updatedAt: serverTimestamp(),
           updatedBy: profile.uid,
         }, { merge: true });
       });
       await batch.commit();
-      alert(`首頁走馬燈已更新，共 ${featuredCards.length} 張卡牌。`);
+      alert(`公開卡牌圖片已更新，共 ${publicCards.length} 張；首頁走馬燈會顯示最高價 12 張。`);
     } catch (error) {
       showSafeError(error);
     } finally {
@@ -8464,6 +9064,7 @@ function CreateCardForm({ cards, profile }) {
           category: row.category || CARD_CATEGORIES[0],
           tokenValue: row.tokenValue,
           modePrices: row.modePrices,
+          pricingMode: row.pricingMode,
           allowedShareModes: row.allowedShareModes,
           conversionValue: row.conversionValue,
           hellCardId: row.hellCardId || "",
@@ -8480,6 +9081,10 @@ function CreateCardForm({ cards, profile }) {
 
         if (matchedCard) {
           await updateDoc(doc(db, "cards", matchedCard.id), updates);
+          await setDoc(doc(db, "publicCardShowcase", matchedCard.id), {
+            ...getPublicCardPayload({ ...matchedCard, ...updates }),
+            updatedBy: profile.uid,
+          }, { merge: true });
           await updateAssignedRecordsForCard(matchedCard.id, {
             cardName: row.name,
             cardCategory: row.category || CARD_CATEGORIES[0],
@@ -8493,6 +9098,7 @@ function CreateCardForm({ cards, profile }) {
             category: row.category || CARD_CATEGORIES[0],
             tokenValue: row.tokenValue,
             modePrices: row.modePrices,
+            pricingMode: row.pricingMode,
             allowedShareModes: row.allowedShareModes,
             conversionValue: row.conversionValue,
           });
@@ -8516,7 +9122,13 @@ function CreateCardForm({ cards, profile }) {
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
           };
-          await addDoc(collection(db, "cards"), docData);
+          const cardRef = await addDoc(collection(db, "cards"), docData);
+          if (docData.imageUrl) {
+            await setDoc(doc(db, "publicCardShowcase", cardRef.id), {
+              ...getPublicCardPayload(docData),
+              updatedBy: profile.uid,
+            }, { merge: true });
+          }
           createdCount += 1;
         }
       }
@@ -8531,6 +9143,7 @@ function CreateCardForm({ cards, profile }) {
   }
 
   const newAutomaticPrices = getAutomaticPrices(newCard.conversionValue, newCard.hellCardId);
+  const newDisplayedPrices = newCard.pricingMode === "manual" ? newCard.modePrices : newAutomaticPrices;
 
   return (
     <section className="panel card-library-panel">
@@ -8539,14 +9152,14 @@ function CreateCardForm({ cards, profile }) {
         <div>
 
           <h1>卡牌庫管理</h1>
-          <p className="muted">只需設定兌換價值及地獄對應卡，三種抽卡售價會按毛利率自動計算。</p>
+          <p className="muted">一般卡牌按毛利率自動計算；Promotion 卡可勾選「自訂」並獨立設定三種玩法售價。</p>
         </div>
       </div>
 
       <div className="card-pricing-formula-panel">
         <div>
           <strong>自動定價公式</strong>
-          <span>售價 =（天堂卡兌換價值 × 天堂機率＋地獄卡兌換價值 × 地獄機率）× 毛利率</span>
+          <span>售價 =（天堂卡兌換價值 × 天堂機率＋地獄卡兌換價值 × 地獄機率）× 毛利率；自訂卡不受全局重算影響。</span>
         </div>
         <label>
           <span>毛利率</span>
@@ -8590,8 +9203,19 @@ function CreateCardForm({ cards, profile }) {
           />
         </label>
         <span className="form-note">
-          CSV 欄位：id、name、category、priceHalf、priceFifth、priceTenth、conversionValue、hellCardId、imageUrl。保留 id 可更新現有卡；留空 id 會新增。
+          CSV 欄位：id、name、category、priceHalf、priceFifth、priceTenth、pricingMode、conversionValue、hellCardId、imageUrl。pricingMode 填 manual 可保留自訂優惠價。
         </span>
+      </div>
+
+      <div className="card-search card-library-search">
+        <Search size={17} />
+        <input
+          value={librarySearch}
+          onChange={(event) => setLibrarySearch(event.target.value)}
+          placeholder="搜尋卡名、分類或卡牌 ID"
+          type="search"
+        />
+        <span>{visibleLibraryCards.length} / {filteredLibraryCards.length}</span>
       </div>
 
       <div className="category-manager">
@@ -8693,25 +9317,45 @@ function CreateCardForm({ cards, profile }) {
               ))}
             </select>
           </label>
-          <label className="card-sheet-field">
+          <div className="card-sheet-field card-price-field">
             <span>1/2 售價</span>
+            <label className="card-pricing-mode-toggle">
+              <input
+                type="checkbox"
+                checked={newCard.pricingMode === "manual"}
+                onChange={(event) => updateNewCard("pricingMode", event.target.checked ? "manual" : "formula")}
+              />
+              自訂
+            </label>
             <input
-              value={newAutomaticPrices?.half ?? "先選地獄卡"}
-              readOnly
+              type={newCard.pricingMode === "manual" ? "number" : "text"}
+              min="0.01"
+              step="0.01"
+              value={newDisplayedPrices?.half ?? "先選地獄卡"}
+              readOnly={newCard.pricingMode !== "manual"}
+              onChange={(event) => updateNewCardPrice("half", event.target.value)}
             />
-          </label>
+          </div>
           <label className="card-sheet-field">
             <span>1/5 售價</span>
             <input
-              value={newAutomaticPrices?.fifth ?? "先選地獄卡"}
-              readOnly
+              type={newCard.pricingMode === "manual" ? "number" : "text"}
+              min="0.01"
+              step="0.01"
+              value={newDisplayedPrices?.fifth ?? "先選地獄卡"}
+              readOnly={newCard.pricingMode !== "manual"}
+              onChange={(event) => updateNewCardPrice("fifth", event.target.value)}
             />
           </label>
           <label className="card-sheet-field">
             <span>1/10 售價</span>
             <input
-              value={newAutomaticPrices?.tenth ?? "先選地獄卡"}
-              readOnly
+              type={newCard.pricingMode === "manual" ? "number" : "text"}
+              min="0.01"
+              step="0.01"
+              value={newDisplayedPrices?.tenth ?? "先選地獄卡"}
+              readOnly={newCard.pricingMode !== "manual"}
+              onChange={(event) => updateNewCardPrice("tenth", event.target.value)}
             />
           </label>
           <fieldset className="card-sheet-field card-share-mode-field">
@@ -8751,18 +9395,14 @@ function CreateCardForm({ cards, profile }) {
         </form>
 
         <div className="card-sheet-body">
-          {cards.length ? (
-            cards.map((card) => {
-              const draft = cardDrafts[card.id] || {
-                name: card.name || "",
-                category: getCardCategory(card),
-                allowedShareModes: getCardAllowedShareModes(card),
-                conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 10),
-                hellCardId: card.hellCardId || "",
-                imageFile: null,
-              };
+          {filteredLibraryCards.length ? (
+            visibleLibraryCards.map((card) => {
+              const draft = cardDrafts[card.id] || createCardDraft(card);
               const automaticPrices = getAutomaticPrices(draft.conversionValue, draft.hellCardId);
-              const displayedPrices = automaticPrices || getCardModePrices(card);
+              const manualPricing = draft.pricingMode === "manual";
+              const displayedPrices = manualPricing
+                ? draft.modePrices
+                : automaticPrices || getCardModePrices(card);
               const changed = cardDraftChanged(card, draft);
               return (
                 <div className={changed ? "card-sheet-row has-draft" : "card-sheet-row"} key={card.id}>
@@ -8792,28 +9432,48 @@ function CreateCardForm({ cards, profile }) {
                       ))}
                     </select>
                   </label>
-                  <label className="card-sheet-field">
+                  <div className="card-sheet-field card-price-field">
                     <span>1/2 售價</span>
+                    <label className="card-pricing-mode-toggle">
+                      <input
+                        type="checkbox"
+                        checked={manualPricing}
+                        onChange={(event) => updateDraft(card.id, "pricingMode", event.target.checked ? "manual" : "formula")}
+                      />
+                      自訂
+                    </label>
                     <input
+                      type={manualPricing ? "number" : "text"}
+                      min="0.01"
+                      step="0.01"
                       value={displayedPrices.half}
-                      readOnly
-                      title={automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
+                      readOnly={!manualPricing}
+                      onChange={(event) => updateDraftPrice(card.id, "half", event.target.value)}
+                      title={manualPricing ? "自訂 Promotion 售價" : automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
                     />
-                  </label>
+                  </div>
                   <label className="card-sheet-field">
                     <span>1/5 售價</span>
                     <input
+                      type={manualPricing ? "number" : "text"}
+                      min="0.01"
+                      step="0.01"
                       value={displayedPrices.fifth}
-                      readOnly
-                      title={automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
+                      readOnly={!manualPricing}
+                      onChange={(event) => updateDraftPrice(card.id, "fifth", event.target.value)}
+                      title={manualPricing ? "自訂 Promotion 售價" : automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
                     />
                   </label>
                   <label className="card-sheet-field">
                     <span>1/10 售價</span>
                     <input
+                      type={manualPricing ? "number" : "text"}
+                      min="0.01"
+                      step="0.01"
                       value={displayedPrices.tenth}
-                      readOnly
-                      title={automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
+                      readOnly={!manualPricing}
+                      onChange={(event) => updateDraftPrice(card.id, "tenth", event.target.value)}
+                      title={manualPricing ? "自訂 Promotion 售價" : automaticPrices ? "按公式自動計算" : "未設定地獄對應卡，暫時保留原價"}
                     />
                   </label>
                   <fieldset className="card-sheet-field card-share-mode-field">
@@ -8890,10 +9550,15 @@ function CreateCardForm({ cards, profile }) {
               );
             })
           ) : (
-            <p className="muted card-sheet-empty">暫時未建立卡牌。</p>
+            <p className="muted card-sheet-empty">{cards.length ? "沒有符合搜尋的卡牌。" : "暫時未建立卡牌。"}</p>
           )}
         </div>
       </div>
+      {visibleLibraryCards.length < filteredLibraryCards.length && (
+        <button className="small-btn player-card-load-more" type="button" onClick={() => setLibraryVisibleLimit((current) => current + ADMIN_CARD_BATCH_SIZE)}>
+          顯示更多（尚有 {filteredLibraryCards.length - visibleLibraryCards.length} 張）
+        </button>
+      )}
       <p className="form-note">
         上傳圖片會先壓縮成 WebP：盡量縮細檔案，同時保留可用清晰度。
       </p>
@@ -8947,6 +9612,7 @@ function RoomPoolEditor({ draw, cards, singleLive = false }) {
   );
   const savedIds = useMemo(() => getRoomPoolIds(draw), [draw]);
   const [cardSearch, setCardSearch] = useState("");
+  const [visibleLimit, setVisibleLimit] = useState(ADMIN_CARD_BATCH_SIZE);
   const [saving, setSaving] = useState(false);
   const hasUnsavedChanges = useMemo(
     () => !sameIdSet(selectedIds, savedIds),
@@ -8956,6 +9622,14 @@ function RoomPoolEditor({ draw, cards, singleLive = false }) {
     () => filterCards(cards, cardSearch),
     [cards, cardSearch],
   );
+  const visibleCards = useMemo(
+    () => filteredCards.slice(0, visibleLimit),
+    [filteredCards, visibleLimit],
+  );
+
+  useEffect(() => {
+    setVisibleLimit(ADMIN_CARD_BATCH_SIZE);
+  }, [cardSearch]);
 
   useEffect(() => {
     setSelectedIds(getRoomPoolIds(draw));
@@ -9031,7 +9705,7 @@ function RoomPoolEditor({ draw, cards, singleLive = false }) {
             />
           </div>
           <div className="mini-card-picker">
-            {filteredCards.map((card) => (
+            {visibleCards.map((card) => (
               <button
                 className={selectedIds.includes(card.id) ? "mini-card selected" : "mini-card"}
                 key={card.id}
@@ -9055,6 +9729,11 @@ function RoomPoolEditor({ draw, cards, singleLive = false }) {
             ))}
           </div>
           {!filteredCards.length && <span className="muted">沒有符合搜尋的卡牌。</span>}
+          {visibleCards.length < filteredCards.length && (
+            <button className="small-btn player-card-load-more" type="button" onClick={() => setVisibleLimit((current) => current + ADMIN_CARD_BATCH_SIZE)}>
+              顯示更多（尚有 {filteredCards.length - visibleCards.length} 張）
+            </button>
+          )}
         </>
       ) : (
         <span className="muted">請先建立卡牌。</span>
@@ -9432,11 +10111,20 @@ function CreateDrawForm({ profile, cards }) {
   const [thumbnailFile, setThumbnailFile] = useState(null);
   const [selectedCardIds, setSelectedCardIds] = useState([]);
   const [cardSearch, setCardSearch] = useState("");
+  const [visibleLimit, setVisibleLimit] = useState(ADMIN_CARD_BATCH_SIZE);
   const [creating, setCreating] = useState(false);
   const filteredCards = useMemo(
     () => filterCards(cards, cardSearch),
     [cards, cardSearch],
   );
+  const visibleCards = useMemo(
+    () => filteredCards.slice(0, visibleLimit),
+    [filteredCards, visibleLimit],
+  );
+
+  useEffect(() => {
+    setVisibleLimit(ADMIN_CARD_BATCH_SIZE);
+  }, [cardSearch]);
 
   function updateField(field, value) {
     setForm((current) => ({ ...current, [field]: value }));
@@ -9676,7 +10364,7 @@ function CreateDrawForm({ profile, cards }) {
                 />
               </div>
               <div className="room-card-picker">
-                {filteredCards.map((card) => (
+                {visibleCards.map((card) => (
                   <button
                     className={
                       selectedCardIds.includes(card.id) ? "pool-card selected" : "pool-card"
@@ -9698,6 +10386,11 @@ function CreateDrawForm({ profile, cards }) {
                 ))}
               </div>
               {!filteredCards.length && <span className="form-note">沒有符合搜尋的卡牌。</span>}
+              {visibleCards.length < filteredCards.length && (
+                <button className="small-btn player-card-load-more" type="button" onClick={() => setVisibleLimit((current) => current + ADMIN_CARD_BATCH_SIZE)}>
+                  顯示更多（尚有 {filteredCards.length - visibleCards.length} 張）
+                </button>
+              )}
             </>
           ) : (
             <span className="form-note">請先在右邊建立卡牌，再建立房間。</span>
@@ -9732,6 +10425,20 @@ function roomCardPayload(card) {
     tokenValue: Number(card.tokenValue || 0),
     modePrices: getCardModePrices(card),
     allowedShareModes: getCardAllowedShareModes(card),
+  };
+}
+
+// Keeps the anonymous card catalogue image-safe without exposing private card fields.
+function getPublicCardPayload(card) {
+  return {
+    name: String(card?.name || ""),
+    imageUrl: String(card?.imageUrl || ""),
+    tokenValue: Number(card?.tokenValue || 0),
+    modePrices: getCardModePrices(card),
+    allowedShareModes: getCardAllowedShareModes(card),
+    category: getCardCategory(card),
+    active: !card?.archived,
+    updatedAt: serverTimestamp(),
   };
 }
 
@@ -9908,6 +10615,9 @@ function normalizeImportedCardRows(rows) {
         tenth: Number(row.pricetenth || row.tenthprice || legacyPrice),
       };
       const tokenValue = modePrices.half;
+      const pricingMode = String(row.pricingmode || row.pricing || "").trim().toLowerCase() === "manual"
+        ? "manual"
+        : "formula";
       const conversionValue = Number(
         row.conversionvalue || row.refundvalue || row.convertvalue || tokenValue,
       );
@@ -9926,6 +10636,7 @@ function normalizeImportedCardRows(rows) {
         category,
         tokenValue,
         modePrices,
+        pricingMode,
         allowedShareModes,
         conversionValue: Math.max(0, conversionValue),
         hellCardId,
@@ -9942,8 +10653,33 @@ function createCardDraft(card) {
     allowedShareModes: getCardAllowedShareModes(card),
     conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 10),
     hellCardId: card.hellCardId || "",
+    pricingMode: card.pricingMode === "manual" ? "manual" : "formula",
+    modePrices: getCardModePrices(card),
     imageFile: null,
   };
+}
+
+function useHomepageBanner() {
+  const [banner, setBanner] = useState({
+    imageUrl: DEFAULT_HOMEPAGE_BANNER_URL,
+    isCustom: false,
+  });
+
+  useEffect(() => {
+    const settingsRef = doc(db, "publicSiteSettings", "homepage");
+    return onSnapshot(settingsRef, (snapshot) => {
+      const bannerImageUrl = String(snapshot.data()?.bannerImageUrl || "").trim();
+      setBanner({
+        imageUrl: bannerImageUrl || DEFAULT_HOMEPAGE_BANNER_URL,
+        isCustom: Boolean(bannerImageUrl),
+      });
+    }, (error) => {
+      console.error("Homepage banner listener failed.", error);
+      setBanner({ imageUrl: DEFAULT_HOMEPAGE_BANNER_URL, isCustom: false });
+    });
+  }, []);
+
+  return banner;
 }
 
 function useTokenPackages(enabled = true) {
@@ -10227,6 +10963,11 @@ function getCardConversionRefund(record) {
   return Math.floor(Number(record.cardValue || record.tokenCost || 0) * CONVERSION_RATE);
 }
 
+// Purchase price always comes from the selected heaven card, even when a hell card is awarded.
+function getOriginalDrawPrice(record) {
+  return Math.max(0, Number(record?.tokenCost ?? record?.targetCardValue ?? record?.cardValue ?? 0));
+}
+
 function compareRoundNames(left, right) {
   return getRoundSortValue(left) - getRoundSortValue(right);
 }
@@ -10348,21 +11089,63 @@ function getBetaCollectionStatusLabel(status) {
     pending: "待處理",
     shipping: "配送中",
     shipped: "已配送",
-    converted: "已轉換代幣",
+    converted: "已轉代幣次數",
   }[status] || "待處理";
 }
 
 function getBetaCollectionRecordStatus(record) {
   if (record?.convertedToTokens || record?.collectionStatus === "converted") return "converted";
-  if (record?.collectionStatus === "shipped") return "shipped";
-  if (record?.collectionStatus === "shipping") return "shipping";
+  if (getDeliveryStage(record) === "delivered") return "shipped";
+  if (["shipping", "shipped"].includes(record?.collectionStatus)) return "shipping";
   return "pending";
+}
+
+// Older "shipped" records did not distinguish transit from confirmed delivery.
+// Keep them in transit until an administrator explicitly marks them delivered.
+function getDeliveryStage(record) {
+  if (
+    record?.collectionStatus === "shipped"
+    && (record?.deliveryStatus === "delivered" || record?.deliveredAt)
+  ) return "delivered";
+  if (
+    ["shipping", "shipped"].includes(record?.collectionStatus)
+    && (
+      record?.deliveryStatus === "in_transit"
+      || record?.trackingNumber
+      || record?.collectionStatus === "shipped"
+    )
+  ) return "in_transit";
+  return "awaiting_dispatch";
+}
+
+function getCollectionDeliveryLabel(record) {
+  if (record?.convertedToTokens || record?.collectionStatus === "converted") return "已轉回代幣";
+  const deliveryStage = getDeliveryStage(record);
+  if (deliveryStage === "delivered") return "已配送";
+  if (deliveryStage === "in_transit") return "正在配送";
+  if (record?.collectionStatus === "shipping") return "待安排配送";
+  return "待處理";
+}
+
+function getCollectionStatusBadgeClass(record) {
+  if (record?.convertedToTokens || record?.collectionStatus === "converted") return "converted";
+  const deliveryStage = getDeliveryStage(record);
+  if (deliveryStage === "delivered") return "shipped";
+  if (deliveryStage === "in_transit") return "shipping in-transit";
+  return record?.collectionStatus === "shipping" ? "shipping awaiting-dispatch" : "pending";
 }
 
 function getResultSideLabel(resultSide) {
   if (resultSide === "hell") return "地獄";
   if (resultSide === "heaven") return "天堂";
   return "未設定";
+}
+
+// Completed rounds store the public outcome per number on the room document.
+function getRoundSlotResultSide(draw, roundId, slot) {
+  if (!slot || slot.status === "available") return "";
+  const savedSide = draw?.roundResultSides?.[roundId]?.[String(slot.number)] || slot.resultSide;
+  return ["heaven", "hell"].includes(savedSide) ? savedSide : "";
 }
 
 function getShippingRegionLabel(regionId) {
@@ -10682,10 +11465,39 @@ async function uploadCompressedImage(file, path) {
     minQuality: 0.62,
     targetBytes: 420 * 1024,
   });
-  const imageBlob = await fetch(dataUrl).then((response) => response.blob());
+  // Convert the local data URL directly. Using fetch(data:) can fail in Chrome/Safari
+  // before Firebase Storage is contacted, resulting in the unhelpful "Failed to fetch" alert.
+  const imageBlob = dataUrlToBlob(dataUrl);
   const imageRef = ref(storage, path);
-  await uploadBytes(imageRef, imageBlob, { contentType: "image/webp" });
+  try {
+    await uploadBytes(imageRef, imageBlob, { contentType: imageBlob.type || "image/webp" });
+  } catch (error) {
+    if (error instanceof TypeError && String(error.message).includes("Failed to fetch")) {
+      throw new Error("未能連接圖片儲存服務，請檢查網絡後重新上載。", { cause: error });
+    }
+    throw error;
+  }
   return getDownloadURL(imageRef);
+}
+
+function dataUrlToBlob(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+  if (!match) throw new Error("壓縮圖片格式不正確，請重新選擇圖片。");
+
+  const mimeType = match[1] || "image/webp";
+  const encodedData = match[3] || "";
+  let binary;
+  try {
+    binary = match[2] ? atob(encodedData) : decodeURIComponent(encodedData);
+  } catch (error) {
+    throw new Error("未能讀取壓縮圖片，請重新選擇圖片。", { cause: error });
+  }
+
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: mimeType });
 }
 
 async function renameCategoryInCards(oldCategory, newCategory) {
@@ -10831,6 +11643,16 @@ function canvasToDataUrl(canvas, quality) {
 function estimateDataUrlBytes(dataUrl) {
   const base64 = String(dataUrl || "").split(",")[1] || "";
   return Math.ceil((base64.length * 3) / 4);
+}
+
+// Card assignment is the acquisition moment; older records fall back to their purchase time.
+function getRecordAcquiredAt(record) {
+  return record?.assignedAt || record?.createdAt || record?.updatedAt || null;
+}
+
+function formatRecordAcquiredTime(record) {
+  const acquiredAt = getRecordAcquiredAt(record);
+  return acquiredAt ? formatDate(acquiredAt) : "--";
 }
 
 function formatDate(value) {

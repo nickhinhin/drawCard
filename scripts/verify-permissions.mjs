@@ -1,6 +1,7 @@
 import { deleteApp, initializeApp } from "firebase/app";
 import {
   collection,
+  collectionGroup,
   connectFirestoreEmulator,
   doc,
   getDoc,
@@ -284,6 +285,14 @@ async function run() {
       });
     });
 
+    const ownedSlots = await getDocs(query(
+      collectionGroup(firestore, "slots"),
+      where("uid", "==", uid),
+    ));
+    if (!ownedSlots.docs.some((item) => item.ref.path === slotPath)) {
+      throw new Error("The consolidated user slot-history query did not return the purchased slot.");
+    }
+
     const tokenRequestRef = doc(collection(firestore, "tokenRequests"));
     const proofPath = `token-proofs/${uid}/${tokenRequestRef.id}`;
     const quotaBatch = writeBatch(firestore);
@@ -451,6 +460,48 @@ async function run() {
       getDocs(query(collection(firestore, "drawRecords"), where("uid", "==", uid))),
       getDocs(query(collection(firestore, "tokenRequests"), where("uid", "==", uid))),
     ]);
+
+    // A second account racing for the same case-insensitive username must lose without changing the first owner.
+    const secondApp = initializeApp(
+      { projectId, apiKey: "permission-audit-second" },
+      `permission-audit-second-${stamp}`,
+    );
+    const secondAuth = getAuth(secondApp);
+    const secondFirestore = getFirestore(secondApp);
+    connectAuthEmulator(secondAuth, `http://127.0.0.1:${authPort}`, { disableWarnings: true });
+    connectFirestoreEmulator(secondFirestore, "127.0.0.1", firestorePort);
+    const secondCredential = await createUserWithEmailAndPassword(
+      secondAuth,
+      `permission-audit-second-${stamp}@example.test`,
+      "not-a-real-password",
+    );
+    await seedDocuments([{
+      update: {
+        name: `projects/${projectId}/databases/(default)/documents/users/${secondCredential.user.uid}`,
+        fields: {
+          uid: string(secondCredential.user.uid),
+          email: string(secondCredential.user.email),
+          displayName: string("Second permission audit"),
+          photoURL: string(""),
+          username: string(""),
+          tokens: integer(0),
+          role: string("user"),
+          createdAt: timestamp(),
+          updatedAt: timestamp(),
+        },
+      },
+    }]);
+    let duplicateUsernameRejected = false;
+    let duplicateUsernameError = "";
+    try {
+      await ensureUsernameClaim(secondFirestore, secondCredential.user.uid, renamedUsername.toUpperCase());
+    } catch (error) {
+      duplicateUsernameError = String(error?.message || error);
+      duplicateUsernameRejected = /already|使用|claimed|permission-denied|permissions/i.test(duplicateUsernameError);
+    }
+    await signOut(secondAuth).catch(() => undefined);
+    await deleteApp(secondApp);
+
     if (
       profileAfter.data()?.username !== renamedUsername
       || claimAfter.data()?.uid !== uid
@@ -459,11 +510,23 @@ async function run() {
       || scheduledSlotAfter.data()?.status !== "locked"
       || recordsAfter.size < 2
       || requestsAfter.empty
+      || !duplicateUsernameRejected
     ) {
-      throw new Error("Permission audit completed but persisted data was not correct.");
+      throw new Error(`Permission audit completed but persisted data was not correct: ${JSON.stringify({
+        profileUsername: profileAfter.data()?.username,
+        expectedUsername: renamedUsername,
+        claimUid: claimAfter.data()?.uid,
+        oldClaimExists: oldClaimAfter.exists(),
+        liveSlotStatus: slotAfter.data()?.status,
+        scheduledSlotStatus: scheduledSlotAfter.data()?.status,
+        recordCount: recordsAfter.size,
+        requestsEmpty: requestsAfter.empty,
+        duplicateUsernameRejected,
+        duplicateUsernameError,
+      })}`);
     }
 
-    console.log("PASS: username repair and rename, live purchase, scheduled preorder, proof upload, token request, record reads, and live chat are allowed by Firebase rules.");
+    console.log("PASS: username repair, rename and duplicate rejection; live purchase, scheduled preorder, proof upload, token request, record reads, and live chat are allowed by Firebase rules.");
   } finally {
     await signOut(auth).catch(() => undefined);
     await deleteApp(app);

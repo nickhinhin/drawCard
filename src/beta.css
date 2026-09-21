@@ -97,6 +97,27 @@
   white-space: nowrap;
 }
 
+.beta-mode .beta-account-settings {
+  width: min(100%, 680px);
+  margin: 24px auto;
+}
+
+.beta-mode .beta-account-settings .profile-row {
+  margin-top: 22px;
+}
+
+.beta-mode .beta-account-settings .username-edit-form {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.beta-mode .beta-account-settings .username-edit-form .small-btn {
+  justify-self: start;
+}
+
 .beta-mode .beta-demo-login {
   width: 100%;
   min-height: 48px;
@@ -363,7 +384,9 @@
 
 .beta-mode .banner-slot {
   position: relative;
-  height: clamp(190px, 24vw, 300px);
+  height: auto;
+  min-height: 0;
+  aspect-ratio: 1600 / 537;
   margin: -1px -1px 28px;
   overflow: hidden;
   border: 1px solid #2f2f34;
@@ -2248,6 +2271,12 @@
   text-overflow: ellipsis;
 }
 
+.beta-mode .record-acquired-time {
+  color: #8f8f99 !important;
+  font-size: 10px;
+  font-weight: 800;
+}
+
 .beta-mode .pick-number-box {
   display: grid;
   min-width: 78px;
@@ -2371,8 +2400,22 @@
 
 .beta-mode .beta-collection-actions {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   justify-content: flex-end;
+  gap: 10px;
   margin: -8px 0 18px;
+}
+
+.beta-mode .beta-collection-selection-count {
+  margin-right: auto;
+  color: #b8b8c1;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.beta-mode .collection-action-progress {
+  margin: -6px 0 14px;
 }
 
 .beta-mode .collection-card > .card-check {
@@ -2388,7 +2431,7 @@
   color: #fff !important;
 }
 
-.beta-mode .admin-finance-summary span,
+.beta-mode .admin-finance-summary > span,
 .beta-mode .round-schedule-row {
   border-color: #303036;
   background: #141419;
@@ -2618,6 +2661,27 @@
 .beta-mode .slot small,
 .beta-mode .slot.locked small {
   color: inherit;
+}
+
+.beta-mode .slot.result-heaven,
+.beta-mode .desktop-number-grid button.result-heaven {
+  border-color: rgba(51, 211, 153, .72);
+  background: linear-gradient(180deg, rgba(31, 112, 78, .34), #0b0b0e 76%);
+  color: #75e7b2;
+}
+
+.beta-mode .slot.result-hell,
+.beta-mode .desktop-number-grid button.result-hell {
+  border-color: rgba(255, 67, 85, .78);
+  background: linear-gradient(180deg, rgba(165, 29, 48, .38), #0b0b0e 76%);
+  color: #ff7a87;
+}
+
+.beta-mode .slot.result-heaven small,
+.beta-mode .slot.result-hell small,
+.beta-mode .desktop-number-grid button.result-heaven small,
+.beta-mode .desktop-number-grid button.result-hell small {
+  color: #d5d5da;
 }
 
 .beta-mode .slot.locked .number-taken-cross,
@@ -3854,7 +3918,9 @@
   }
 
   .beta-mode .banner-slot {
-    height: 150px;
+    height: auto;
+    min-height: 0;
+    aspect-ratio: 1600 / 537;
     margin-bottom: 20px;
   }
 
@@ -3983,7 +4049,8 @@
     font-size: 11px;
   }
 
-  .beta-mode .beta-collection-actions .primary-btn {
+  .beta-mode .beta-collection-actions .primary-btn,
+  .beta-mode .beta-collection-actions .small-btn {
     width: 100%;
   }
 
@@ -4412,6 +4479,18 @@
   color: #fff;
 }
 
+.beta-mode .desktop-number-grid button.result-heaven {
+  border-color: rgba(51, 211, 153, .72);
+  background: linear-gradient(180deg, rgba(31, 112, 78, .34), #0b0b0e 76%);
+  color: #75e7b2;
+}
+
+.beta-mode .desktop-number-grid button.result-hell {
+  border-color: rgba(255, 67, 85, .78);
+  background: linear-gradient(180deg, rgba(165, 29, 48, .38), #0b0b0e 76%);
+  color: #ff7a87;
+}
+
 .beta-mode .desktop-number-grid strong {
   font-size: 16px;
   line-height: 1;
@@ -4459,6 +4538,16 @@
 .beta-mode .desktop-number-legend span:nth-child(3) i {
   border-color: var(--beta-red);
   background: var(--beta-red);
+}
+
+.beta-mode .desktop-number-legend i.heaven {
+  border-color: #22a861;
+  background: #22a861;
+}
+
+.beta-mode .desktop-number-legend i.hell {
+  border-color: #ef1439;
+  background: #ef1439;
 }
 
 .beta-mode .draw-layout.purchase-step-1 .card-pool-preview,

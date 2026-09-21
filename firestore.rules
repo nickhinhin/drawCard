@@ -126,9 +126,7 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return signedIn() &&
-        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-        userDoc(request.auth.uid).data.role == "admin";
+      return signedIn() && request.auth.token.admin == true;
     }
 
     function isValidUsername(name) {
@@ -882,8 +880,6 @@ service cloud.firestore {
         ("lastPurchaseRecordId" in request.resource.data && isTokenSpend(uid)) ||
         ("lastConversionRecordId" in request.resource.data && isCardConversionUserEdit(uid)) ||
         ("lastTokenRequestId" in request.resource.data && isTokenRequestQuotaIncrease(uid)) ||
-        ("lastTokenGrantRequestId" in request.resource.data && isAdminTokenGrant(uid)) ||
-        ("lastTokenRequestClosedId" in request.resource.data && isAdminTokenRequestClose(uid)) ||
         isChatRateLimitUpdate(uid);
     }
 
@@ -915,14 +911,14 @@ service cloud.firestore {
     match /tokenRequests/{requestId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
       allow create: if isValidTokenRequestCreate(requestId);
-      allow update: if isTokenProofFinalize() || isValidTokenRequestReview(requestId);
+      allow update: if isTokenProofFinalize();
       allow delete: if false;
     }
 
     match /promoCodes/{codeId} {
       allow get: if signedIn();
       allow list: if isAdmin();
-      allow create, update, delete: if isAdmin();
+      allow create, update, delete: if false;
     }
 
     match /promoRedemptions/{redemptionId} {
@@ -934,28 +930,33 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
+    // A single collection-group query replaces one listener per historical room.
+    // Firestore validates the uid filter against this owner-only list rule.
+    match /{documentPath=**}/slots/{slotId} {
+      allow list: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
     match /draws/{drawId} {
       allow read: if true;
-      allow create, update: if isAdmin();
-      allow delete: if isAdmin();
+      allow create, update, delete: if false;
 
       match /slots/{slotId} {
         // Slot documents contain ownership metadata; anonymous visitors must not receive it.
         allow read: if signedIn();
-        allow create: if isAdmin();
+        allow create: if false;
         allow update: if false;
-        allow delete: if isAdmin();
+        allow delete: if false;
       }
 
       match /rounds/{roundId} {
         allow read: if true;
-        allow create, update, delete: if isAdmin();
+        allow create, update, delete: if false;
 
         match /slots/{slotId} {
           allow read: if signedIn();
-          allow create: if isAdmin();
-          allow update: if isAdmin() || isValidSlotPurchase(drawId, roundId, slotId);
-          allow delete: if isAdmin();
+          allow create: if false;
+          allow update: if isValidSlotPurchase(drawId, roundId, slotId);
+          allow delete: if false;
         }
       }
 
@@ -963,34 +964,42 @@ service cloud.firestore {
         allow read: if signedIn();
         allow create: if isValidRoomMessage(drawId)
           && request.resource.data.source == "draw";
-        allow update: if isAdmin();
-        allow delete: if isAdmin();
+        allow update, delete: if false;
       }
     }
 
     match /cards/{cardId} {
       allow read: if signedIn();
-      allow create, update: if isAdmin();
-      allow delete: if false;
+      allow create, update, delete: if false;
     }
 
     match /publicCardShowcase/{cardId} {
       allow read: if true;
-      allow create, update: if isAdmin();
-      allow delete: if false;
+      allow create, update, delete: if false;
+    }
+
+    match /publicSiteSettings/{settingId} {
+      allow read: if true;
+      allow create, update, delete: if false;
     }
 
     match /settings/{settingId} {
       allow read: if signedIn();
-      allow create, update: if isAdmin();
-      allow delete: if false;
+      allow create, update, delete: if false;
     }
 
     match /drawRecords/{recordId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
-      allow create: if isAdmin() || isMatchingRoundDrawRecord(recordId) || isVipRewardDirectClaim(recordId);
-      allow update: if isAdmin() || isVipRewardClaim() || isCardTokenConversion(recordId) || isShippingRequest();
+      allow create: if isMatchingRoundDrawRecord(recordId) || isVipRewardDirectClaim(recordId);
+      allow update: if isVipRewardClaim() || isCardTokenConversion(recordId) || isShippingRequest();
       allow delete: if false;
+    }
+
+    // Cloud Functions use the Admin SDK and bypass these client rules. Audit entries
+    // are immutable from every web/native client, including administrators.
+    match /adminAuditLogs/{auditId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
     }
   }
 }
