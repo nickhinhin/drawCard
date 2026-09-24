@@ -444,7 +444,8 @@
   font-weight: 900;
 }
 
-.beta-mode .banner-slot:has(> img)::before {
+.beta-mode .banner-slot:has(> img)::before,
+.beta-mode .banner-slot.banner-carousel::before {
   display: none;
 }
 

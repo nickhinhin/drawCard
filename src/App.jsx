@@ -6,6 +6,9 @@ import {
   Check,
   ChevronDown,
   ChevronLeft,
+  ChevronRight,
+  ArrowDown,
+  ArrowUp,
   Clock3,
   Copy,
   Crown,
@@ -425,6 +428,9 @@ const TOKEN_PACKAGE_RATE_VERSION = 2;
 const MIN_CUSTOM_PAYMENT_HKD = 100;
 const CUSTOM_PAYMENT_BONUS_THRESHOLD_HKD = 500;
 const DEFAULT_HOMEPAGE_BANNER_URL = "/default-live-banner.webp";
+const MAX_BANNER_SLIDES = 8;
+const BANNER_INTERVAL_OPTIONS = [3, 5, 7, 10, 15];
+const DEFAULT_BANNER_INTERVAL_SECONDS = 5;
 
 const DEFAULT_VIP_TIERS = [
   { id: "vip0", name: "VIP0", threshold: 3000, rewardCardId: "", rewardName: "M2 卡包" },
@@ -3007,21 +3013,86 @@ function BetaSingleHallIntro({ cards, rooms, onOpenRoom, onSelectCard }) {
 }
 
 function HomepageBanner() {
-  const banner = useHomepageBanner();
+  const { slides, intervalSeconds } = useHomepageBanner();
+  const [index, setIndex] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const touchStartX = useRef(null);
+  const count = slides.length;
+  const current = count ? index % count : 0;
+
+  // Auto-advance; restarting the timer after every change keeps manual navigation from being skipped.
+  useEffect(() => {
+    if (count < 2 || paused) return undefined;
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return undefined;
+    const timer = window.setTimeout(() => setIndex((value) => (value + 1) % count), intervalSeconds * 1000);
+    return () => window.clearTimeout(timer);
+  }, [count, current, paused, intervalSeconds]);
+
+  const go = (step) => setIndex((value) => (value + step + count) % count);
+
+  function handleTouchEnd(event) {
+    const startX = touchStartX.current;
+    touchStartX.current = null;
+    if (startX === null || count < 2) return;
+    const deltaX = event.changedTouches[0].clientX - startX;
+    if (Math.abs(deltaX) > 40) go(deltaX < 0 ? 1 : -1);
+  }
 
   return (
-    <div className="banner-slot">
-      {/* The default banner ships in two sizes so phones load the smaller one. */}
-      <img
-        src={banner.imageUrl}
-        srcSet={banner.imageUrl === DEFAULT_HOMEPAGE_BANNER_URL ? "/default-live-banner-800.webp 800w, /default-live-banner.webp 1600w" : undefined}
-        sizes="(max-width: 860px) 100vw, 1200px"
-        width="1600"
-        height="529"
-        fetchPriority="high"
-        decoding="async"
-        alt="LiveDraw TCG 直播預告"
-      />
+    <div
+      className="banner-slot banner-carousel"
+      role="region"
+      aria-roledescription="carousel"
+      aria-label="直播預告"
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+      onTouchStart={(event) => { touchStartX.current = event.touches[0].clientX; }}
+      onTouchEnd={handleTouchEnd}
+    >
+      <div className="banner-track" style={{ transform: `translateX(-${current * 100}%)` }}>
+        {slides.map((slide, slideIndex) => {
+          const isDefault = slide.imageUrl === DEFAULT_HOMEPAGE_BANNER_URL;
+          // Only the visible and next slides load right away; the rest load when reached.
+          const eager = slideIndex === current || slideIndex === (current + 1) % count;
+          return (
+            <img
+              key={slide.id}
+              src={slide.imageUrl}
+              srcSet={isDefault ? "/default-live-banner-800.webp 800w, /default-live-banner.webp 1600w" : undefined}
+              sizes="(max-width: 860px) 100vw, 1200px"
+              width="1600"
+              height="529"
+              loading={eager ? "eager" : "lazy"}
+              fetchPriority={slideIndex === 0 ? "high" : "low"}
+              decoding="async"
+              alt={count > 1 ? `LiveDraw TCG 直播預告 ${slideIndex + 1}／${count}` : "LiveDraw TCG 直播預告"}
+              aria-hidden={slideIndex !== current}
+            />
+          );
+        })}
+      </div>
+      {count > 1 && (
+        <>
+          <button className="banner-arrow prev" type="button" onClick={() => go(-1)} aria-label="上一張">
+            <ChevronLeft size={22} />
+          </button>
+          <button className="banner-arrow next" type="button" onClick={() => go(1)} aria-label="下一張">
+            <ChevronRight size={22} />
+          </button>
+          <div className="banner-dots">
+            {slides.map((slide, slideIndex) => (
+              <button
+                key={slide.id}
+                type="button"
+                className={slideIndex === current ? "active" : ""}
+                onClick={() => setIndex(slideIndex)}
+                aria-label={`第 ${slideIndex + 1} 張`}
+                aria-current={slideIndex === current}
+              />
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -9066,6 +9137,7 @@ function HomepageBannerManager({ profile }) {
   const [imageFile, setImageFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [saving, setSaving] = useState(false);
+  const customSlides = banner.isCustom ? banner.slides : [];
 
   useEffect(() => {
     if (!imageFile) {
@@ -9077,10 +9149,36 @@ function HomepageBannerManager({ profile }) {
     return () => URL.revokeObjectURL(nextPreviewUrl);
   }, [imageFile]);
 
-  async function saveBanner() {
-    if (!imageFile) return;
+  // Every change saves straight away so visitors see the same order as the list here.
+  async function saveSlides(nextSlides, intervalSeconds = banner.intervalSeconds) {
+    await adminSetDoc(doc(db, "publicSiteSettings", "homepage"), {
+      bannerSlides: nextSlides.map(({ id, imageUrl }) => ({ id, imageUrl })),
+      // Kept for older clients that only read a single banner.
+      bannerImageUrl: nextSlides[0]?.imageUrl || "",
+      bannerIntervalSeconds: intervalSeconds,
+      updatedAt: serverTimestamp(),
+      updatedBy: profile.uid,
+    }, { merge: true });
+  }
+
+  async function runSave(action, fallbackMessage) {
     setSaving(true);
     try {
+      await action();
+    } catch (error) {
+      showSafeError(error, fallbackMessage);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function addSlide() {
+    if (!imageFile) return;
+    if (customSlides.length >= MAX_BANNER_SLIDES) {
+      alert(`最多 ${MAX_BANNER_SLIDES} 張 Banner。`);
+      return;
+    }
+    runSave(async () => {
       const bannerDataUrl = await imageFileToCompressedDataUrl(imageFile, {
         maxWidth: 1600,
         maxHeight: 600,
@@ -9088,36 +9186,32 @@ function HomepageBannerManager({ profile }) {
         minQuality: 0.62,
         targetBytes: 520 * 1024,
       });
-      const bannerImageUrl = await uploadAdminImage(bannerDataUrl, "site", "homepage-banner");
-      await adminSetDoc(doc(db, "publicSiteSettings", "homepage"), {
-        bannerImageUrl,
-        updatedAt: serverTimestamp(),
-        updatedBy: profile.uid,
-      }, { merge: true });
+      const imageUrl = await uploadAdminImage(bannerDataUrl, "site", "homepage-banner");
+      await saveSlides([...customSlides, { id: `slide-${Date.now()}`, imageUrl }]);
       setImageFile(null);
-      alert("首頁 Banner 已更新。");
-    } catch (error) {
-      showSafeError(error, "Banner 儲存失敗，請重新選擇圖片再試。");
-    } finally {
-      setSaving(false);
-    }
+    }, "Banner 上載失敗，請重新選擇圖片再試。");
   }
 
-  async function restoreDefaultBanner() {
-    if (!window.confirm("確認恢復預設首頁 Banner？")) return;
-    setSaving(true);
-    try {
-      await adminSetDoc(doc(db, "publicSiteSettings", "homepage"), {
-        bannerImageUrl: "",
-        updatedAt: serverTimestamp(),
-        updatedBy: profile.uid,
-      }, { merge: true });
-      setImageFile(null);
-    } catch (error) {
-      showSafeError(error, "未能恢復預設 Banner。");
-    } finally {
-      setSaving(false);
-    }
+  function moveSlide(slideIndex, step) {
+    const nextSlides = [...customSlides];
+    const [slide] = nextSlides.splice(slideIndex, 1);
+    nextSlides.splice(slideIndex + step, 0, slide);
+    runSave(() => saveSlides(nextSlides), "未能更改次序。");
+  }
+
+  function removeSlide(slideIndex) {
+    if (!window.confirm(`確認移除第 ${slideIndex + 1} 張 Banner？`)) return;
+    runSave(() => saveSlides(customSlides.filter((_slide, itemIndex) => itemIndex !== slideIndex)), "未能移除 Banner。");
+  }
+
+  function changeInterval(event) {
+    const seconds = Number(event.target.value);
+    runSave(() => saveSlides(customSlides, seconds), "未能更改輪播時間。");
+  }
+
+  function restoreDefaultBanner() {
+    if (!window.confirm("確認移除所有自訂 Banner，恢復預設圖片？")) return;
+    runSave(() => saveSlides([]), "未能恢復預設 Banner。");
   }
 
   return (
@@ -9125,25 +9219,64 @@ function HomepageBannerManager({ profile }) {
       <div className="section-heading compact">
         <ImagePlus size={22} />
         <div>
-          <h2>首頁 Banner</h2>
-          <p className="muted">上載後會即時顯示俾所有訪客；建議使用約 1600 × 540 的橫向圖片。</p>
+          <h2>首頁 Banner 輪播</h2>
+          <p className="muted">
+            最多 {MAX_BANNER_SLIDES} 張，會按以下次序自動輪播，改動即時顯示俾所有訪客；建議使用約 1600 × 540 的橫向圖片。
+          </p>
         </div>
       </div>
-      <div className="homepage-banner-preview">
-        <img src={previewUrl || banner.imageUrl} alt="首頁 Banner 預覽" />
-      </div>
+
+      {customSlides.length ? (
+        <ol className="banner-slide-list">
+          {customSlides.map((slide, slideIndex) => (
+            <li key={slide.id}>
+              <span className="banner-slide-number">{slideIndex + 1}</span>
+              <img src={slide.imageUrl} alt={`Banner ${slideIndex + 1}`} loading="lazy" />
+              <div className="banner-slide-actions">
+                <button className="small-btn" type="button" onClick={() => moveSlide(slideIndex, -1)} disabled={saving || slideIndex === 0} aria-label="上移">
+                  <ArrowUp size={15} />
+                </button>
+                <button className="small-btn" type="button" onClick={() => moveSlide(slideIndex, 1)} disabled={saving || slideIndex === customSlides.length - 1} aria-label="下移">
+                  <ArrowDown size={15} />
+                </button>
+                <button className="small-btn danger" type="button" onClick={() => removeSlide(slideIndex)} disabled={saving}>
+                  <Trash2 size={15} />移除
+                </button>
+              </div>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <div className="homepage-banner-preview">
+          <img src={DEFAULT_HOMEPAGE_BANNER_URL} alt="預設首頁 Banner" />
+          <p className="form-note">而家顯示緊預設 Banner。加入圖片後會改為顯示你上載嘅 Banner。</p>
+        </div>
+      )}
+
+      <label className="banner-interval">
+        每張顯示時間
+        <select value={banner.intervalSeconds} onChange={changeInterval} disabled={saving || customSlides.length < 2}>
+          {BANNER_INTERVAL_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{seconds} 秒</option>)}
+        </select>
+      </label>
+
+      {previewUrl && (
+        <div className="homepage-banner-preview">
+          <img src={previewUrl} alt="新 Banner 預覽" />
+        </div>
+      )}
       <FileUpload
         id="homepage-banner-file"
-        label="選擇新 Banner"
+        label="加入新 Banner"
         file={imageFile}
         onChange={setImageFile}
-        disabled={saving}
+        disabled={saving || customSlides.length >= MAX_BANNER_SLIDES}
       />
       <div className="homepage-banner-actions">
-        <button className="primary-btn" type="button" onClick={saveBanner} disabled={saving || !imageFile}>
-          <Save size={17} />{saving ? "儲存中..." : "儲存 Banner"}
+        <button className="primary-btn" type="button" onClick={addSlide} disabled={saving || !imageFile}>
+          <Plus size={17} />{saving ? "處理中..." : "加入輪播"}
         </button>
-        <button className="small-btn" type="button" onClick={restoreDefaultBanner} disabled={saving || !banner.isCustom}>
+        <button className="small-btn" type="button" onClick={restoreDefaultBanner} disabled={saving || !customSlides.length}>
           <RefreshCcw size={15} />恢復預設
         </button>
       </div>
@@ -12022,23 +12155,41 @@ function createCardDraft(card) {
   };
 }
 
+const DEFAULT_BANNER_STATE = {
+  slides: [{ id: "default", imageUrl: DEFAULT_HOMEPAGE_BANNER_URL }],
+  intervalSeconds: DEFAULT_BANNER_INTERVAL_SECONDS,
+  isCustom: false,
+};
+
+function readBannerSettings(data = {}) {
+  const slides = (Array.isArray(data.bannerSlides) ? data.bannerSlides : [])
+    .map((slide, slideIndex) => ({
+      id: String(slide?.id || `slide-${slideIndex}`),
+      imageUrl: String(slide?.imageUrl || "").trim(),
+    }))
+    .filter((slide) => slide.imageUrl)
+    .slice(0, MAX_BANNER_SLIDES);
+  // Settings saved before the carousel existed only have a single banner URL.
+  const legacyUrl = String(data.bannerImageUrl || "").trim();
+  if (!slides.length && legacyUrl && !Array.isArray(data.bannerSlides)) slides.push({ id: "legacy", imageUrl: legacyUrl });
+  const seconds = Number(data.bannerIntervalSeconds);
+  return {
+    slides: slides.length ? slides : DEFAULT_BANNER_STATE.slides,
+    intervalSeconds: BANNER_INTERVAL_OPTIONS.includes(seconds) ? seconds : DEFAULT_BANNER_INTERVAL_SECONDS,
+    isCustom: slides.length > 0,
+  };
+}
+
 function useHomepageBanner() {
-  const [banner, setBanner] = useState({
-    imageUrl: DEFAULT_HOMEPAGE_BANNER_URL,
-    isCustom: false,
-  });
+  const [banner, setBanner] = useState(DEFAULT_BANNER_STATE);
 
   useEffect(() => {
     const settingsRef = doc(db, "publicSiteSettings", "homepage");
     return onSnapshot(settingsRef, (snapshot) => {
-      const bannerImageUrl = String(snapshot.data()?.bannerImageUrl || "").trim();
-      setBanner({
-        imageUrl: bannerImageUrl || DEFAULT_HOMEPAGE_BANNER_URL,
-        isCustom: Boolean(bannerImageUrl),
-      });
+      setBanner(readBannerSettings(snapshot.data()));
     }, (error) => {
       console.error("Homepage banner listener failed.", error);
-      setBanner({ imageUrl: DEFAULT_HOMEPAGE_BANNER_URL, isCustom: false });
+      setBanner(DEFAULT_BANNER_STATE);
     });
   }, []);
 

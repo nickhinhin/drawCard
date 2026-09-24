@@ -1089,6 +1089,140 @@ textarea:focus {
   font-weight: 600;
 }
 
+.banner-carousel {
+  position: relative;
+  aspect-ratio: 1600 / 537;
+  overflow: hidden;
+  touch-action: pan-y;
+}
+
+.banner-carousel::before {
+  display: none;
+}
+
+.banner-track {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  display: flex;
+  transition: transform 0.6s ease;
+}
+
+.banner-track > img {
+  flex: 0 0 100%;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.banner-arrow {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity 0.2s ease, background 0.2s ease;
+}
+
+.banner-arrow.prev { left: 12px; }
+.banner-arrow.next { right: 12px; }
+.banner-carousel:hover .banner-arrow,
+.banner-arrow:focus-visible { opacity: 1; }
+.banner-arrow:hover { background: rgba(0, 0, 0, 0.7); }
+
+.banner-dots {
+  position: absolute;
+  z-index: 2;
+  bottom: 10px;
+  left: 50%;
+  display: flex;
+  gap: 8px;
+  transform: translateX(-50%);
+}
+
+.banner-dots button {
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  transition: width 0.25s ease, background 0.25s ease;
+}
+
+.banner-dots button.active {
+  width: 22px;
+  background: #fff;
+}
+
+@media (hover: none) {
+  .banner-arrow { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .banner-track { transition: none; }
+}
+
+.banner-slide-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.banner-slide-list li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.banner-slide-list img {
+  width: 100%;
+  max-width: 320px;
+  aspect-ratio: 1600 / 537;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.banner-slide-number {
+  min-width: 22px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.banner-slide-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.banner-interval {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+@media (max-width: 560px) {
+  .banner-slide-list li { grid-template-columns: auto minmax(0, 1fr); }
+  .banner-slide-actions { grid-column: 1 / -1; }
+}
+
 .homepage-banner-manager {
   display: grid;
   gap: 16px;
