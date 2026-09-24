@@ -5907,6 +5907,12 @@
   gap: 12px;
 }
 
+.beta-mode .affiliate-monthly-download {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid #2a2a30;
+}
+
 .beta-mode .affiliate-report-form label {
   display: grid;
   gap: 6px;

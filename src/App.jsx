@@ -914,7 +914,7 @@ function App() {
               <button className="primary-btn" type="button" onClick={() => window.location.reload()}>
                 重新載入
               </button>
-              <button className="secondary-btn" type="button" onClick={handleLogout}>
+              <button className="ghost-btn" type="button" onClick={handleLogout}>
                 登出
               </button>
             </div>
@@ -1011,7 +1011,7 @@ function AdminSite({
         <Shield size={36} />
         <h1>沒有管理員權限</h1>
         <p>此帳戶未獲管理員權限，請改用管理員帳戶登入。</p>
-        <button className="secondary-btn" type="button" onClick={onLogout}>
+        <button className="ghost-btn" type="button" onClick={onLogout}>
           <LogOut size={17} />
           登出
         </button>
@@ -3152,7 +3152,7 @@ function LiveArchivePage({ onOpenRoom }) {
       <LiveArchiveList rooms={rooms} onOpenRoom={onOpenRoom} />
       {rooms.length >= pageSize && (
         <button
-          className="secondary-btn live-archive-more"
+          className="ghost-btn live-archive-more"
           type="button"
           onClick={() => setPageSize((current) => current + ARCHIVE_PAGE_SIZE)}
         >
@@ -6357,6 +6357,17 @@ function affiliateRange(preset, customStart, customEnd) {
   return [start, end ? new Date(end.getTime() + 86400000) : null];
 }
 
+function currentHongKongMonth() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong" }).format(new Date()).slice(0, 7);
+}
+
+// "2026-09" → [1 Sep 00:00 HKT, 1 Oct 00:00 HKT).
+function hongKongMonthRange(value) {
+  const [year, month] = String(value || "").split("-").map(Number);
+  if (!year || !month || month < 1 || month > 12) return [null, null];
+  return [hongKongDate(year, month - 1, 1), month === 12 ? hongKongDate(year + 1, 0, 1) : hongKongDate(year, month, 1)];
+}
+
 // Web replacement for the retired macOS affiliate screens: review applications
 // and read per-referrer reports computed by the adminAffiliateReport function.
 function AffiliateManager() {
@@ -6372,6 +6383,7 @@ function AffiliateManager() {
   const [report, setReport] = useState(null);
   const [reportLoading, setReportLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [downloadMonth, setDownloadMonth] = useState(currentHongKongMonth);
 
   async function loadAffiliateData() {
     setLoading(true);
@@ -6412,10 +6424,11 @@ function AffiliateManager() {
     }
   }
 
-  async function downloadAllReports() {
-    const [start, end] = affiliateRange(preset, customStart, customEnd);
-    if (!start || !end || end <= start) {
-      alert("請選擇有效日期範圍。");
+  async function downloadAllReports(event) {
+    event.preventDefault();
+    const [start, end] = hongKongMonthRange(downloadMonth);
+    if (!start || !end) {
+      alert("請選擇月份。");
       return;
     }
     setDownloading(true);
@@ -6461,9 +6474,7 @@ function AffiliateManager() {
         });
       }
       const headers = ["推薦人", "推薦人電郵", "推薦碼", "類型", "會員", "會員電郵", "入金HKD", "消費代幣", "已開獎消費", "派出卡牌價值", "平台盈虧", "抽卡次數", "未開獎"];
-      const day = (date) => new Intl.DateTimeFormat("en-CA").format(date);
-      const lastDay = new Date(end.getTime() - 86400000);
-      downloadTextFile(`affiliate-report-${day(start)}_${day(lastDay)}.csv`, createCsvText(headers, rows));
+      downloadTextFile(`affiliate-report-${downloadMonth}.csv`, createCsvText(headers, rows));
     } catch (error) {
       showSafeError(error, "未能下載推薦報表。");
     } finally {
@@ -6586,9 +6597,23 @@ function AffiliateManager() {
             <button className="primary-btn" type="submit" disabled={reportLoading}>
               {reportLoading ? "載入中..." : "查看報表"}
             </button>
-            <button className="secondary-btn" type="button" disabled={downloading} onClick={downloadAllReports}>
+          </form>
+        ) : null}
+        {affiliates.length ? (
+          <form className="affiliate-report-form affiliate-monthly-download" onSubmit={downloadAllReports}>
+            <label>
+              月結報表（全部推薦人）
+              <input
+                type="month"
+                value={downloadMonth}
+                max={currentHongKongMonth()}
+                onChange={(event) => setDownloadMonth(event.target.value)}
+                required
+              />
+            </label>
+            <button className="ghost-btn" type="submit" disabled={downloading || !downloadMonth}>
               <Download size={16} />
-              {downloading ? "下載中..." : "下載全部推薦人報表"}
+              {downloading ? "下載中..." : "下載該月報表"}
             </button>
           </form>
         ) : (
