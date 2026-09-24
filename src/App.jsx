@@ -6345,6 +6345,8 @@ function hongKongDate(year, monthIndex, day) {
   return new Date(`${year}-${month}-${String(day).padStart(2, "0")}T00:00:00+08:00`);
 }
 
+const AFFILIATE_REPORT_FIRST_YEAR = 2026;
+
 function currentHongKongMonth() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong" }).format(new Date()).slice(0, 7);
 }
@@ -6464,6 +6466,17 @@ function AffiliateManager() {
     }
   }
 
+  // Year and month dropdowns; future months are not offered.
+  const [latestYear, latestMonth] = currentHongKongMonth().split("-");
+  const [downloadYear, downloadMonthNumber] = downloadMonth.split("-");
+  const reportYears = Array.from({ length: Number(latestYear) - AFFILIATE_REPORT_FIRST_YEAR + 1 }, (_item, index) => String(Number(latestYear) - index));
+  const reportMonths = Array.from({ length: downloadYear === latestYear ? Number(latestMonth) : 12 }, (_item, index) => String(index + 1).padStart(2, "0"));
+
+  function changeDownloadYear(year) {
+    const month = year === latestYear && downloadMonthNumber > latestMonth ? latestMonth : downloadMonthNumber;
+    setDownloadMonth(`${year}-${month}`);
+  }
+
   const visibleApplications = applications.filter((item) => (
     applicationView === "pending" ? item.status === "pending" : item.status !== "pending"
   ));
@@ -6531,14 +6544,16 @@ function AffiliateManager() {
         {affiliates.length ? (
           <form className="affiliate-report-form" onSubmit={downloadAllReports}>
             <label>
+              年份
+              <select value={downloadYear} onChange={(event) => changeDownloadYear(event.target.value)}>
+                {reportYears.map((year) => <option key={year} value={year}>{year} 年</option>)}
+              </select>
+            </label>
+            <label>
               月份
-              <input
-                type="month"
-                value={downloadMonth}
-                max={currentHongKongMonth()}
-                onChange={(event) => setDownloadMonth(event.target.value)}
-                required
-              />
+              <select value={downloadMonthNumber} onChange={(event) => setDownloadMonth(`${downloadYear}-${event.target.value}`)}>
+                {reportMonths.map((month) => <option key={month} value={month}>{Number(month)} 月</option>)}
+              </select>
             </label>
             <button className="primary-btn" type="submit" disabled={downloading || !downloadMonth}>
               <Download size={16} />
