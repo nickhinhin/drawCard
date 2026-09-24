@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App.jsx";
 import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
+import { installGlobalErrorReporting } from "./errorReporting.js";
 import "./styles.css";
 import "./beta.css";
 
@@ -23,6 +24,8 @@ if (IS_ADMIN_SITE) {
   robots.content = "noindex, nofollow";
   document.head.appendChild(robots);
 }
+
+installGlobalErrorReporting();
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>

@@ -10,6 +10,9 @@ const adminMarkers = [
   "adminBatchWrite",
   "adminUploadImage",
   "adminEnsureDrawSlots",
+  "adminLiveHealth",
+  "adminAuditAnalyze",
+  "adminMonitorSession",
 ];
 
 async function listFiles(dir) {

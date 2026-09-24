@@ -1,13 +1,13 @@
 import { initializeApp } from "firebase/app";
 import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "firebase/app-check";
-import { getAuth, GoogleAuthProvider } from "firebase/auth";
+import { connectAuthEmulator, getAuth, GoogleAuthProvider } from "firebase/auth";
 import {
+  connectFirestoreEmulator,
   initializeFirestore,
   persistentLocalCache,
   persistentMultipleTabManager,
 } from "firebase/firestore";
-import { getStorage } from "firebase/storage";
-import { getFunctions } from "firebase/functions";
+import { connectFunctionsEmulator, getFunctions } from "firebase/functions";
 import { IS_BETA } from "./appVariant.js";
 
 const firebaseConfig = {
@@ -31,7 +31,11 @@ const firebaseConfig = {
 };
 
 export const app = initializeApp(firebaseConfig);
-const appCheckSiteKey = import.meta.env.VITE_FIREBASE_APP_CHECK_SITE_KEY;
+// Local UI testing only: `vite` dev server with VITE_USE_EMULATORS=true talks to the
+// Firebase emulators. import.meta.env.DEV is false in production builds, so this
+// branch (and the emulator hosts) is removed from the deployed bundle.
+const useEmulators = import.meta.env.DEV && import.meta.env.VITE_USE_EMULATORS === "true";
+const appCheckSiteKey = useEmulators ? "" : import.meta.env.VITE_FIREBASE_APP_CHECK_SITE_KEY;
 export const appCheck = appCheckSiteKey
   ? initializeAppCheck(app, {
     provider: new ReCaptchaEnterpriseProvider(appCheckSiteKey),
@@ -46,8 +50,13 @@ export const db = initializeFirestore(app, {
     tabManager: persistentMultipleTabManager(),
   }),
 });
-export const storage = getStorage(app);
 export const functions = getFunctions(app, "asia-east2");
+
+if (useEmulators) {
+  connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
+  connectFirestoreEmulator(db, "127.0.0.1", 8080);
+  connectFunctionsEmulator(functions, "127.0.0.1", 5001);
+}
 
 export const analyticsPromise = new Promise((resolve) => {
   if (IS_BETA) {

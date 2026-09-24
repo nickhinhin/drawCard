@@ -1,6 +1,6 @@
 import { deleteApp, initializeApp } from "firebase/app";
 import {
-  collection, connectFirestoreEmulator, doc, getFirestore, runTransaction, serverTimestamp, setDoc, updateDoc, writeBatch,
+  collection, connectFirestoreEmulator, doc, getDoc, getDocs, getFirestore, runTransaction, serverTimestamp, setDoc, updateDoc, writeBatch,
 } from "firebase/firestore";
 import { connectAuthEmulator, createUserWithEmailAndPassword, getAuth } from "firebase/auth";
 
@@ -201,6 +201,51 @@ try {
   results.push("PASS  normal purchase with library card thumbnail: allowed");
 } catch (error) {
   results.push(`FAIL  normal purchase with library card thumbnail: ${error.code || error.message}`);
+}
+
+// Admin-only data: players must not read or forge monitor reports, audit logs or affiliate data.
+await seed([
+  ["monitorSessions/s1", { status: s("completed"), drawTitle: s("Live") }],
+  ["adminAuditLogs/a1", { action: s("test") }],
+  ["affiliateApplications/x1", { uid: s("someone") }],
+]);
+for (const [label, action] of [
+  ["player reads a monitor report", () => getDoc(doc(db, "monitorSessions", "s1"))],
+  ["player lists monitor reports", () => getDocs(collection(db, "monitorSessions"))],
+  ["player forges a monitor report", () => setDoc(doc(db, "monitorSessions", "fake"), { status: "completed" })],
+  ["player edits a monitor report", () => updateDoc(doc(db, "monitorSessions", "s1"), { status: "active" })],
+  ["player reads admin audit logs", () => getDocs(collection(db, "adminAuditLogs"))],
+  ["player writes admin audit logs", () => setDoc(doc(db, "adminAuditLogs", "fake"), { action: "x" })],
+  ["player reads affiliate applications", () => getDocs(collection(db, "affiliateApplications"))],
+]) {
+  try {
+    await action();
+    results.push(`FAIL  ${label}: ACCEPTED`);
+  } catch {
+    results.push(`PASS  ${label}: rejected`);
+  }
+}
+
+// An account holding the admin claim can read monitor reports but still cannot write them.
+const adminAccount = await createUserWithEmailAndPassword(auth, `admin-${stamp}@example.test`, "not-a-real-password");
+const claimResponse = await fetch(`http://127.0.0.1:${authPort}/identitytoolkit.googleapis.com/v1/projects/${projectId}/accounts:update`, {
+  method: "POST",
+  headers: { Authorization: "Bearer owner", "Content-Type": "application/json" },
+  body: JSON.stringify({ localId: adminAccount.user.uid, customAttributes: JSON.stringify({ admin: true }) }),
+});
+if (!claimResponse.ok) throw new Error(await claimResponse.text());
+await adminAccount.user.getIdToken(true);
+try {
+  await getDoc(doc(db, "monitorSessions", "s1"));
+  results.push("PASS  admin reads a monitor report: allowed");
+} catch (error) {
+  results.push(`FAIL  admin reads a monitor report: ${error.code || error.message}`);
+}
+try {
+  await setDoc(doc(db, "monitorSessions", "admin-fake"), { status: "completed" });
+  results.push("FAIL  admin writes a monitor report directly: ACCEPTED");
+} catch {
+  results.push("PASS  admin writes a monitor report directly: rejected (server only)");
 }
 
 console.log(results.join("\n"));

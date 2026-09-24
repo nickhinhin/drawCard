@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { getApps, initializeApp } from "firebase-admin/app";
+import { applicationDefault, getApps, initializeApp } from "firebase-admin/app";
 import { FieldPath, FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
+import { logger } from "firebase-functions";
 import { setGlobalOptions } from "firebase-functions/v2";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
+import { analyzeAuditEntries } from "./audit-analysis.js";
+import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeClientError } from "./monitor.js";
 
 // Least-privilege runtime identity: Firestore, this project's bucket, App Check and logging only.
 // Builds run as the default compute account, which holds only roles/cloudbuild.builds.builder.
@@ -12,10 +15,12 @@ setGlobalOptions({ serviceAccount: "livedraw-functions@livedraw-7e3c2.iam.gservi
 if (!getApps().length) initializeApp();
 
 const db = getFirestore();
+// App Check is always enforced in production; only the local emulator (no App Check tokens) skips it.
+const ENFORCE_APP_CHECK = process.env.FUNCTIONS_EMULATOR !== "true";
 const userCallableOptions = {
   region: "asia-east2",
-  enforceAppCheck: true,
-  consumeAppCheckToken: true,
+  enforceAppCheck: ENFORCE_APP_CHECK,
+  consumeAppCheckToken: ENFORCE_APP_CHECK,
   timeoutSeconds: 30,
   memory: "256MiB",
 };
@@ -24,7 +29,7 @@ const userCallableOptions = {
 // the server-issued `admin` custom claim and the allowlist before any access.
 const adminCallableOptions = {
   region: "asia-east2",
-  enforceAppCheck: true,
+  enforceAppCheck: ENFORCE_APP_CHECK,
   timeoutSeconds: 60,
   memory: "256MiB",
 };
@@ -37,7 +42,7 @@ const affiliateApplicationsCallableOptions = {
 const tokenProofCallableOptions = {
   region: "asia-east2",
   // Payment proofs come only from the web client, which always attaches App Check tokens.
-  enforceAppCheck: true,
+  enforceAppCheck: ENFORCE_APP_CHECK,
   timeoutSeconds: 30,
   memory: "256MiB",
 };
@@ -262,6 +267,11 @@ function adminDocument(collectionName, documentId) {
 
 export const ensureAffiliateAccount = onCall(userCallableOptions, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "請先登入會員帳戶。");
+  // Passwords exist only as a second factor-free login for verified phone accounts;
+  // an email/password account without a verified phone may not become a member.
+  if (request.auth.token.firebase?.sign_in_provider === "password" && !request.auth.token.phone_number) {
+    throw new HttpsError("permission-denied", "請使用手機號碼驗證碼或 Google 登入註冊。");
+  }
   const uid = request.auth.uid;
   const requestedReferralCode = normalizeAffiliateCode(request.data?.referralCode);
   const displayName = String(request.data?.displayName || request.auth.token.name || "").trim().slice(0, 80);
@@ -1284,3 +1294,253 @@ export const __test = {
   affiliateCodeForUid, normalizeAffiliateCode,
   adminBatchOperation, decodeAdminValue, summarizeAffiliateReport,
 };
+
+// Data-change audit triggers (see audit.js).
+export * from "./audit.js";
+
+// The retention-locked log bucket that holds the data-change audit trail.
+// Until it exists, entries are read from the project's default log bucket (30 days).
+const AUDIT_LOG_VIEW = "projects/livedraw-7e3c2/locations/global/buckets/livedraw-audit/views/_AllLogs";
+const AUDIT_EXPORT_MAX_DAYS = 370;
+
+function auditRange(request) {
+  const startDate = new Date(String(request.data?.startAt || ""));
+  const endDate = new Date(String(request.data?.endAt || ""));
+  const rangeMs = endDate.getTime() - startDate.getTime();
+  if (!Number.isFinite(rangeMs) || rangeMs <= 0 || rangeMs > AUDIT_EXPORT_MAX_DAYS * 86400000) {
+    throw new HttpsError("invalid-argument", `日期範圍必須為 1 至 ${AUDIT_EXPORT_MAX_DAYS} 日。`);
+  }
+  return { startDate, endDate };
+}
+
+// Reads one page of data-change entries from the locked audit bucket, falling
+// back to the default 30-day bucket until the locked bucket exists.
+async function fetchAuditPage(startDate, endDate, pageToken = "") {
+  const filter = [
+    'jsonPayload.auditType="livedraw-data-change"',
+    `timestamp>="${startDate.toISOString()}"`,
+    `timestamp<"${endDate.toISOString()}"`,
+  ].join(" AND ");
+  const { access_token: accessToken } = await applicationDefault().getAccessToken();
+  const listEntries = async (resourceNames) => {
+    const response = await loggingList(accessToken, {
+      resourceNames, filter, orderBy: "timestamp asc", pageSize: 1000,
+      ...(pageToken ? { pageToken } : {}),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  // Read the locked bucket and the default bucket together: entries written
+  // before the sink existed are only in the default bucket (30 days).
+  let source = "locked-bucket";
+  let result = await listEntries([AUDIT_LOG_VIEW, "projects/livedraw-7e3c2"]);
+  if (result.status === 404 || result.body?.error?.status === "NOT_FOUND") {
+    source = "default-30-days";
+    result = await listEntries(["projects/livedraw-7e3c2"]);
+  }
+  if (result.status !== 200) {
+    console.error("Audit log read failed.", result.status, result.body?.error?.message);
+    throw new HttpsError("internal", "未能讀取審計紀錄，請確認服務帳戶有 Logs Viewer 權限。");
+  }
+  const entries = (result.body.entries || []).map((entry) => {
+    const payload = entry.jsonPayload || {};
+    return {
+      eventId: payload.eventId || entry.insertId || "",
+      time: entry.timestamp,
+      operation: payload.operation || "",
+      collection: payload.collection || "",
+      path: payload.path || "",
+      authType: payload.authType || "",
+      authId: payload.authId || "",
+      changes: payload.changes || {},
+      context: payload.context || {},
+    };
+  });
+  return { entries, nextPageToken: result.body.nextPageToken || "", source };
+}
+
+// One-click review: scans the selected range and returns suspicious-activity findings.
+const AUDIT_ANALYSIS_MAX_ENTRIES = 50000;
+export const adminAuditAnalyze = onCall({ ...adminCallableOptions, timeoutSeconds: 300, memory: "512MiB" }, async (request) => {
+  const actor = assertAdmin(request);
+  const { startDate, endDate } = auditRange(request);
+  const entries = [];
+  let pageToken = "";
+  let source = "";
+  do {
+    const page = await fetchAuditPage(startDate, endDate, pageToken);
+    entries.push(...page.entries);
+    source = page.source;
+    pageToken = page.nextPageToken;
+  } while (pageToken && entries.length < AUDIT_ANALYSIS_MAX_ENTRIES);
+  const result = analyzeAuditEntries(entries);
+  await db.collection("adminAuditLogs").add(auditRecord(
+    actor, "audit-log:analyze", "auditLog", source, null,
+    { startAt: startDate.toISOString(), endAt: endDate.toISOString(), entries: entries.length, summary: result.summary },
+    request,
+  ));
+  return {
+    ...result,
+    findings: result.findings.slice(0, 1000),
+    truncated: Boolean(pageToken),
+    source,
+  };
+});
+
+// Browser error reports from players and admins, shown on the admin live monitor.
+// App Check keeps scripts out; the limiter caps reports per user or IP.
+const allowClientError = createRateLimiter(20, 60 * 1000);
+const allowAnyClientError = createRateLimiter(300, 60 * 1000);
+export const reportClientError = onCall({
+  region: "asia-east2", enforceAppCheck: ENFORCE_APP_CHECK, timeoutSeconds: 10, memory: "256MiB", maxInstances: 2,
+}, (request) => {
+  const uid = request.auth?.uid || "";
+  // The last X-Forwarded-For hop is added by Google's front end and cannot be spoofed.
+  const forwarded = String(request.rawRequest?.headers?.["x-forwarded-for"] || "").split(",").map((part) => part.trim()).filter(Boolean);
+  const key = uid || forwarded.at(-1) || "anonymous";
+  if (!allowAnyClientError("all") || !allowClientError(key)) return { ok: false };
+  const report = sanitizeClientError(request.data, uid);
+  // logger.error would replace the message with a server stack trace; write it explicitly.
+  logger.write({ severity: "ERROR", ...report, message: `client error: ${report.message}` });
+  return { ok: true };
+});
+
+// Reads project logs between two instants (newest first).
+// Cloud Logging allows about 60 list calls a minute; back off briefly when throttled.
+async function loggingList(accessToken, body) {
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetch("https://logging.googleapis.com/v2/entries:list", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (response.status !== 429 || attempt >= 3) return response;
+    await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)));
+  }
+}
+
+async function readProjectLogs(filter, sinceIso, untilIso, pageSize = 1000) {
+  const { access_token: accessToken } = await applicationDefault().getAccessToken();
+  const response = await loggingList(accessToken, {
+    resourceNames: ["projects/livedraw-7e3c2"],
+    filter: `${filter} AND timestamp>="${sinceIso}"${untilIso ? ` AND timestamp<"${untilIso}"` : ""}`,
+    orderBy: "timestamp desc",
+    pageSize,
+  });
+  const body = await response.json();
+  if (!response.ok) {
+    console.error("Log read failed.", response.status, body?.error?.message);
+    throw new HttpsError("internal", "未能讀取系統日誌，請確認服務帳戶有 Logs Viewer 權限。");
+  }
+  return body.entries || [];
+}
+
+const CLIENT_ERROR_FILTER = 'jsonPayload.clientErrorType="livedraw-client-error"';
+const SERVER_ERROR_FILTER = 'resource.type="cloud_run_revision" AND severity>=WARNING AND NOT jsonPayload.clientErrorType="livedraw-client-error"';
+const isErrorSeverity = (entry) => ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"].includes(entry.severity);
+
+async function errorSummary(sinceIso, untilIso) {
+  const [clientEntries, serverEntries] = await Promise.all([
+    readProjectLogs(CLIENT_ERROR_FILTER, sinceIso, untilIso),
+    readProjectLogs(SERVER_ERROR_FILTER, sinceIso, untilIso, 500),
+  ]);
+  return {
+    clientErrors: groupClientErrors(clientEntries).slice(0, 50),
+    serverErrors: groupServerErrors(serverEntries).slice(0, 50),
+    clientErrorCount: clientEntries.length,
+    serverErrorCount: serverEntries.filter(isErrorSeverity).length,
+    serverWarningCount: serverEntries.filter((entry) => entry.severity === "WARNING").length,
+  };
+}
+
+// Live event health: grouped browser errors and server errors since the session started.
+export const adminLiveHealth = onCall({ ...adminCallableOptions, timeoutSeconds: 60 }, async (request) => {
+  assertAdmin(request);
+  const since = new Date(String(request.data?.sinceAt || ""));
+  const sinceIso = Number.isNaN(since.getTime())
+    ? new Date(Date.now() - 60 * 60 * 1000).toISOString()
+    : new Date(Math.max(since.getTime(), Date.now() - 24 * 60 * 60 * 1000)).toISOString();
+  return { checkedAt: new Date().toISOString(), sinceAt: sinceIso, ...(await errorSummary(sinceIso)) };
+});
+
+// Start / stop a monitored live session. Stopping builds and stores the session report.
+export const adminMonitorSession = onCall({ ...adminCallableOptions, timeoutSeconds: 300, memory: "512MiB" }, async (request) => {
+  const actor = assertAdmin(request);
+  const action = request.data?.action;
+  const sessions = db.collection("monitorSessions");
+  if (action === "start") {
+    const drawTitle = String(request.data?.drawTitle || "").slice(0, 120);
+    const ref = sessions.doc();
+    // One active session at a time, even if two admins press start together.
+    await db.runTransaction(async (transaction) => {
+      const active = await transaction.get(sessions.where("status", "in", ["active", "stopping"]).limit(1));
+      if (!active.empty) throw new HttpsError("already-exists", "已經有一個監察進行中。");
+      transaction.create(ref, {
+        status: "active", drawTitle, startedAt: FieldValue.serverTimestamp(),
+        startedBy: actor.uid, startedByEmail: actor.email || "",
+      });
+    });
+    await db.collection("adminAuditLogs").add(auditRecord(actor, "monitor:start", "monitorSessions", ref.id, null, { drawTitle }, request));
+    return { ok: true, sessionId: ref.id };
+  }
+  if (action !== "stop") throw new HttpsError("invalid-argument", "操作不正確。");
+
+  const sessionRef = sessions.doc(assertIdentifier(request.data?.sessionId, "監察 ID"));
+  // Claim the stop first so a double press cannot build two reports.
+  const snapshot = await db.runTransaction(async (transaction) => {
+    const current = await transaction.get(sessionRef);
+    if (!current.exists || current.data().status !== "active") throw new HttpsError("failed-precondition", "呢個監察已經停止。");
+    transaction.update(sessionRef, { status: "stopping" });
+    return current;
+  });
+  try {
+    const start = snapshot.data().startedAt.toDate();
+    const end = new Date();
+    const startTs = Timestamp.fromDate(start);
+    const endTs = Timestamp.fromDate(end);
+    const [records, created, reviewed, pending, shipping] = await Promise.all([
+      db.collection("drawRecords").where("createdAt", ">=", startTs).where("createdAt", "<", endTs).get(),
+      db.collection("tokenRequests").where("createdAt", ">=", startTs).where("createdAt", "<", endTs).get(),
+      db.collection("tokenRequests").where("reviewedAt", ">=", startTs).where("reviewedAt", "<", endTs).get(),
+      db.collection("tokenRequests").where("status", "in", ["pending", "awaiting_upload"]).get(),
+      db.collection("drawRecords").where("shippingRequestedAt", ">=", startTs).where("shippingRequestedAt", "<", endTs).count().get(),
+    ]);
+    const requests = new Map();
+    [created, reviewed, pending].forEach((result) => result.docs.forEach((doc) => requests.set(doc.id, doc.data())));
+    const report = buildMonitorReport({
+      startMs: start.getTime(),
+      endMs: end.getTime(),
+      records: records.docs.map((doc) => doc.data()),
+      requests: [...requests.values()],
+      shipping: shipping.data().count,
+    });
+    const [errors, auditEntries] = await Promise.all([
+      errorSummary(start.toISOString(), end.toISOString()).catch((error) => ({ unavailable: String(error.message || error) })),
+      (async () => {
+        const entries = [];
+        let pageToken = "";
+        do {
+          const page = await fetchAuditPage(start, end, pageToken);
+          entries.push(...page.entries);
+          pageToken = page.nextPageToken;
+        } while (pageToken && entries.length < 20000);
+        return entries;
+      })().catch(() => null),
+    ]);
+    const audit = auditEntries ? analyzeAuditEntries(auditEntries) : null;
+    const stored = {
+      ...report,
+      errors,
+      audit: audit ? { summary: audit.summary, entryCount: audit.entryCount, findings: audit.findings.slice(0, 50) } : { unavailable: true },
+    };
+    await sessionRef.update({
+      status: "completed", endedAt: FieldValue.serverTimestamp(), endedBy: actor.uid,
+      endedByEmail: actor.email || "", report: stored,
+    });
+  } catch (error) {
+    // Let the admin try again instead of leaving the session stuck in "stopping".
+    await sessionRef.update({ status: "active" });
+    throw error;
+  }
+  await db.collection("adminAuditLogs").add(auditRecord(actor, "monitor:stop", "monitorSessions", sessionRef.id, null, { durationMinutes: Math.round((Date.now() - snapshot.data().startedAt.toMillis()) / 60000) }, request));
+  return { ok: true, sessionId: sessionRef.id };
+});

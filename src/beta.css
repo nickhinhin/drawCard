@@ -5969,3 +5969,236 @@
   align-items: center;
   gap: 10px;
 }
+
+/* Audit analysis results. */
+.beta-mode .audit-analysis {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.beta-mode .audit-level.critical strong,
+.beta-mode .audit-level.high strong { color: var(--beta-red-text); }
+.beta-mode .audit-level.medium strong { color: #fbbf24; }
+.beta-mode .audit-level.low strong { color: #93c5fd; }
+
+.beta-mode .audit-findings {
+  display: grid;
+  gap: 8px;
+  max-height: 520px;
+  overflow-y: auto;
+}
+
+.beta-mode .audit-finding {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid #34343b;
+  border-left-width: 4px;
+  border-radius: 3px;
+  background: #0d0d11;
+}
+
+.beta-mode .audit-finding.critical,
+.beta-mode .audit-finding.high { border-left-color: var(--beta-red); }
+.beta-mode .audit-finding.medium { border-left-color: #f59e0b; }
+.beta-mode .audit-finding.low { border-left-color: #60a5fa; }
+
+.beta-mode .audit-finding strong {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #fff;
+}
+
+.beta-mode .audit-finding p {
+  margin: 0;
+  color: #d8d8de;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .audit-finding small {
+  color: var(--beta-muted);
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .audit-badge {
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: #25252c;
+  font-size: 0.75rem;
+}
+
+.beta-mode .audit-badge.critical,
+.beta-mode .audit-badge.high { color: var(--beta-red-text); }
+.beta-mode .audit-badge.medium { color: #fbbf24; }
+.beta-mode .audit-badge.low { color: #93c5fd; }
+
+.beta-mode .audit-report-title {
+  margin: 0;
+  font-size: 1rem;
+}
+
+/* Print only the audit report, on white paper. */
+@media print {
+  body.printing-audit-report * {
+    visibility: hidden;
+  }
+
+  body.printing-audit-report .audit-report,
+  body.printing-audit-report .audit-report * {
+    visibility: visible;
+  }
+
+  body.printing-audit-report .audit-report {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+  }
+
+  body.printing-audit-report,
+  body.printing-audit-report .audit-report,
+  body.printing-audit-report .audit-report * {
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  body.printing-audit-report .audit-findings {
+    max-height: none;
+    overflow: visible;
+  }
+
+  body.printing-audit-report .audit-finding {
+    break-inside: avoid;
+    border-color: #999 !important;
+  }
+
+  body.printing-audit-report .audit-print-hide {
+    display: none !important;
+  }
+}
+
+.beta-mode .admin-redirect-login {
+  margin-top: 10px;
+  font-size: 0.85rem;
+}
+
+/* Live monitor. */
+.beta-mode .live-monitor {
+  display: grid;
+  gap: 18px;
+}
+
+.beta-mode .monitor-alerts {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.beta-mode .monitor-alert {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 3px;
+  font-weight: 800;
+}
+
+.beta-mode .monitor-alert.high {
+  background: color-mix(in srgb, var(--beta-red) 22%, transparent);
+  color: #fff;
+}
+
+.beta-mode .monitor-alert.medium {
+  background: color-mix(in srgb, #f59e0b 18%, transparent);
+  color: #fcd34d;
+}
+
+.beta-mode .monitor-alert.low {
+  background: color-mix(in srgb, #3b82f6 16%, transparent);
+  color: #bfdbfe;
+}
+
+.beta-mode .monitor-kpis {
+  margin-top: 6px;
+}
+
+.beta-mode .monitor-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.beta-mode .monitor-columns h3 {
+  margin: 0 0 10px;
+}
+
+.beta-mode .monitor-columns h4 {
+  margin: 14px 0 8px;
+  color: var(--beta-muted);
+}
+
+.beta-mode .monitor-feed {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+
+.beta-mode .monitor-feed p {
+  margin: 0;
+  color: #d8d8de;
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .monitor-feed b {
+  color: var(--beta-muted);
+  font-weight: 700;
+}
+
+.beta-mode .monitor-health-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+@media (max-width: 860px) {
+  .beta-mode .monitor-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+.beta-mode .live-monitor .section-heading .monitor-stop {
+  margin-left: auto;
+}
+
+.beta-mode .monitor-report {
+  display: grid;
+  gap: 14px;
+}
+
+.beta-mode .monitor-report-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.beta-mode .monitor-session-item {
+  align-items: center;
+  gap: 12px;
+}
+
+.beta-mode .monitor-session-item p {
+  margin: 4px 0 0;
+}
+
+.beta-mode .auth-sms-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.beta-mode .change-password-card {
+  margin-top: 18px;
+}

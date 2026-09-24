@@ -907,6 +907,12 @@ service cloud.firestore {
 
     // Cloud Functions use the Admin SDK and bypass these client rules. Audit entries
     // are immutable from every web/native client, including administrators.
+    // Live monitor session reports are written only by adminMonitorSession.
+    match /monitorSessions/{sessionId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
     match /adminAuditLogs/{auditId} {
       allow read: if isAdmin();
       allow create, update, delete: if false;

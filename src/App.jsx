@@ -10,6 +10,7 @@ import {
   Copy,
   Crown,
   Download,
+  FileText,
   ExternalLink,
   Maximize2,
   Minimize2,
@@ -46,15 +47,21 @@ import {
 } from "lucide-react";
 import {
   RecaptchaVerifier,
+  EmailAuthProvider,
   browserLocalPersistence,
   browserSessionPersistence,
+  getAdditionalUserInfo,
   getRedirectResult,
+  linkWithCredential,
   onAuthStateChanged,
+  reauthenticateWithCredential,
   setPersistence,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signInWithPhoneNumber,
   signInWithRedirect,
   signOut,
+  updatePassword,
 } from "firebase/auth";
 import {
   FieldValue,
@@ -75,13 +82,47 @@ import {
   where,
   writeBatch,
 } from "firebase/firestore";
-import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { httpsCallable } from "firebase/functions";
 import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
-import { auth, db, functions, googleProvider, storage } from "./firebase";
+import { reportClientError } from "./errorReporting.js";
+import { auth, db, functions, googleProvider } from "./firebase";
 
 const PENDING_AFFILIATE_CODE_KEY = "livedraw-pending-affiliate-code";
 const PENDING_REGISTRATION_KEY = "livedraw-pending-registration";
+const PHONE_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d).{8,64}$/;
+
+// Phone accounts sign in with phone + password after the first SMS verification.
+// Firebase has no phone+password provider, so the password is linked to an
+// internal login name derived from the verified phone number; no email is ever sent.
+function phoneLoginEmail(phoneNumber) {
+  return `${String(phoneNumber || "").replace(/\D/g, "")}@phone.livedraw-7e3c2.firebaseapp.com`;
+}
+
+// Phone accounts sign in with a synthetic email; never show it as a real address.
+function displayEmail(email) {
+  return /@phone\.livedraw-7e3c2\.firebaseapp\.com$/i.test(String(email || "")) ? "" : String(email || "");
+}
+
+function isPhoneAccount(user) {
+  return Boolean(user?.phoneNumber) && (user.providerData || []).some((item) => item.providerId === "phone");
+}
+
+function hasPhonePassword(user) {
+  return (user?.providerData || []).some((item) => item.providerId === "password");
+}
+
+function getPasswordAuthErrorMessage(error) {
+  const code = String(error?.code || "");
+  if (["auth/invalid-credential", "auth/wrong-password", "auth/user-not-found", "auth/invalid-email"].includes(code)) {
+    return "手機號碼或密碼不正確。如果未設定密碼或者忘記密碼，請撳「忘記密碼？」用 SMS 驗證碼重設。";
+  }
+  if (code === "auth/too-many-requests") return "嘗試次數過多，請稍後再試，或撳「忘記密碼？」重設密碼。";
+  if (code === "auth/password-does-not-meet-requirements" || code === "auth/weak-password") {
+    return "密碼最少 8 個字，並要包括英文字母同數字。";
+  }
+  if (code === "auth/requires-recent-login") return "為保安理由，請登出後用 SMS 驗證碼重新登入，再設定密碼。";
+  return getSafeErrorMessage(error, "密碼登入失敗，請再試一次。");
+}
 const AFFILIATE_CODE_PATTERN = /^AFF[A-F0-9]{20}$/;
 
 function normalizeAffiliateCode(value) {
@@ -383,7 +424,7 @@ const TOKEN_PACKAGES = [
 const TOKEN_PACKAGE_RATE_VERSION = 2;
 const MIN_CUSTOM_PAYMENT_HKD = 100;
 const CUSTOM_PAYMENT_BONUS_THRESHOLD_HKD = 500;
-const DEFAULT_HOMEPAGE_BANNER_URL = "/default-live-banner.jpg";
+const DEFAULT_HOMEPAGE_BANNER_URL = "/default-live-banner.webp";
 
 const DEFAULT_VIP_TIERS = [
   { id: "vip0", name: "VIP0", threshold: 3000, rewardCardId: "", rewardName: "M2 卡包" },
@@ -463,6 +504,7 @@ function App() {
   const [usernameConflict, setUsernameConflict] = useState(false);
   const [hasAdminClaim, setHasAdminClaim] = useState(false);
   const [adminClaimReady, setAdminClaimReady] = useState(false);
+  const [signInProvider, setSignInProvider] = useState("");
 
   useEffect(() => {
     // Preserve the referral before login redirects or in-app navigation can remove it.
@@ -518,7 +560,10 @@ function App() {
 
     authUser.getIdTokenResult(true)
       .then((token) => {
-        if (!cancelled) setHasAdminClaim(token.claims.admin === true);
+        if (!cancelled) {
+          setHasAdminClaim(token.claims.admin === true);
+          setSignInProvider(token.signInProvider || "");
+        }
       })
       .catch(() => {
         if (!cancelled) setHasAdminClaim(false);
@@ -607,6 +652,14 @@ function App() {
   const needsUsername = Boolean(
     authUser && profile && (!profile.username || usernameConflict),
   );
+  const [passwordGateDone, setPasswordGateDone] = useState(false);
+  useEffect(() => setPasswordGateDone(false), [authUser?.uid]);
+  // An SMS code never signs a phone account straight in: after any SMS sign-in the
+  // player must set (or reset) a password, and daily logins use phone + password.
+  const needsPhonePassword = Boolean(
+    authUser && profile && !needsUsername && isPhoneAccount(authUser) && !passwordGateDone
+      && (signInProvider === "phone" || !hasPhonePassword(authUser)),
+  );
   const isProfileLoading = Boolean(authUser && !profile && !profileInitializationError);
 
   const tabs = useMemo(
@@ -631,11 +684,21 @@ function App() {
     googleSignInPendingRef.current = true;
     setAuthError("");
     setSigningIn(true);
+    // Browsers can hide the popup's closure from the page (COOP), which would
+    // leave the button spinning forever; give up waiting after 60 seconds.
+    let timedOut = false;
+    const popupTimeout = window.setTimeout(() => {
+      timedOut = true;
+      googleSignInPendingRef.current = false;
+      setSigningIn(false);
+      setAuthError("Google 登入未完成。請再撳一次登入，或者改用跳轉登入。");
+    }, 60000);
     try {
       googleProvider.setCustomParameters({ prompt: "select_account" });
       await signInWithPopup(auth, googleProvider);
       setAuthDialogOpen(false);
     } catch (error) {
+      if (timedOut) return;
       const productionRedirectCodes = new Set([
         "auth/popup-blocked",
         "auth/popup-closed-by-user",
@@ -659,7 +722,22 @@ function App() {
         setAuthError(getSafeErrorMessage(error, "Google 登入失敗，請再試一次。"));
       }
     } finally {
-      googleSignInPendingRef.current = false;
+      window.clearTimeout(popupTimeout);
+      if (!timedOut) {
+        googleSignInPendingRef.current = false;
+        setSigningIn(false);
+      }
+    }
+  }
+
+  async function handleRedirectLogin() {
+    setAuthError("");
+    setSigningIn(true);
+    try {
+      googleProvider.setCustomParameters({ prompt: "select_account" });
+      await signInWithRedirect(auth, googleProvider);
+    } catch (error) {
+      setAuthError(getSafeErrorMessage(error, "Google 登入失敗，請再試一次。"));
       setSigningIn(false);
     }
   }
@@ -699,6 +777,7 @@ function App() {
         isProfileLoading={isProfileLoading}
         needsUsername={needsUsername}
         onGoogleLogin={handleLogin}
+        onRedirectLogin={handleRedirectLogin}
         onLogout={handleLogout}
         profile={activeProfile}
         profileInitializationError={profileInitializationError}
@@ -840,6 +919,16 @@ function App() {
             profile={profile}
             conflict={usernameConflict}
           />
+        ) : needsPhonePassword ? (
+          <PhonePasswordGate
+            authUser={authUser}
+            resetting={hasPhonePassword(authUser)}
+            onDone={() => {
+              setSignInProvider("password");
+              setPasswordGateDone(true);
+            }}
+            onLogout={handleLogout}
+          />
         ) : (
           <>
             {!isBeta && (
@@ -883,6 +972,7 @@ function AdminSite({
   needsUsername,
   onGoogleLogin,
   onLogout,
+  onRedirectLogin,
   profile,
   profileInitializationError,
   signingIn,
@@ -903,6 +993,9 @@ function AdminSite({
         <button className="primary-btn" type="button" onClick={onGoogleLogin} disabled={signingIn}>
           <LogIn size={18} />
           {signingIn ? "登入中..." : "使用 Google 登入"}
+        </button>
+        <button className="ghost-btn admin-redirect-login" type="button" onClick={onRedirectLogin}>
+          登入視窗冇彈出？改用跳轉登入
         </button>
       </section>
     );
@@ -1170,6 +1263,9 @@ function WelcomePanel({ authError, onGoogleLogin, onPhoneLogin, signingIn }) {
 
 function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signingIn }) {
   const [accountAction, setAccountAction] = useState(isBeta ? "" : "login");
+  // Phone users sign in with a password. SMS is only for registration and "forgot password".
+  const [useSmsLogin, setUseSmsLogin] = useState(false);
+  const [password, setPassword] = useState("");
   const [authMethod, setAuthMethod] = useState(isBeta ? "" : "phone");
   const [phoneNumber, setPhoneNumber] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -1183,6 +1279,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
   const recaptchaRef = useRef(null);
   const recaptchaWidgetIdRef = useRef(null);
   const isRegistration = accountAction === "register";
+  const isPasswordReset = !isRegistration && useSmsLogin;
 
   useEffect(
     () => () => {
@@ -1253,6 +1350,12 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
         }));
       }
       const credential = await confirmation.confirm(verificationCode.trim());
+      // "Forgot password" must not register a new account behind the registration form.
+      if (isPasswordReset && getAdditionalUserInfo(credential)?.isNewUser) {
+        await credential.user.delete().catch(() => signOut(auth));
+        setConfirmation(null);
+        throw new Error("呢個手機號碼未註冊，請返回選擇「註冊」。");
+      }
       if (isBeta && isRegistration) {
         const username = normalizeUsername(displayName);
         // The phone sign-in credential is new; wait for its ID token before account bootstrap.
@@ -1279,8 +1382,33 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
     }
   }
 
+  async function signInWithPhonePassword(event) {
+    event.preventDefault();
+    setPhoneError("");
+    setPhoneBusy(true);
+    try {
+      await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
+      await signInWithEmailAndPassword(auth, phoneLoginEmail(normalizePhoneNumber(phoneNumber)), password);
+      onClose();
+    } catch (error) {
+      setPhoneError(error?.code ? getPasswordAuthErrorMessage(error) : getPhoneAuthErrorMessage(error));
+    } finally {
+      setPhoneBusy(false);
+    }
+  }
+
+  // "Forgot password" verifies the phone by SMS, then a new password is mandatory.
+  function switchToSms() {
+    setPhoneError("");
+    setUseSmsLogin(true);
+  }
+
   function goBack() {
     setPhoneError("");
+    if (useSmsLogin && !confirmation && !isRegistration) {
+      setUseSmsLogin(false);
+      return;
+    }
     if (confirmation) {
       setConfirmation(null);
     } else if (authMethod) {
@@ -1341,7 +1469,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
             <div className="auth-method-grid">
               <button className="auth-choice-card primary" type="button" onClick={() => setAuthMethod("phone")}>
                 <Smartphone size={24} />
-                <span><strong>手機號碼</strong><small>使用 SMS 一次性驗證碼</small></span>
+                <span><strong>手機號碼</strong><small>{isRegistration ? "使用 SMS 驗證碼註冊" : "手機號碼 + 密碼"}</small></span>
               </button>
               <button className="auth-choice-card" type="button" onClick={continueWithGoogle} disabled={signingIn}>
                 <LogIn size={24} />
@@ -1358,10 +1486,42 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
         ) : (
           <>
 
-            <h2 id="auth-dialog-title">{isBeta ? `手機號碼${isRegistration ? "註冊" : "登入"}` : "登入 / 註冊"}</h2>
-            <p className="muted">{confirmation ? "輸入已發送到你手機的 6 位數字驗證碼。" : isBeta ? "輸入手機號碼以接收一次性驗證碼。" : "使用手機號碼接收一次性驗證碼，或使用 Google 帳戶繼續。"}</p>
+            <h2 id="auth-dialog-title">{isBeta ? (isPasswordReset ? "忘記密碼" : `手機號碼${isRegistration ? "註冊" : "登入"}`) : "登入 / 註冊"}</h2>
+            <p className="muted">
+              {confirmation
+                ? "輸入已發送到你手機的 6 位數字驗證碼。"
+                : isBeta && !isRegistration && !useSmsLogin
+                  ? "輸入手機號碼同密碼登入。"
+                  : isPasswordReset
+                    ? "輸入已註冊嘅手機號碼，驗證之後需要設定新密碼。未設定過密碼嘅舊帳戶都用呢度設定。"
+                    : isBeta ? "輸入手機號碼以接收一次性驗證碼。" : "使用手機號碼接收一次性驗證碼，或使用 Google 帳戶繼續。"}
+            </p>
 
-            {!confirmation ? (
+            {isBeta && !isRegistration && !useSmsLogin && !confirmation ? (
+              <form className="stack-form" onSubmit={signInWithPhonePassword}>
+                <label>
+                  手機號碼
+                  <input type="tel" inputMode="tel" autoComplete="tel" value={phoneNumber} onChange={(event) => setPhoneNumber(event.target.value)} placeholder="例如 +852 9123 4567" required />
+                </label>
+                <label>
+                  密碼
+                  <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
+                </label>
+                <div className="auth-options">
+                  <label className="check-option">
+                    <input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} />
+                    <span>記住我</span>
+                  </label>
+                </div>
+                <button className="primary-btn" type="submit" disabled={phoneBusy}>
+                  <LogIn size={18} />
+                  {phoneBusy ? "登入中..." : "登入"}
+                </button>
+                <div className="auth-sms-links">
+                  <button className="auth-forgot-link" type="button" onClick={switchToSms}>忘記密碼？／未設定密碼</button>
+                </div>
+              </form>
+            ) : !confirmation ? (
               <form className="stack-form" onSubmit={sendPhoneCode}>
                 {isBeta && isRegistration && (
                   <>
@@ -1391,11 +1551,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
                       <input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} />
                       <span>記住我</span>
                     </label>
-                    {!isRegistration && (
-                      <button className="auth-forgot-link" type="button" onClick={() => alert("手機號碼帳戶不設密碼，請重新接收 SMS 驗證碼登入。")}>
-                        忘記密碼？
-                      </button>
-                    )}
+
                   </div>
                 )}
                 <button className="primary-btn" id="send-phone-code" type="submit" disabled={phoneBusy}>
@@ -1411,7 +1567,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
                 </label>
                 <button className="primary-btn" type="submit" disabled={phoneBusy}>
                   <Check size={18} />
-                  {phoneBusy ? "驗證中..." : `確認並${isRegistration ? "註冊" : "登入"}`}
+                  {phoneBusy ? "驗證中..." : isPasswordReset ? "確認並設定新密碼" : `確認並${isRegistration ? "註冊" : "登入"}`}
                 </button>
                 <button className="small-btn" type="button" onClick={() => setConfirmation(null)}>更改手機號碼</button>
               </form>
@@ -1493,6 +1649,135 @@ function UsernameGate({ authUser, profile, conflict = false }) {
 }
 
 // Keeps the editable player name available in the beta layout without rewriting any historical snapshots.
+// Shown after an SMS sign-in until the phone account has a password (or when resetting it).
+function PhonePasswordGate({ authUser, resetting, onDone, onLogout }) {
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function savePassword(event) {
+    event.preventDefault();
+    setError("");
+    if (!PHONE_PASSWORD_PATTERN.test(password)) {
+      setError("密碼最少 8 個字，並要包括英文字母同數字。");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("兩次輸入嘅密碼唔一樣。");
+      return;
+    }
+    setBusy(true);
+    try {
+      const email = phoneLoginEmail(authUser.phoneNumber);
+      if (hasPhonePassword(authUser)) {
+        await updatePassword(authUser, password);
+      } else {
+        await linkWithCredential(authUser, EmailAuthProvider.credential(email, password));
+      }
+      // Switch this session to a password sign-in so a reload does not ask again.
+      await signInWithEmailAndPassword(auth, email, password);
+      onDone();
+    } catch (saveError) {
+      setError(getPasswordAuthErrorMessage(saveError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="panel username-gate">
+      <div className="section-heading">
+        <Lock size={24} />
+        <div>
+          <h1>{resetting ? "重設密碼" : "設定登入密碼"}</h1>
+          <p className="muted">
+            {resetting
+              ? "你用咗 SMS 驗證碼登入，請設定新密碼先可以繼續。之後請用手機號碼同密碼登入。"
+              : "設定密碼之後，下次只需要輸入手機號碼同密碼就可以登入，唔使再收驗證碼。"}
+          </p>
+        </div>
+      </div>
+      <form className="stack-form" onSubmit={savePassword}>
+        <p className="muted">手機號碼：{authUser.phoneNumber}</p>
+        <label>
+          新密碼
+          <input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} maxLength={64} placeholder="最少 8 個字，包括英文字母同數字" required />
+        </label>
+        <label>
+          再輸入一次新密碼
+          <input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} minLength={8} maxLength={64} required />
+        </label>
+        {error && <p className="error-note">{error}</p>}
+        <button className="primary-btn" type="submit" disabled={busy}>
+          <Lock size={17} />{busy ? "儲存中..." : "儲存密碼"}
+        </button>
+        <button className="ghost-btn" type="button" onClick={onLogout}>
+          <LogOut size={17} />登出
+        </button>
+      </form>
+    </section>
+  );
+}
+
+function ChangePhonePasswordForm({ authUser }) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  async function changePassword(event) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    if (!PHONE_PASSWORD_PATTERN.test(password)) {
+      setError("新密碼最少 8 個字，並要包括英文字母同數字。");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("兩次輸入嘅新密碼唔一樣。");
+      return;
+    }
+    setBusy(true);
+    try {
+      const email = phoneLoginEmail(authUser.phoneNumber);
+      await reauthenticateWithCredential(authUser, EmailAuthProvider.credential(email, currentPassword));
+      await updatePassword(authUser, password);
+      setCurrentPassword("");
+      setPassword("");
+      setConfirmPassword("");
+      setMessage("密碼已更新。");
+    } catch (changeError) {
+      setError(["auth/invalid-credential", "auth/wrong-password"].includes(changeError?.code)
+        ? "現有密碼不正確。"
+        : getPasswordAuthErrorMessage(changeError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="affiliate-link-card change-password-card">
+      <div>
+        <strong>更改登入密碼</strong>
+        <small>忘記現有密碼？登出後喺登入畫面撳「忘記密碼」，用 SMS 驗證碼重設。</small>
+      </div>
+      <form className="affiliate-application-form" onSubmit={changePassword}>
+        <label>現有密碼<input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
+        <label>新密碼<input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} maxLength={64} placeholder="最少 8 個字，包括英文字母同數字" required /></label>
+        <label>再輸入一次新密碼<input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} minLength={8} maxLength={64} required /></label>
+        {error && <p className="error-note">{error}</p>}
+        {message && <p className="sf-pickup-selected"><Check size={15} />{message}</p>}
+        <button className="primary-btn" type="submit" disabled={busy}>
+          <Lock size={17} />{busy ? "更新中..." : "更新密碼"}
+        </button>
+      </form>
+    </section>
+  );
+}
+
 function BetaAccountSettings({ authUser, profile }) {
   return (
     <section className="panel beta-account-settings">
@@ -1509,10 +1794,11 @@ function BetaAccountSettings({ authUser, profile }) {
         </span>
         <div>
           <strong>{profile?.username || "玩家"}</strong>
-          <span>{authUser?.email || ""}</span>
+          <span>{displayEmail(authUser?.email) || authUser?.phoneNumber || ""}</span>
         </div>
       </div>
       <UsernameEditForm authUser={authUser} profile={profile} />
+      {isPhoneAccount(authUser) && hasPhonePassword(authUser) && <ChangePhonePasswordForm authUser={authUser} />}
       <AffiliateLinkCard profile={profile} />
     </section>
   );
@@ -1520,7 +1806,7 @@ function BetaAccountSettings({ authUser, profile }) {
 
 function AffiliateLinkCard({ profile, compact = false }) {
   const [copied, setCopied] = useState(false);
-  const [contact, setContact] = useState(profile?.phoneNumber || profile?.email || "");
+  const [contact, setContact] = useState(profile?.phoneNumber || displayEmail(profile?.email) || "");
   const [message, setMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState("");
@@ -1798,7 +2084,7 @@ function AccountPanel({ authUser, profile, setActiveTab }) {
         <span className="avatar-initial">{initial}</span>
         <div>
           <strong>{profile?.username}</strong>
-          <span>{authUser.email}</span>
+          <span>{displayEmail(authUser.email) || authUser.phoneNumber}</span>
         </div>
       </div>
 
@@ -2725,7 +3011,17 @@ function HomepageBanner() {
 
   return (
     <div className="banner-slot">
-      <img src={banner.imageUrl} alt="LiveDraw TCG 直播預告" />
+      {/* The default banner ships in two sizes so phones load the smaller one. */}
+      <img
+        src={banner.imageUrl}
+        srcSet={banner.imageUrl === DEFAULT_HOMEPAGE_BANNER_URL ? "/default-live-banner-800.webp 800w, /default-live-banner.webp 1600w" : undefined}
+        sizes="(max-width: 860px) 100vw, 1200px"
+        width="1600"
+        height="529"
+        fetchPriority="high"
+        decoding="async"
+        alt="LiveDraw TCG 直播預告"
+      />
     </div>
   );
 }
@@ -3277,7 +3573,7 @@ function BetaPsaCarousel({ cards, rooms, onOpenRoom, onSelectCard }) {
                   aria-label={`進入直播中房間抽 ${card.name}`}
                 >
                   <span className="beta-psa-badge">PSA 10</span>
-                  <img src={card.imageUrl} alt={card.name} loading="lazy" />
+                  <img src={getCardThumbUrl(card)} alt={card.name} loading="lazy" decoding="async" width="240" height="330" />
                   <strong title={card.name}>{card.name}</strong>
                   <div className="beta-psa-price">
                     <del><TokenAmount value={card.tokenValue} /></del>
@@ -5972,14 +6268,21 @@ function SfPickupPointPicker({ value, onChange }) {
 
 const AFFILIATE_STATUS_LABELS = { pending: "待審批", approved: "已批准", rejected: "已拒絕" };
 
+// Report periods are Hong Kong calendar days, months and years.
+function hongKongDate(year, monthIndex, day) {
+  const month = String(monthIndex + 1).padStart(2, "0");
+  return new Date(`${year}-${month}-${String(day).padStart(2, "0")}T00:00:00+08:00`);
+}
+
 function affiliateRange(preset, customStart, customEnd) {
-  const now = new Date();
-  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const [year, month, day] = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong" })
+    .format(new Date()).split("-").map(Number);
+  const startOfDay = hongKongDate(year, month - 1, day);
   if (preset === "today") return [startOfDay, new Date(startOfDay.getTime() + 86400000)];
-  if (preset === "month") return [new Date(now.getFullYear(), now.getMonth(), 1), new Date(now.getFullYear(), now.getMonth() + 1, 1)];
-  if (preset === "year") return [new Date(now.getFullYear(), 0, 1), new Date(now.getFullYear() + 1, 0, 1)];
-  const start = customStart ? new Date(`${customStart}T00:00:00`) : null;
-  const end = customEnd ? new Date(`${customEnd}T00:00:00`) : null;
+  if (preset === "month") return [hongKongDate(year, month - 1, 1), month === 12 ? hongKongDate(year + 1, 0, 1) : hongKongDate(year, month, 1)];
+  if (preset === "year") return [hongKongDate(year, 0, 1), hongKongDate(year + 1, 0, 1)];
+  const start = customStart ? new Date(`${customStart}T00:00:00+08:00`) : null;
+  const end = customEnd ? new Date(`${customEnd}T00:00:00+08:00`) : null;
   return [start, end ? new Date(end.getTime() + 86400000) : null];
 }
 
@@ -6026,7 +6329,7 @@ function AffiliateManager() {
       alert("拒絕申請時請填寫原因。");
       return;
     }
-    if (decision === "approved" && !window.confirm(`確認批准 ${application.username || application.email || "此會員"} 的 Affiliate 申請？`)) return;
+    if (decision === "approved" && !window.confirm(`確認批准 ${application.username || displayEmail(application.email) || "此會員"} 的 Affiliate 申請？`)) return;
     setBusyUid(application.uid);
     try {
       await httpsCallable(functions, "adminReviewAffiliateApplication")({ uid: application.uid, decision, reviewNote });
@@ -6056,14 +6359,14 @@ function AffiliateManager() {
         });
         const referrer = {
           推薦人: affiliate.username || "",
-          推薦人電郵: affiliate.email || "",
+          推薦人電郵: displayEmail(affiliate.email),
           推薦碼: affiliate.affiliateCode || "",
         };
         data.referees.forEach((row) => rows.push({
           ...referrer,
           類型: "會員",
           會員: row.username || row.uid,
-          會員電郵: row.email || "",
+          會員電郵: displayEmail(row.email),
           入金HKD: row.depositsHkd,
           消費代幣: row.spendTokens,
           已開獎消費: row.settledSpendTokens,
@@ -6149,7 +6452,7 @@ function AffiliateManager() {
             {visibleApplications.map((item) => (
               <article className="record-item affiliate-application-item" key={item.uid}>
                 <div>
-                  <strong>{item.username || "未設定用戶名"} · {item.email || "無電郵"}</strong>
+                  <strong>{item.username || "未設定用戶名"} · {displayEmail(item.email) || "無電郵"}</strong>
                   <p className="muted">聯絡：{item.contact}</p>
                   <p>{item.message}</p>
                   {item.reviewNote && <p className="muted">備註：{item.reviewNote}</p>}
@@ -6190,7 +6493,7 @@ function AffiliateManager() {
               <select value={referrerUid} onChange={(event) => { setReferrerUid(event.target.value); setReport(null); }}>
                 <option value="">請選擇</option>
                 {affiliates.map((item) => (
-                  <option key={item.uid} value={item.uid}>{item.username || item.email} · {item.refereeCount} 位會員</option>
+                  <option key={item.uid} value={item.uid}>{item.username || displayEmail(item.email)} · {item.refereeCount} 位會員</option>
                 ))}
               </select>
             </label>
@@ -6237,7 +6540,7 @@ function AffiliateManager() {
                 </div>
                 {report.referees.map((row) => (
                   <div role="row" className="affiliate-report-row" key={row.uid}>
-                    <span>{row.username || row.email || row.uid}</span>
+                    <span>{row.username || displayEmail(row.email) || row.uid}</span>
                     <span>{formatTokenNumber(row.depositsHkd)}</span>
                     <span>{formatTokenNumber(row.spendTokens)}</span>
                     <span>{formatTokenNumber(row.payoutTokens)}</span>
@@ -6251,6 +6554,515 @@ function AffiliateManager() {
             )}
           </div>
         )}
+      </section>
+    </div>
+  );
+}
+
+const AUDIT_SEVERITY_LABELS = { critical: "嚴重", high: "高", medium: "中", low: "低" };
+
+function toDateInputValue(date) {
+  return new Intl.DateTimeFormat("en-CA").format(date);
+}
+
+// Analyses the data-change audit trail for a date range and prints the findings.
+function AuditLogExporter() {
+  const today = new Date();
+  const [startDate, setStartDate] = useState(toDateInputValue(new Date(today.getTime() - 6 * 86400000)));
+  const [endDate, setEndDate] = useState(toDateInputValue(today));
+  const [status, setStatus] = useState("");
+  const [analysis, setAnalysis] = useState(null);
+
+  function selectedRange() {
+    // Dates are Hong Kong calendar days, whatever time zone the admin's browser uses.
+    const start = new Date(`${startDate}T00:00:00+08:00`);
+    const end = new Date(new Date(`${endDate}T00:00:00+08:00`).getTime() + 86400000);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) return null;
+    return { start, end };
+  }
+
+  async function analyzeRange() {
+    const range = selectedRange();
+    if (!range) {
+      alert("請選擇有效日期範圍。");
+      return;
+    }
+    setStatus("分析中…");
+    setAnalysis(null);
+    try {
+      const { data } = await httpsCallable(functions, "adminAuditAnalyze")({
+        startAt: range.start.toISOString(),
+        endAt: range.end.toISOString(),
+      });
+      setAnalysis(data);
+    } catch (error) {
+      showSafeError(error, "未能分析審計紀錄。");
+    } finally {
+      setStatus("");
+    }
+  }
+
+  // Prints only the analysis report (see the audit-print styles); raw records are never exported.
+  function printReport() {
+    document.body.classList.add("printing-audit-report");
+    const cleanUp = () => {
+      document.body.classList.remove("printing-audit-report");
+      window.removeEventListener("afterprint", cleanUp);
+    };
+    window.addEventListener("afterprint", cleanUp);
+    window.print();
+  }
+
+
+  return (
+    <section className="panel">
+      <div className="section-heading compact">
+        <Shield size={22} />
+        <div>
+          <h2>審計紀錄</h2>
+          <p className="muted">揀日期範圍後一鍵分析期間內所有資料改動（代幣、購買、申請、設定等），列出可疑活動並可列印報告。原始紀錄存放於鎖定的日誌儲存區，任何人都不能修改、刪除或下載。</p>
+        </div>
+      </div>
+      <form className="affiliate-report-form" onSubmit={(event) => { event.preventDefault(); analyzeRange(); }}>
+        <label>開始日期<input type="date" value={startDate} max={endDate} onChange={(event) => setStartDate(event.target.value)} /></label>
+        <label>結束日期<input type="date" value={endDate} min={startDate} onChange={(event) => setEndDate(event.target.value)} /></label>
+        <button className="primary-btn" type="submit" disabled={Boolean(status)}>
+          <Shield size={16} />
+          {status || "一鍵分析"}
+        </button>
+      </form>
+      {analysis && (
+        <div className="audit-analysis audit-report">
+          <h3 className="audit-report-title">LiveDraw 審計分析報告 · {startDate} 至 {endDate}</h3>
+          <div className="affiliate-summary">
+            <div><span>已檢查紀錄</span><strong>{formatTokenNumber(analysis.entryCount)}</strong></div>
+            {["critical", "high", "medium", "low"].map((level) => (
+              <div className={`audit-level ${level}`} key={level}>
+                <span>{AUDIT_SEVERITY_LABELS[level]}</span><strong>{analysis.summary[level] || 0}</strong>
+              </div>
+            ))}
+          </div>
+          {analysis.source === "default-30-days" && <p className="form-note">鎖定儲存區未建立，只分析咗最近 30 日內嘅紀錄。</p>}
+          {analysis.truncated && <p className="form-note">紀錄太多，只分析咗首 50,000 條，請縮短日期範圍。</p>}
+          {analysis.findings.length ? (
+            <>
+              <button className="small-btn audit-print-hide" type="button" onClick={printReport}>
+                <FileText size={15} />列印報告
+              </button>
+              <div className="audit-findings">
+                {analysis.findings.map((item, index) => (
+                  <article className={`audit-finding ${item.severity}`} key={`${item.rule}-${item.path}-${index}`}>
+                    <strong><span className={`audit-badge ${item.severity}`}>{AUDIT_SEVERITY_LABELS[item.severity]}</span>{item.title}</strong>
+                    <p>{item.detail}</p>
+                    <small>{item.time ? new Date(item.time).toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong" }) : ""} · {item.path} · {item.actor}</small>
+                  </article>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="sf-pickup-selected"><Check size={15} />呢段期間冇發現可疑活動。</p>
+              <button className="small-btn audit-print-hide" type="button" onClick={printReport}>
+                <FileText size={15} />列印報告
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+const MONITOR_PENDING_ALERT_MS = 10 * 60 * 1000;
+const MONITOR_HEALTH_REFRESH_MS = 60 * 1000;
+
+function formatAgo(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "--";
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return "少於 1 分鐘";
+  if (minutes < 60) return `${minutes} 分鐘`;
+  return `${Math.floor(minutes / 60)} 小時 ${minutes % 60} 分鐘`;
+}
+
+function formatClock(value) {
+  const time = typeof value === "string" ? new Date(value) : value instanceof Date ? value : new Date(toMillis(value));
+  return Number.isNaN(time.getTime()) ? "--" : time.toLocaleTimeString("zh-HK", { hour12: false });
+}
+
+// Real-time dashboard shown only while a monitor session is running.
+function LiveMonitorDashboard({ session, onStop, stopping }) {
+  const sessionStartMs = toMillis(session.startedAt) || Date.now();
+  const [liveRoom, setLiveRoom] = useState(null);
+  const [roundSlots, setRoundSlots] = useState([]);
+  const [todayRecords, setTodayRecords] = useState([]);
+  const [pendingRequests, setPendingRequests] = useState([]);
+  const [shippingQueue, setShippingQueue] = useState([]);
+  const [health, setHealth] = useState(null);
+  const [healthError, setHealthError] = useState("");
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 10000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => onSnapshot(
+    query(collection(db, "draws"), where("status", "==", "live")),
+    (snapshot) => setLiveRoom(snapshot.docs[0] ? { id: snapshot.docs[0].id, ...snapshot.docs[0].data() } : null),
+    (error) => console.error("Monitor live room listener failed.", error),
+  ), []);
+
+  const currentRoundId = liveRoom ? toRoundId(getRoomCurrentRound(liveRoom)) : "";
+  useEffect(() => {
+    if (!liveRoom?.id || !currentRoundId) {
+      setRoundSlots([]);
+      return undefined;
+    }
+    return onSnapshot(
+      collection(db, "draws", liveRoom.id, "rounds", currentRoundId, "slots"),
+      (snapshot) => setRoundSlots(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+      (error) => console.error("Monitor slot listener failed.", error),
+    );
+  }, [liveRoom?.id, currentRoundId]);
+
+  useEffect(() => onSnapshot(
+      query(collection(db, "drawRecords"), where("createdAt", ">=", Timestamp.fromMillis(sessionStartMs)), orderBy("createdAt", "desc")),
+      (snapshot) => setTodayRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).filter((record) => record.source !== "vip")),
+      (error) => console.error("Monitor records listener failed.", error),
+  ), [sessionStartMs]);
+
+  useEffect(() => onSnapshot(
+    query(collection(db, "tokenRequests"), where("status", "==", "pending")),
+    (snapshot) => setPendingRequests(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+    (error) => console.error("Monitor token request listener failed.", error),
+  ), []);
+
+  useEffect(() => onSnapshot(
+    query(collection(db, "drawRecords"), where("shippingRequested", "==", true)),
+    (snapshot) => setShippingQueue(snapshot.docs.map((item) => item.data())
+      .filter((record) => record.collectionStatus === "shipping" && getDeliveryStage(record) !== "delivered")),
+    (error) => console.error("Monitor shipping listener failed.", error),
+  ), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadHealth() {
+      try {
+        const { data } = await httpsCallable(functions, "adminLiveHealth")({ sinceAt: new Date(sessionStartMs).toISOString() });
+        if (!cancelled) {
+          setHealth(data);
+          setHealthError("");
+        }
+      } catch (error) {
+        if (!cancelled) setHealthError(getSafeErrorMessage(error, "未能讀取系統錯誤紀錄。"));
+      }
+    }
+    loadHealth();
+    const timer = window.setInterval(loadHealth, MONITOR_HEALTH_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sessionStartMs]);
+
+  const recentWindow = now - 15 * 60 * 1000;
+  const recentRecords = todayRecords.filter((record) => toMillis(record.createdAt) >= recentWindow);
+  const sumTokens = (records) => records.reduce((sum, record) => sum + Number(record.tokenCost || 0), 0);
+  const buyers = new Set(todayRecords.map((record) => record.uid));
+  const topBuyers = Object.values(todayRecords.reduce((totals, record) => {
+    const key = record.uid || record.username;
+    totals[key] = totals[key] || { name: record.username || record.uid, tokens: 0, count: 0 };
+    totals[key].tokens += Number(record.tokenCost || 0);
+    totals[key].count += 1;
+    return totals;
+  }, {})).sort((left, right) => right.tokens - left.tokens).slice(0, 5);
+  const soldSlots = roundSlots.filter((slot) => slot.status && slot.status !== "available");
+  const roundSize = Number(liveRoom?.cardCount || roundSlots.length || 0);
+  const roundFill = roundSize ? soldSlots.length / roundSize : 0;
+  const oldestPending = pendingRequests.reduce((oldest, request) => Math.min(oldest, toMillis(request.createdAt) || now), now);
+  const oldestPendingWait = pendingRequests.length ? now - oldestPending : 0;
+  const buyingStopped = Boolean(liveRoom && isRoundBuyingBlocked(liveRoom, currentRoundId));
+
+  const alerts = [];
+  if (!liveRoom) alerts.push({ level: "medium", text: "而家冇直播中嘅房間。" });
+  if (buyingStopped) alerts.push({ level: "medium", text: `直播中，但${formatRoundLabel(currentRoundId)}已停止購買。` });
+  if (roundFill >= 0.9 && roundFill < 1) alerts.push({ level: "low", text: `${formatRoundLabel(currentRoundId)}就快賣晒（${soldSlots.length}/${roundSize}）。` });
+  if (roundFill >= 1) alerts.push({ level: "low", text: `${formatRoundLabel(currentRoundId)}已經賣晒，可以準備開卡或者開下一場。` });
+  if (oldestPendingWait >= MONITOR_PENDING_ALERT_MS) alerts.push({ level: "high", text: `有代幣申請已經等咗 ${formatAgo(oldestPendingWait)}，玩家可能等緊入代幣先買到。` });
+  if (health?.clientErrorCount) alerts.push({ level: "high", text: `監察期間有 ${health.clientErrorCount} 個玩家端錯誤。` });
+  if (health?.serverErrorCount) alerts.push({ level: "high", text: `監察期間有 ${health.serverErrorCount} 個伺服器錯誤。` });
+  if (healthError) alerts.push({ level: "medium", text: healthError });
+
+  return (
+    <div className="live-monitor">
+      <section className="panel">
+        <div className="section-heading compact">
+          <Bell size={22} />
+          <div>
+            <h2>直播監察</h2>
+            <p className="muted">
+              {liveRoom ? `${liveRoom.title || "直播"} · ${formatRoundLabel(currentRoundId)} · ${buyingStopped ? "已停止購買" : "開放購買中"}` : "而家冇直播中嘅房間"}
+              {" · "}監察咗 {formatAgo(now - sessionStartMs)}（由 {formatClock(new Date(sessionStartMs))} 開始）
+            </p>
+          </div>
+          <button className="primary-btn monitor-stop" type="button" disabled={stopping} onClick={onStop}>
+            {stopping ? "正在產生報告..." : "停止監察並產生報告"}
+          </button>
+        </div>
+        {alerts.length ? (
+          <div className="monitor-alerts">
+            {alerts.map((alert) => <p className={`monitor-alert ${alert.level}`} key={alert.text}>{alert.text}</p>)}
+          </div>
+        ) : (
+          <p className="sf-pickup-selected"><Check size={15} />一切正常。</p>
+        )}
+        <div className="affiliate-summary monitor-kpis">
+          <div><span>監察期間銷售（代幣）</span><strong>{formatTokenNumber(sumTokens(todayRecords))}</strong></div>
+          <div><span>購買次數</span><strong>{todayRecords.length}</strong></div>
+          <div><span>買家人數</span><strong>{buyers.size}</strong></div>
+          <div><span>最近 15 分鐘</span><strong>{recentRecords.length} 次 · {formatTokenNumber(sumTokens(recentRecords))}</strong></div>
+          <div><span>{currentRoundId ? formatRoundLabel(currentRoundId) : "本場"}已售</span><strong>{soldSlots.length} / {roundSize || "--"}</strong></div>
+          <div><span>本場銷售（代幣）</span><strong>{formatTokenNumber(soldSlots.reduce((sum, slot) => sum + Number(slot.tokenCost || 0), 0))}</strong></div>
+          <div><span>待審核代幣申請</span><strong>{pendingRequests.length}{pendingRequests.length ? ` · 最耐 ${formatAgo(oldestPendingWait)}` : ""}</strong></div>
+          <div><span>待安排配送</span><strong>{shippingQueue.length}</strong></div>
+        </div>
+      </section>
+
+      <div className="monitor-columns">
+        <section className="panel">
+          <h3>最新購買</h3>
+          {todayRecords.length ? (
+            <div className="monitor-feed">
+              {todayRecords.slice(0, 15).map((record) => (
+                <p key={record.id}>
+                  <b>{formatClock(record.createdAt)}</b> {record.username || record.uid} · {formatRoundLabel(record.round)} #{record.number} · {record.targetCardName} · ⚡{formatTokenNumber(record.tokenCost)}
+                </p>
+              ))}
+            </div>
+          ) : <p className="muted">監察期間未有購買。</p>}
+          <h3>最高消費</h3>
+          {topBuyers.length ? (
+            <div className="monitor-feed">
+              {topBuyers.map((buyer) => <p key={buyer.name}>{buyer.name} · {buyer.count} 次 · ⚡{formatTokenNumber(buyer.tokens)}</p>)}
+            </div>
+          ) : <p className="muted">--</p>}
+        </section>
+
+        <section className="panel">
+          <div className="monitor-health-heading">
+            <h3>錯誤監察</h3>
+          </div>
+          {health ? (
+            <>
+              <p className="muted">更新時間：{formatClock(health.checkedAt)} · 玩家端錯誤 {health.clientErrorCount >= 1000 ? "1000+" : health.clientErrorCount} · 伺服器錯誤 {health.serverErrorCount} · 警告 {health.serverWarningCount >= 500 ? "500+" : health.serverWarningCount}</p>
+              <h4>玩家端錯誤</h4>
+              {health.clientErrors.length ? health.clientErrors.map((item) => (
+                <article className="audit-finding high" key={`${item.code}-${item.message}`}>
+                  <strong>{item.message}</strong>
+                  <small>{item.count} 次 · {item.users} 位用戶 · {item.code || "no code"} · {item.where} · 最後 {formatClock(item.lastSeen)}</small>
+                </article>
+              )) : <p className="muted">冇玩家端錯誤。</p>}
+              <h4>伺服器錯誤及警告</h4>
+              {health.serverErrors.length ? health.serverErrors.map((item) => (
+                <article className={`audit-finding ${item.severity === "WARNING" ? "medium" : "high"}`} key={`${item.service}-${item.severity}-${item.message}`}>
+                  <strong>{item.service} · {item.severity}</strong>
+                  <p>{item.message}</p>
+                  <small>{item.count} 次 · 最後 {formatClock(item.lastSeen)}</small>
+                </article>
+              )) : <p className="muted">冇伺服器錯誤。</p>}
+            </>
+          ) : healthError ? <p className="error-note">{healthError}</p> : <InlineLoading label="正在讀取錯誤紀錄..." />}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+const MONITOR_REQUEST_LABELS = {
+  submitted: "新提交", approved: "已批准", rejected: "已駁回", approvedHkd: "批准入金（HK$）",
+  approvedTokens: "批出代幣", pendingAtEnd: "結束時未處理", averageWaitMinutes: "平均處理時間（分鐘）",
+  longestWaitMinutes: "最長處理時間（分鐘）",
+};
+
+function downloadMonitorReport(session) {
+  const report = session.report || {};
+  const rows = [];
+  const add = (section, item, value) => rows.push({ 部分: section, 項目: item, 數值: value });
+  add("概覽", "直播", session.drawTitle || "");
+  add("概覽", "開始", formatClock(session.startedAt));
+  add("概覽", "結束", formatClock(session.endedAt));
+  add("概覽", "時長（分鐘）", report.durationMinutes);
+  add("銷售", "購買次數", report.sales?.purchases);
+  add("銷售", "消費代幣", report.sales?.tokens);
+  add("銷售", "買家人數", report.sales?.buyers);
+  add("銷售", "最繁忙一分鐘", report.sales?.busiestMinute ? `${formatClock(report.sales.busiestMinute.at)}（${report.sales.busiestMinute.purchases} 次）` : "-");
+  (report.sales?.byRound || []).forEach((round) => add("每場銷售", `${round.room} ${formatRoundLabel(round.round)}`, `${round.count} 次 · ${round.tokens} 代幣`));
+  (report.sales?.topBuyers || []).forEach((buyer) => add("最高消費", buyer.name, `${buyer.count} 次 · ${buyer.tokens} 代幣`));
+  Object.entries(report.tokenRequests || {}).forEach(([key, value]) => add("代幣申請", MONITOR_REQUEST_LABELS[key] || key, value));
+  add("配送", "配送申請", report.shippingRequests);
+  add("錯誤", "玩家端錯誤", report.errors?.clientErrorCount ?? "未能讀取");
+  add("錯誤", "伺服器錯誤", report.errors?.serverErrorCount ?? "未能讀取");
+  (report.errors?.clientErrors || []).forEach((item) => add("玩家端錯誤", item.message, `${item.count} 次 · ${item.users} 位用戶`));
+  (report.errors?.serverErrors || []).forEach((item) => add("伺服器錯誤", `${item.service} ${item.severity}`, `${item.count} 次 · ${item.message}`));
+  (report.audit?.findings || []).forEach((item) => add("可疑活動", `${AUDIT_SEVERITY_LABELS[item.severity]} · ${item.title}`, item.detail));
+  const day = formatClock(session.startedAt).replace(/[^\d]/g, "");
+  downloadTextFile(`live-monitor-report-${new Intl.DateTimeFormat("en-CA").format(new Date(toMillis(session.startedAt)))}-${day}.csv`, createCsvText(["部分", "項目", "數值"], rows));
+}
+
+function MonitorReportView({ session, onClose }) {
+  const report = session.report || {};
+  function printReport() {
+    document.body.classList.add("printing-audit-report");
+    const cleanUp = () => {
+      document.body.classList.remove("printing-audit-report");
+      window.removeEventListener("afterprint", cleanUp);
+    };
+    window.addEventListener("afterprint", cleanUp);
+    window.print();
+  }
+  return (
+    <section className="panel audit-report monitor-report">
+      <div className="monitor-report-actions audit-print-hide">
+        <button className="small-btn" type="button" onClick={onClose}><ChevronLeft size={15} />返回</button>
+        <button className="small-btn" type="button" onClick={printReport}><FileText size={15} />列印報告</button>
+        <button className="small-btn" type="button" onClick={() => downloadMonitorReport(session)}><Download size={15} />下載 CSV</button>
+      </div>
+      <h3 className="audit-report-title">直播監察報告 · {session.drawTitle || "直播"}</h3>
+      <p className="muted">{new Date(toMillis(session.startedAt)).toLocaleString("zh-HK")} 至 {formatClock(session.endedAt)} · {report.durationMinutes} 分鐘 · {session.startedByEmail}</p>
+      <div className="affiliate-summary">
+        <div><span>消費代幣</span><strong>{formatTokenNumber(report.sales?.tokens)}</strong></div>
+        <div><span>購買次數</span><strong>{report.sales?.purchases ?? 0}</strong></div>
+        <div><span>買家人數</span><strong>{report.sales?.buyers ?? 0}</strong></div>
+        <div><span>批准入金</span><strong>HK${formatTokenNumber(report.tokenRequests?.approvedHkd)}</strong></div>
+        <div><span>平均處理申請</span><strong>{report.tokenRequests?.averageWaitMinutes ?? 0} 分鐘</strong></div>
+        <div><span>錯誤</span><strong>{(report.errors?.clientErrorCount ?? 0) + (report.errors?.serverErrorCount ?? 0)}</strong></div>
+        <div><span>可疑活動（高／嚴重）</span><strong>{(report.audit?.summary?.high ?? 0) + (report.audit?.summary?.critical ?? 0)}</strong></div>
+      </div>
+      <div className="monitor-columns">
+        <div>
+          <h4>每場銷售</h4>
+          <div className="monitor-feed">
+            {(report.sales?.byRound || []).map((round) => <p key={`${round.room}-${round.round}`}>{round.room} {formatRoundLabel(round.round)} · {round.count} 次 · ⚡{formatTokenNumber(round.tokens)}</p>)}
+            {!report.sales?.byRound?.length && <p className="muted">冇購買。</p>}
+          </div>
+          <h4>最高消費</h4>
+          <div className="monitor-feed">
+            {(report.sales?.topBuyers || []).map((buyer) => <p key={buyer.name}>{buyer.name} · {buyer.count} 次 · ⚡{formatTokenNumber(buyer.tokens)}</p>)}
+            {!report.sales?.topBuyers?.length && <p className="muted">冇購買。</p>}
+          </div>
+          <h4>代幣申請</h4>
+          <div className="monitor-feed">
+            {Object.entries(report.tokenRequests || {}).map(([key, value]) => <p key={key}>{MONITOR_REQUEST_LABELS[key] || key}：{formatTokenNumber(value)}</p>)}
+            <p>配送申請：{report.shippingRequests ?? 0}</p>
+          </div>
+        </div>
+        <div>
+          <h4>錯誤</h4>
+          {report.errors?.unavailable ? <p className="error-note">未能讀取錯誤紀錄。</p> : (
+            <div className="audit-findings">
+              {[...(report.errors?.clientErrors || []).map((item) => ({ key: `c-${item.message}`, title: `玩家端 · ${item.message}`, detail: `${item.count} 次 · ${item.users} 位用戶` })),
+                ...(report.errors?.serverErrors || []).map((item) => ({ key: `s-${item.service}-${item.message}`, title: `${item.service} · ${item.severity}`, detail: `${item.count} 次 · ${item.message}` }))]
+                .map((item) => <article className="audit-finding high" key={item.key}><strong>{item.title}</strong><small>{item.detail}</small></article>)}
+              {!report.errors?.clientErrors?.length && !report.errors?.serverErrors?.length && <p className="muted">冇錯誤。</p>}
+            </div>
+          )}
+          <h4>可疑活動</h4>
+          {report.audit?.unavailable ? <p className="error-note">未能讀取審計紀錄。</p> : (
+            <div className="audit-findings">
+              {(report.audit?.findings || []).map((item, index) => (
+                <article className={`audit-finding ${item.severity}`} key={`${item.rule}-${index}`}>
+                  <strong><span className={`audit-badge ${item.severity}`}>{AUDIT_SEVERITY_LABELS[item.severity]}</span>{item.title}</strong>
+                  <p>{item.detail}</p>
+                </article>
+              ))}
+              {!report.audit?.findings?.length && <p className="muted">冇發現可疑活動。</p>}
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// Monitoring runs only between "start" and "stop"; each stop stores a report.
+function LiveMonitor() {
+  const [sessions, setSessions] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [viewingId, setViewingId] = useState("");
+
+  useEffect(() => onSnapshot(
+    query(collection(db, "monitorSessions"), orderBy("startedAt", "desc"), limit(30)),
+    (snapshot) => setSessions(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+    (error) => console.error("Monitor sessions listener failed.", error),
+  ), []);
+
+  const activeSession = sessions.find((session) => session.status === "active");
+  const viewing = sessions.find((session) => session.id === viewingId && session.status === "completed");
+
+  async function startMonitor() {
+    setBusy(true);
+    try {
+      const live = await getDocs(query(collection(db, "draws"), where("status", "==", "live"), limit(1)));
+      await httpsCallable(functions, "adminMonitorSession")({ action: "start", drawTitle: live.docs[0]?.data().title || "" });
+    } catch (error) {
+      showSafeError(error, "未能開始監察。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stopMonitor() {
+    if (!window.confirm("確認停止監察並產生報告？")) return;
+    setBusy(true);
+    try {
+      const { data } = await httpsCallable(functions, "adminMonitorSession")({ action: "stop", sessionId: activeSession.id });
+      setViewingId(data.sessionId);
+    } catch (error) {
+      showSafeError(error, "未能停止監察，請再試一次。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (activeSession) return <LiveMonitorDashboard session={activeSession} onStop={stopMonitor} stopping={busy} />;
+  if (viewing) return <MonitorReportView session={viewing} onClose={() => setViewingId("")} />;
+
+  return (
+    <div className="live-monitor">
+      <section className="panel">
+        <div className="section-heading compact">
+          <Bell size={22} />
+          <div>
+            <h2>直播監察</h2>
+            <p className="muted">直播開始時撳「開始監察」，期間會即時顯示銷售、待處理申請同錯誤；完場撳「停止」就會產生報告。</p>
+          </div>
+        </div>
+        <button className="primary-btn" type="button" disabled={busy} onClick={startMonitor}>
+          <Bell size={16} />{busy ? "開始中..." : "開始監察"}
+        </button>
+      </section>
+      <section className="panel">
+        <h3>過往監察報告</h3>
+        {sessions.filter((session) => session.status === "completed").length ? (
+          <div className="record-list">
+            {sessions.filter((session) => session.status === "completed").map((session) => (
+              <article className="record-item monitor-session-item" key={session.id}>
+                <div>
+                  <strong>{session.drawTitle || "直播"} · {new Date(toMillis(session.startedAt)).toLocaleString("zh-HK")}</strong>
+                  <p className="muted">
+                    {session.report?.durationMinutes ?? 0} 分鐘 · {session.report?.sales?.purchases ?? 0} 次購買 · ⚡{formatTokenNumber(session.report?.sales?.tokens)}
+                    {" · "}錯誤 {(session.report?.errors?.clientErrorCount ?? 0) + (session.report?.errors?.serverErrorCount ?? 0)}
+                    {" · "}可疑 {(session.report?.audit?.summary?.high ?? 0) + (session.report?.audit?.summary?.critical ?? 0)}
+                  </p>
+                </div>
+                <div className="request-actions">
+                  <button className="small-btn" type="button" onClick={() => setViewingId(session.id)}>查看</button>
+                  <button className="small-btn" type="button" onClick={() => downloadMonitorReport(session)}><Download size={15} />CSV</button>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : <p className="muted">未有監察報告。</p>}
       </section>
     </div>
   );
@@ -6273,10 +7085,12 @@ function LiveDrawAdminPanel({ profile }) {
   const vipTiers = useVipProgram();
   const adminSections = isBeta
     ? [
+        { id: "monitor", label: "直播監察", eyebrow: "Live monitor", icon: Bell },
         { id: "live", label: "直播管理", eyebrow: "Live", icon: Gavel },
         BETA_BANNER_SECTION,
         ...ADMIN_SECTIONS.filter((section) => !["rooms", "create-room"].includes(section.id)),
         { id: "affiliate", label: "Affiliate", eyebrow: "Affiliate program", icon: UserRoundPlus },
+        { id: "audit", label: "審計紀錄", eyebrow: "Audit trail", icon: Shield },
         BETA_PAYMENT_SECTION,
       ]
     : ADMIN_SECTIONS;
@@ -6483,6 +7297,16 @@ function LiveDrawAdminPanel({ profile }) {
       {activeAdminSection === "promos" && (
         <div className="admin-section narrow-admin-section">
           <PromoCodeManager profile={profile} />
+        </div>
+      )}
+      {isBeta && activeAdminSection === "monitor" && (
+        <div className="admin-section">
+          <LiveMonitor />
+        </div>
+      )}
+      {isBeta && activeAdminSection === "audit" && (
+        <div className="admin-section narrow-admin-section">
+          <AuditLogExporter />
         </div>
       )}
       {isBeta && activeAdminSection === "affiliate" && (
@@ -11775,9 +12599,12 @@ function rangeNumbers(start, end) {
 
 function normalizePhoneNumber(value) {
   const compact = String(value || "").replace(/[\s()-]/g, "");
-  const normalized = (compact.startsWith("+")
-    ? `+${compact.slice(1).replace(/\D/g, "")}`
-    : `+852${compact.replace(/\D/g, "")}`)
+  const digits = compact.replace(/\D/g, "");
+  // Numbers typed with the country code but without "+" (e.g. 85291234567) keep it.
+  const hasCountryCode = /^852\d{8}$/.test(digits) || /^8860?9\d{8}$/.test(digits);
+  const normalized = (compact.startsWith("+") || hasCountryCode
+    ? `+${digits}`
+    : `+852${digits}`)
     // Taiwan numbers are often typed with the local trunk 0 (+886 0912...).
     .replace(/^\+8860(9\d{8})$/, "+886$1");
 
@@ -11835,7 +12662,13 @@ function getSafeErrorMessage(error, fallback = "操作失敗，請稍後再試�
 
 function showSafeError(error, fallback) {
   console.error(error);
-  alert(getSafeErrorMessage(error, fallback));
+  const message = getSafeErrorMessage(error, fallback);
+  // Expected business outcomes (cooldowns, validation) are not reported as failures.
+  const expected = /(resource-exhausted|failed-precondition|invalid-argument|already-exists)$/.test(String(error?.code || ""));
+  if (!expected && (error?.code || /權限|失敗|未能|Failed|permission|network/i.test(message))) {
+    reportClientError({ message: `${message}${error?.message && error.message !== message ? ` | ${error.message}` : ""}`, code: error?.code }, fallback || "showSafeError");
+  }
+  alert(message);
 }
 
 // Admin-owned collections are server-write only. These helpers mirror the
@@ -12100,16 +12933,7 @@ async function uploadCompressedImage(file, path) {
     });
     return data.url;
   }
-  const imageRef = ref(storage, path);
-  try {
-    await uploadBytes(imageRef, imageBlob, { contentType: imageBlob.type || "image/webp" });
-  } catch (error) {
-    if (error instanceof TypeError && String(error.message).includes("Failed to fetch")) {
-      throw new Error("未能連接圖片儲存服務，請檢查網絡後重新上載。", { cause: error });
-    }
-    throw error;
-  }
-  return getDownloadURL(imageRef);
+  throw new Error("圖片上載路徑不正確。");
 }
 
 async function blobToBase64(blob) {

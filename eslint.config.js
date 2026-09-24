@@ -34,6 +34,9 @@ export default [
       ...reactHooks.configs.recommended.rules,
       "react/prop-types": "off",
       "react/react-in-jsx-scope": "off",
+      // Catch variables used before their declaration (a runtime crash in React renders).
+      // Function declarations are hoisted and stay allowed.
+      "no-use-before-define": ["error", { functions: false, classes: true, variables: true }],
     },
     settings: {
       react: {
