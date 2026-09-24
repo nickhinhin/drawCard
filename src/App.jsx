@@ -6345,18 +6345,6 @@ function hongKongDate(year, monthIndex, day) {
   return new Date(`${year}-${month}-${String(day).padStart(2, "0")}T00:00:00+08:00`);
 }
 
-function affiliateRange(preset, customStart, customEnd) {
-  const [year, month, day] = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong" })
-    .format(new Date()).split("-").map(Number);
-  const startOfDay = hongKongDate(year, month - 1, day);
-  if (preset === "today") return [startOfDay, new Date(startOfDay.getTime() + 86400000)];
-  if (preset === "month") return [hongKongDate(year, month - 1, 1), month === 12 ? hongKongDate(year + 1, 0, 1) : hongKongDate(year, month, 1)];
-  if (preset === "year") return [hongKongDate(year, 0, 1), hongKongDate(year + 1, 0, 1)];
-  const start = customStart ? new Date(`${customStart}T00:00:00+08:00`) : null;
-  const end = customEnd ? new Date(`${customEnd}T00:00:00+08:00`) : null;
-  return [start, end ? new Date(end.getTime() + 86400000) : null];
-}
-
 function currentHongKongMonth() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong" }).format(new Date()).slice(0, 7);
 }
@@ -6376,12 +6364,6 @@ function AffiliateManager() {
   const [loading, setLoading] = useState(true);
   const [busyUid, setBusyUid] = useState("");
   const [applicationView, setApplicationView] = useState("pending");
-  const [referrerUid, setReferrerUid] = useState("");
-  const [preset, setPreset] = useState("month");
-  const [customStart, setCustomStart] = useState("");
-  const [customEnd, setCustomEnd] = useState("");
-  const [report, setReport] = useState(null);
-  const [reportLoading, setReportLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [downloadMonth, setDownloadMonth] = useState(currentHongKongMonth);
 
@@ -6482,28 +6464,6 @@ function AffiliateManager() {
     }
   }
 
-  async function loadReport(event) {
-    event.preventDefault();
-    const [start, end] = affiliateRange(preset, customStart, customEnd);
-    if (!referrerUid || !start || !end || end <= start) {
-      alert("請選擇推薦人及有效日期範圍。");
-      return;
-    }
-    setReportLoading(true);
-    try {
-      const { data } = await httpsCallable(functions, "adminAffiliateReport")({
-        referrerUid,
-        startAt: start.toISOString(),
-        endAt: end.toISOString(),
-      });
-      setReport(data);
-    } catch (error) {
-      showSafeError(error, "未能載入推薦報表。");
-    } finally {
-      setReportLoading(false);
-    }
-  }
-
   const visibleApplications = applications.filter((item) => (
     applicationView === "pending" ? item.status === "pending" : item.status !== "pending"
   ));
@@ -6564,45 +6524,14 @@ function AffiliateManager() {
         <div className="section-heading compact">
           <ListChecks size={22} />
           <div>
-            <h2>推薦報表</h2>
+            <h2>月結報表（全部推薦人）</h2>
             <p className="muted">入金只計管理員核實並批准的金額；消費不計 VIP 獎勵；盈虧 = 已開獎消費 − 派出卡牌價值。</p>
           </div>
         </div>
         {affiliates.length ? (
-          <form className="affiliate-report-form" onSubmit={loadReport}>
+          <form className="affiliate-report-form" onSubmit={downloadAllReports}>
             <label>
-              推薦人
-              <select value={referrerUid} onChange={(event) => { setReferrerUid(event.target.value); setReport(null); }}>
-                <option value="">請選擇</option>
-                {affiliates.map((item) => (
-                  <option key={item.uid} value={item.uid}>{item.username || displayEmail(item.email)} · {item.refereeCount} 位會員</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              期間
-              <select value={preset} onChange={(event) => setPreset(event.target.value)}>
-                <option value="today">今日</option>
-                <option value="month">本月</option>
-                <option value="year">今年</option>
-                <option value="custom">自訂</option>
-              </select>
-            </label>
-            {preset === "custom" && (
-              <>
-                <label>開始<input type="date" value={customStart} onChange={(event) => setCustomStart(event.target.value)} /></label>
-                <label>結束<input type="date" value={customEnd} onChange={(event) => setCustomEnd(event.target.value)} /></label>
-              </>
-            )}
-            <button className="primary-btn" type="submit" disabled={reportLoading}>
-              {reportLoading ? "載入中..." : "查看報表"}
-            </button>
-          </form>
-        ) : null}
-        {affiliates.length ? (
-          <form className="affiliate-report-form affiliate-monthly-download" onSubmit={downloadAllReports}>
-            <label>
-              月結報表（全部推薦人）
+              月份
               <input
                 type="month"
                 value={downloadMonth}
@@ -6611,44 +6540,13 @@ function AffiliateManager() {
                 required
               />
             </label>
-            <button className="ghost-btn" type="submit" disabled={downloading || !downloadMonth}>
+            <button className="primary-btn" type="submit" disabled={downloading || !downloadMonth}>
               <Download size={16} />
               {downloading ? "下載中..." : "下載該月報表"}
             </button>
           </form>
         ) : (
           <p className="muted">暫時未有已批准的推薦人。</p>
-        )}
-        {report && (
-          <div className="affiliate-report">
-            <div className="affiliate-summary">
-              <div><span>推薦會員</span><strong>{formatTokenNumber(report.totals.refereeCount)}</strong></div>
-              <div><span>入金（HK$）</span><strong>{formatTokenNumber(report.totals.depositsHkd)}</strong></div>
-              <div><span>消費代幣</span><strong>{formatTokenNumber(report.totals.spendTokens)}</strong></div>
-              <div><span>派出卡牌價值</span><strong>{formatTokenNumber(report.totals.payoutTokens)}</strong></div>
-              <div><span>平台盈虧</span><strong>{formatTokenNumber(report.totals.gainLossTokens)}</strong></div>
-              <div><span>抽卡次數（未開獎）</span><strong>{report.totals.drawCount}（{report.totals.pendingDrawCount}）</strong></div>
-            </div>
-            {report.referees.length ? (
-              <div className="affiliate-report-table" role="table">
-                <div role="row" className="affiliate-report-row header">
-                  <span>會員</span><span>入金 HK$</span><span>消費</span><span>派出價值</span><span>盈虧</span><span>抽卡</span>
-                </div>
-                {report.referees.map((row) => (
-                  <div role="row" className="affiliate-report-row" key={row.uid}>
-                    <span>{row.username || displayEmail(row.email) || row.uid}</span>
-                    <span>{formatTokenNumber(row.depositsHkd)}</span>
-                    <span>{formatTokenNumber(row.spendTokens)}</span>
-                    <span>{formatTokenNumber(row.payoutTokens)}</span>
-                    <span>{formatTokenNumber(row.gainLossTokens)}</span>
-                    <span>{row.drawCount}（{row.pendingDrawCount}）</span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="muted">此推薦人暫時未有推薦會員。</p>
-            )}
-          </div>
         )}
       </section>
     </div>
