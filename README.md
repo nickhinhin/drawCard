@@ -37,7 +37,7 @@ Firebase-backed React website for live card draws.
 
 ## Firebase setup
 
-Enable these Firebase products in project `drawcard-26e01`:
+Enable these Firebase products in project `livedraw-7e3c2`:
 
 - Authentication: enable Google provider.
 - Firestore Database: native mode.
@@ -59,14 +59,11 @@ firebase deploy --only hosting
 
 ## First admin
 
-The app creates all new users with `role: "user"` and `tokens: 0`. To create the first admin, sign in once, then edit the user document in Firestore:
-
-- Collection: `users`
-- Document ID: the Firebase Auth UID
-- Field: `role`
-- Value: `admin`
-
-After that, admin users can approve token requests, create rooms, and complete/delete draw rooms from the website. Admin roles must still be edited manually in Firebase Firestore.
+Administration is available only on the separate admin website
+(https://livedraw-adminpage-7e3c2.web.app, built with `npm run build:admin` and
+deployed with `npm run deploy:admin`). Follow `ADMIN_SECURITY_HANDOFF.md` to configure
+the UID allowlist, Firebase custom claim and App Check. The public website build does
+not contain any administration code (`scripts/assert-no-web-admin.mjs` enforces this).
 
 ## Data model
 

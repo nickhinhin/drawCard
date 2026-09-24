@@ -3,7 +3,7 @@
 const auth = require("/usr/local/lib/node_modules/firebase-tools/lib/auth.js");
 const api = require("/usr/local/lib/node_modules/firebase-tools/lib/apiv2.js");
 
-const PROJECT_ID = "drawcard-26e01";
+const PROJECT_ID = "livedraw-7e3c2";
 const DATABASE_ROOT = `projects/${PROJECT_ID}/databases/(default)`;
 const API_ROOT = `https://firestore.googleapis.com/v1/${DATABASE_ROOT}`;
 function readValue(value) {

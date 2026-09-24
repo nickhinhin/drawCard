@@ -57,27 +57,51 @@ import {
   signOut,
 } from "firebase/auth";
 import {
+  FieldValue,
   Timestamp,
-  addDoc,
   collection,
   collectionGroup,
   doc,
+  documentId,
   getDoc,
   getDocs,
-  increment,
+  limit,
   limitToLast,
   onSnapshot,
   orderBy,
   query,
   runTransaction,
   serverTimestamp,
-  setDoc,
-  updateDoc,
   where,
   writeBatch,
 } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
-import { auth, db, googleProvider, storage } from "./firebase";
+import { httpsCallable } from "firebase/functions";
+import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
+import { auth, db, functions, googleProvider, storage } from "./firebase";
+
+const PENDING_AFFILIATE_CODE_KEY = "livedraw-pending-affiliate-code";
+const PENDING_REGISTRATION_KEY = "livedraw-pending-registration";
+const AFFILIATE_CODE_PATTERN = /^AFF[A-F0-9]{20}$/;
+
+function normalizeAffiliateCode(value) {
+  const code = String(value || "").trim().toUpperCase();
+  return AFFILIATE_CODE_PATTERN.test(code) ? code : "";
+}
+
+function captureAffiliateCode() {
+  const code = normalizeAffiliateCode(new URLSearchParams(window.location.search).get("ref"));
+  if (code) window.localStorage.setItem(PENDING_AFFILIATE_CODE_KEY, code);
+  return code || normalizeAffiliateCode(window.localStorage.getItem(PENDING_AFFILIATE_CODE_KEY));
+}
+
+function readPendingRegistration() {
+  try {
+    return JSON.parse(window.sessionStorage.getItem(PENDING_REGISTRATION_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
 
 const DEFAULT_DRAW = {
   title: "Tonight Live Card Draw",
@@ -100,6 +124,15 @@ const CARD_IMAGE_COMPRESSION = {
   quality: 0.68,
   minQuality: 0.58,
   targetBytes: 180 * 1024,
+};
+
+// Small preview used in lists, the marquee, slots and purchase records.
+const CARD_THUMB_COMPRESSION = {
+  maxWidth: 240,
+  maxHeight: 330,
+  quality: 0.7,
+  minQuality: 0.55,
+  targetBytes: 28 * 1024,
 };
 
 const LIVE_SNAPSHOT_OPTIONS = { includeMetadataChanges: true };
@@ -133,7 +166,7 @@ const MY_COLLECTION_PAGE_SIZE = 12;
 const PLAYER_CARD_BATCH_SIZE = 40;
 const ADMIN_CARD_BATCH_SIZE = 80;
 const FIRESTORE_SAFE_BATCH_SIZE = 400;
-const TOKEN_REQUEST_COOLDOWN_MS = 10 * 60 * 1000;
+const TOKEN_REQUEST_COOLDOWN_MS = 60 * 1000;
 const TOKEN_REQUEST_WINDOW_MS = 24 * 60 * 60 * 1000;
 const TOKEN_REQUEST_DAILY_LIMIT = 5;
 const TOKEN_REQUEST_PENDING_LIMIT = 2;
@@ -207,7 +240,8 @@ function normalizeManualCardPrices(prices) {
   const normalized = Object.fromEntries(
     ["half", "fifth", "tenth"].map((key) => {
       const value = Number(prices?.[key]);
-      return [key, Number.isFinite(value) ? Math.round(value * 100) / 100 : 0];
+      // Token prices are whole numbers so balances never carry fractions.
+      return [key, Number.isFinite(value) ? Math.round(value) : 0];
     }),
   );
   return Object.values(normalized).every((value) => value > 0) ? normalized : null;
@@ -220,11 +254,12 @@ function calculateAutomaticCardPrices(heavenConversionValue, hellConversionValue
   const margin = Number(marginRate);
   if (![heaven, hell, margin].every(Number.isFinite) || heaven < 0 || hell < 0 || margin <= 0) return null;
 
-  const roundPrice = (value) => Math.round(value * 100) / 100;
+  // Whole-token prices, at least 1 token per share.
+  const roundPrice = (value) => Math.max(1, Math.round(value));
   return {
-    half: Math.max(0.01, roundPrice((heaven * 0.5 + hell * 0.5) * margin)),
-    fifth: Math.max(0.01, roundPrice((heaven * 0.2 + hell * 0.8) * margin)),
-    tenth: Math.max(0.01, roundPrice((heaven * 0.1 + hell * 0.9) * margin)),
+    half: roundPrice((heaven * 0.5 + hell * 0.5) * margin),
+    fifth: roundPrice((heaven * 0.2 + hell * 0.8) * margin),
+    tenth: roundPrice((heaven * 0.1 + hell * 0.9) * margin),
   };
 }
 
@@ -346,6 +381,8 @@ const TOKEN_PACKAGES = [
   { hkd: 30000, tokens: 35100 },
 ];
 const TOKEN_PACKAGE_RATE_VERSION = 2;
+const MIN_CUSTOM_PAYMENT_HKD = 100;
+const CUSTOM_PAYMENT_BONUS_THRESHOLD_HKD = 500;
 const DEFAULT_HOMEPAGE_BANNER_URL = "/default-live-banner.jpg";
 
 const DEFAULT_VIP_TIERS = [
@@ -355,10 +392,6 @@ const DEFAULT_VIP_TIERS = [
   { id: "vip3", name: "VIP3", threshold: 100000, rewardCardId: "", rewardName: "升級實體卡獎勵" },
   { id: "vip4", name: "VIP4", threshold: 300000, rewardCardId: "", rewardName: "升級實體卡獎勵" },
 ];
-
-function getVipRewardCardId(tier) {
-  return String(tier?.rewardCardId || `vip-reward-${tier?.id || "reward"}`);
-}
 
 const ADMIN_SECTIONS = [
   { id: "rooms", label: "房間管理", eyebrow: "Rooms", icon: Gavel },
@@ -386,10 +419,9 @@ const BETA_BANNER_SECTION = {
   icon: ImagePlus,
 };
 
-const BETA_DEMO_SESSION_KEY = "livedraw-beta-demo";
 const BETA_DUMMY_PAYMENT_SETTINGS = {
   fpsIdentifier: "0000000",
-  fpsName: "LiveDraw Demo（測試）",
+  fpsName: "LiveDraw",
   isDummy: true,
 };
 
@@ -416,151 +448,11 @@ const EMPTY_PAYMENT_SETTINGS = {
   fpsName: "",
   isDummy: false,
 };
-const BETA_DEMO_PROFILE = {
-  uid: "beta-demo-local",
-  username: "DemoPlayer",
-  displayName: "Demo Player",
-  email: "demo@beta.local",
-  tokens: 25000,
-  role: "user",
-  totalDeposits: 1000,
-  isDemo: true,
-};
-const BETA_DEMO_RECORDS = [
-  {
-    id: "demo-active",
-    uid: BETA_DEMO_PROFILE.uid,
-    drawId: "demo-live-room",
-    drawTitle: "Beta Live Card Draw",
-    roomSlug: "beta-live-card-draw",
-    round: "round-002",
-    number: 17,
-    tokenCost: 1200,
-    targetCardName: "Pikachu VMAX",
-    createdAt: "2026-09-17T11:20:00+09:00",
-  },
-  {
-    id: "demo-complete",
-    uid: BETA_DEMO_PROFILE.uid,
-    drawId: "demo-complete-room",
-    drawTitle: "Weekend Card Break",
-    roomSlug: "weekend-card-break",
-    round: "round-001",
-    number: 8,
-    tokenCost: 800,
-    targetCardName: "Charizard ex",
-    cardId: "demo-card-charizard",
-    cardName: "Charizard ex",
-    createdAt: "2026-09-15T18:35:00+09:00",
-    assignedAt: "2026-09-15T19:10:00+09:00",
-  },
-];
-const BETA_DEMO_COLLECTION = [
-  {
-    ...BETA_DEMO_RECORDS[1],
-    id: "demo-card-pending",
-    cardId: "demo-card-charizard",
-    cardName: "Charizard ex",
-    cardValue: 800,
-    collectionStatus: "pending",
-  },
-  {
-    id: "demo-card-shipping",
-    uid: BETA_DEMO_PROFILE.uid,
-    drawTitle: "Sunday Live Draw",
-    roomSlug: "sunday-live-draw",
-    round: "round-003",
-    number: 21,
-    cardId: "demo-card-mew",
-    cardName: "Mew VMAX",
-    cardValue: 650,
-    collectionStatus: "shipping",
-    deliveryStatus: "in_transit",
-    trackingNumber: "DEMO123456789",
-    createdAt: "2026-09-12T14:10:00+09:00",
-    assignedAt: "2026-09-12T14:50:00+09:00",
-  },
-  {
-    id: "demo-card-awaiting-shipping",
-    uid: BETA_DEMO_PROFILE.uid,
-    drawTitle: "Saturday Live Draw",
-    roomSlug: "saturday-live-draw",
-    round: "round-002",
-    number: 12,
-    cardId: "demo-card-awaiting",
-    cardName: "Pikachu ex",
-    cardValue: 580,
-    collectionStatus: "shipping",
-    shippingRequested: true,
-    createdAt: "2026-09-11T16:10:00+09:00",
-    assignedAt: "2026-09-11T16:45:00+09:00",
-  },
-  {
-    id: "demo-card-processed",
-    uid: BETA_DEMO_PROFILE.uid,
-    drawTitle: "Friday Night Draw",
-    roomSlug: "friday-night-draw",
-    round: "round-001",
-    number: 5,
-    cardId: "demo-card-lugia",
-    cardName: "Lugia V",
-    cardValue: 500,
-    collectionStatus: "shipped",
-    deliveryStatus: "delivered",
-    deliveredAt: "2026-09-10T13:20:00+09:00",
-    createdAt: "2026-09-08T20:15:00+09:00",
-    assignedAt: "2026-09-08T20:45:00+09:00",
-  },
-];
-
-function useBetaDemoCards(enabled) {
-  const [cards, setCards] = useState([]);
-
-  useEffect(() => {
-    if (!enabled) {
-      setCards([]);
-      return undefined;
-    }
-
-    const showcaseQuery = query(
-      collection(db, "publicCardShowcase"),
-      where("active", "==", true),
-    );
-    return onSnapshot(showcaseQuery, (snapshot) => {
-      setCards(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-    });
-  }, [enabled]);
-
-  return cards;
-}
-
-function enrichDemoRecords(records, cards) {
-  const cardsWithImages = cards.filter((card) => card.imageUrl);
-  if (!cardsWithImages.length) return records;
-
-  return records.map((record, index) => {
-    const card = cardsWithImages[index % cardsWithImages.length];
-    return {
-      ...record,
-      targetCardName: card.name || record.targetCardName,
-      targetCardImageUrl: card.imageUrl,
-      ...(record.cardId
-        ? {
-            cardName: card.name || record.cardName,
-            cardImageUrl: card.imageUrl,
-          }
-        : {}),
-    };
-  });
-}
-
 function App() {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
-  const [demoMode, setDemoMode] = useState(
-    () => isBeta && window.sessionStorage.getItem(BETA_DEMO_SESSION_KEY) === "1",
-  );
+  const isBeta = IS_BETA;
   const [authUser, setAuthUser] = useState(null);
   const [profile, setProfile] = useState(null);
+  const [profileInitializationError, setProfileInitializationError] = useState("");
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState("");
   const [signingIn, setSigningIn] = useState(false);
@@ -569,6 +461,13 @@ function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("draw");
   const [usernameConflict, setUsernameConflict] = useState(false);
+  const [hasAdminClaim, setHasAdminClaim] = useState(false);
+  const [adminClaimReady, setAdminClaimReady] = useState(false);
+
+  useEffect(() => {
+    // Preserve the referral before login redirects or in-app navigation can remove it.
+    captureAffiliateCode();
+  }, []);
 
   useEffect(() => {
     const authTimer = window.setTimeout(() => {
@@ -581,6 +480,7 @@ function App() {
       (user) => {
         window.clearTimeout(authTimer);
         setAuthUser(user);
+        setProfileInitializationError("");
         setAuthReady(true);
       },
       (error) => {
@@ -606,30 +506,77 @@ function App() {
       .finally(() => setSigningIn(false));
   }, []);
 
+  // The management workspace stays invisible unless Firebase issued the admin
+  // custom claim. The server repeats this verification for every write.
+  useEffect(() => {
+    let cancelled = false;
+    setAdminClaimReady(false);
+    if (!authUser) {
+      setHasAdminClaim(false);
+      return undefined;
+    }
+
+    authUser.getIdTokenResult(true)
+      .then((token) => {
+        if (!cancelled) setHasAdminClaim(token.claims.admin === true);
+      })
+      .catch(() => {
+        if (!cancelled) setHasAdminClaim(false);
+      })
+      .finally(() => {
+        if (!cancelled) setAdminClaimReady(true);
+      });
+
+    return () => { cancelled = true; };
+  }, [authUser]);
+
   useEffect(() => {
     if (!authUser) {
       setProfile(null);
+      setProfileInitializationError("");
       return undefined;
     }
 
     const profileRef = doc(db, "users", authUser.uid);
+    const ensureAffiliateAccount = httpsCallable(functions, "ensureAffiliateAccount", {
+      limitedUseAppCheckTokens: true,
+    });
+    const pendingRegistration = readPendingRegistration();
+    let initializationStarted = false;
     const stopProfile = onSnapshot(profileRef, async (snapshot) => {
       if (snapshot.exists()) {
         setProfile({ id: snapshot.id, ...snapshot.data() });
+        setProfileInitializationError("");
+        window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
+        window.sessionStorage.removeItem(PENDING_REGISTRATION_KEY);
         return;
       }
-
-      await setDoc(profileRef, {
-        uid: authUser.uid,
-        email: authUser.email || "",
-        displayName: (authUser.displayName || "").slice(0, 80),
-        photoURL: (authUser.photoURL || "").slice(0, 500),
-        username: "",
-        tokens: 0,
-        role: "user",
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      }, { merge: true });
+      if (initializationStarted) return;
+      initializationStarted = true;
+      try {
+        const accountData = {
+          referralCode: captureAffiliateCode(),
+          displayName: pendingRegistration.displayName || authUser.displayName || "",
+          phoneNumber: pendingRegistration.phoneNumber || authUser.phoneNumber || "",
+          ageConfirmed: pendingRegistration.ageConfirmed === true,
+        };
+        // A browser can restore an Auth user before its cached ID token is usable by
+        // Functions. Refresh once and retry only authentication failures so account
+        // creation does not become stuck on the first page load after sign-in.
+        await authUser.getIdToken(true);
+        try {
+          await ensureAffiliateAccount(accountData);
+        } catch (error) {
+          if (error?.code !== "functions/unauthenticated") throw error;
+          await authUser.getIdToken(true);
+          await ensureAffiliateAccount(accountData);
+        }
+        window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
+        window.sessionStorage.removeItem(PENDING_REGISTRATION_KEY);
+      } catch (error) {
+        initializationStarted = false;
+        setProfileInitializationError(getSafeErrorMessage(error, "未能建立會員帳戶，請重新登入。"));
+      }
     });
 
     return stopProfile;
@@ -655,12 +602,12 @@ function App() {
     };
   }, [authUser, profile?.username]);
 
-  const signedIn = Boolean(authUser || demoMode);
-  const activeProfile = demoMode ? BETA_DEMO_PROFILE : profile;
+  const signedIn = Boolean(authUser);
+  const activeProfile = profile;
   const needsUsername = Boolean(
-    authUser && !demoMode && profile && (!profile.username || usernameConflict),
+    authUser && profile && (!profile.username || usernameConflict),
   );
-  const isProfileLoading = Boolean(authUser && !demoMode && !profile);
+  const isProfileLoading = Boolean(authUser && !profile && !profileInitializationError);
 
   const tabs = useMemo(
     () => [
@@ -718,21 +665,8 @@ function App() {
   }
 
   async function handleLogout() {
-    if (demoMode) {
-      window.sessionStorage.removeItem(BETA_DEMO_SESSION_KEY);
-      setDemoMode(false);
-      setActiveTab("draw");
-      return;
-    }
     await signOut(auth);
-    setActiveTab("draw");
-  }
-
-  function handleDemoLogin() {
-    if (!isBeta) return;
-    window.sessionStorage.setItem(BETA_DEMO_SESSION_KEY, "1");
-    setDemoMode(true);
-    setAuthDialogOpen(false);
+    setHasAdminClaim(false);
     setActiveTab("draw");
   }
 
@@ -752,6 +686,26 @@ function App() {
     setActiveTab("draw");
     setMobileOpen(false);
     window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  if (IS_ADMIN_SITE) {
+    return (
+      <AdminSite
+        adminClaimReady={adminClaimReady}
+        authError={authError}
+        authReady={authReady}
+        authUser={authUser}
+        hasAdminClaim={hasAdminClaim}
+        isProfileLoading={isProfileLoading}
+        needsUsername={needsUsername}
+        onGoogleLogin={handleLogin}
+        onLogout={handleLogout}
+        profile={activeProfile}
+        profileInitializationError={profileInitializationError}
+        signingIn={signingIn}
+        usernameConflict={usernameConflict}
+      />
+    );
   }
 
   if (!authReady && !isBeta) {
@@ -866,6 +820,20 @@ function App() {
           )
         ) : isProfileLoading ? (
           <LoadingScreen />
+        ) : profileInitializationError ? (
+          <section className="panel empty-state" role="alert">
+            <LogIn size={36} />
+            <h1>未能載入會員帳戶</h1>
+            <p>{profileInitializationError}</p>
+            <div className="action-row">
+              <button className="primary-btn" type="button" onClick={() => window.location.reload()}>
+                重新載入
+              </button>
+              <button className="secondary-btn" type="button" onClick={handleLogout}>
+                登出
+              </button>
+            </div>
+          </section>
         ) : needsUsername ? (
           <UsernameGate
             authUser={authUser}
@@ -897,10 +865,116 @@ function App() {
           isBeta={isBeta}
           onClose={() => setAuthDialogOpen(false)}
           onGoogleLogin={handleLogin}
-          onDemoLogin={handleDemoLogin}
           signingIn={signingIn}
         />
       )}
+    </div>
+  );
+}
+
+// Standalone admin workspace served from the admin Hosting site only.
+function AdminSite({
+  adminClaimReady,
+  authError,
+  authReady,
+  authUser,
+  hasAdminClaim,
+  isProfileLoading,
+  needsUsername,
+  onGoogleLogin,
+  onLogout,
+  profile,
+  profileInitializationError,
+  signingIn,
+  usernameConflict,
+}) {
+  const signedIn = Boolean(authUser);
+
+  let content;
+  if (!authReady || (signedIn && !adminClaimReady)) {
+    content = <LoadingScreen />;
+  } else if (!signedIn) {
+    content = (
+      <section className="panel empty-state">
+        <Shield size={36} />
+        <h1>LiveDraw 管理後台</h1>
+        <p>請使用管理員 Google 帳戶登入。</p>
+        {authError && <p className="error-note" role="alert">{authError}</p>}
+        <button className="primary-btn" type="button" onClick={onGoogleLogin} disabled={signingIn}>
+          <LogIn size={18} />
+          {signingIn ? "登入中..." : "使用 Google 登入"}
+        </button>
+      </section>
+    );
+  } else if (!hasAdminClaim) {
+    content = (
+      <section className="panel empty-state" role="alert">
+        <Shield size={36} />
+        <h1>沒有管理員權限</h1>
+        <p>此帳戶未獲管理員權限，請改用管理員帳戶登入。</p>
+        <button className="secondary-btn" type="button" onClick={onLogout}>
+          <LogOut size={17} />
+          登出
+        </button>
+      </section>
+    );
+  } else if (isProfileLoading) {
+    content = <LoadingScreen />;
+  } else if (profileInitializationError) {
+    content = (
+      <section className="panel empty-state" role="alert">
+        <h1>未能載入管理員帳戶</h1>
+        <p>{profileInitializationError}</p>
+        <button className="primary-btn" type="button" onClick={() => window.location.reload()}>
+          重新載入
+        </button>
+      </section>
+    );
+  } else if (needsUsername) {
+    content = <UsernameGate authUser={authUser} profile={profile} conflict={usernameConflict} />;
+  } else {
+    content = (
+      <section className="workspace">
+        <LiveDrawAdminPanel profile={profile} />
+      </section>
+    );
+  }
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <span className="brand">
+          <img
+            className="beta-brand-logo"
+            src="/livedraw-logo.svg"
+            alt="LiveDraw TCG"
+            width="430"
+            height="112"
+          />
+        </span>
+        <nav className="nav">
+          <span className="nav-item active">
+            <Shield size={18} />
+            管理後台
+          </span>
+        </nav>
+        <div className="auth-actions">
+          {signedIn && (
+            <>
+              <span className="beta-player-name">
+                {profile?.username || authUser?.displayName || "管理員"}
+              </span>
+              <button className="ghost-btn" type="button" onClick={onLogout} aria-label="登出">
+                <LogOut size={17} />
+                <span>登出</span>
+              </button>
+            </>
+          )}
+        </div>
+      </header>
+      <main id="top" className="main-grid beta-main-grid">
+        {content}
+      </main>
     </div>
   );
 }
@@ -1094,12 +1168,12 @@ function WelcomePanel({ authError, onGoogleLogin, onPhoneLogin, signingIn }) {
   );
 }
 
-function AuthDialog({ authError, isBeta = false, onClose, onDemoLogin, onGoogleLogin, signingIn }) {
+function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signingIn }) {
   const [accountAction, setAccountAction] = useState(isBeta ? "" : "login");
   const [authMethod, setAuthMethod] = useState(isBeta ? "" : "phone");
   const [phoneNumber, setPhoneNumber] = useState("");
   const [displayName, setDisplayName] = useState("");
-  const [referralCode, setReferralCode] = useState("");
+  const [referralCode, setReferralCode] = useState(() => captureAffiliateCode());
   const [ageConfirmed, setAgeConfirmed] = useState(false);
   const [rememberMe, setRememberMe] = useState(true);
   const [verificationCode, setVerificationCode] = useState("");
@@ -1166,36 +1240,33 @@ function AuthDialog({ authError, isBeta = false, onClose, onDemoLogin, onGoogleL
     setPhoneBusy(true);
 
     try {
+      if (isBeta && isRegistration) {
+        const manualAffiliateCode = normalizeAffiliateCode(referralCode);
+        if (referralCode.trim() && !manualAffiliateCode) {
+          throw new Error("Affiliate 推薦碼格式不正確，請使用推薦連結內的完整代碼。");
+        }
+        if (manualAffiliateCode) window.localStorage.setItem(PENDING_AFFILIATE_CODE_KEY, manualAffiliateCode);
+        window.sessionStorage.setItem(PENDING_REGISTRATION_KEY, JSON.stringify({
+          displayName: displayName.trim().slice(0, 80),
+          phoneNumber: normalizePhoneNumber(phoneNumber),
+          ageConfirmed: true,
+        }));
+      }
       const credential = await confirmation.confirm(verificationCode.trim());
       if (isBeta && isRegistration) {
         const username = normalizeUsername(displayName);
-        const betaProfileRef = doc(db, "users", credential.user.uid);
-        await runTransaction(db, async (transaction) => {
-          const profileSnapshot = await transaction.get(betaProfileRef);
-          const betaFields = {
-            displayName: displayName.trim().slice(0, 80),
-            phoneNumber: credential.user.phoneNumber || normalizePhoneNumber(phoneNumber),
-            referralCode: referralCode.trim().slice(0, 40),
-            ageConfirmed: true,
-            ageConfirmedAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          };
-
-          if (profileSnapshot.exists()) {
-            transaction.update(betaProfileRef, betaFields);
-          } else {
-            transaction.set(betaProfileRef, {
-              uid: credential.user.uid,
-              email: credential.user.email || "",
-              photoURL: credential.user.photoURL || "",
-              username: "",
-              tokens: 0,
-              role: "user",
-              createdAt: serverTimestamp(),
-              ...betaFields,
-            });
-          }
+        // The phone sign-in credential is new; wait for its ID token before account bootstrap.
+        await credential.user.getIdToken();
+        await httpsCallable(functions, "ensureAffiliateAccount", {
+          limitedUseAppCheckTokens: true,
+        })({
+          referralCode: captureAffiliateCode(),
+          displayName: displayName.trim().slice(0, 80),
+          phoneNumber: credential.user.phoneNumber || normalizePhoneNumber(phoneNumber),
+          ageConfirmed: true,
         });
+        window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
+        window.sessionStorage.removeItem(PENDING_REGISTRATION_KEY);
         if (username.length >= 3) {
           await ensureUsernameClaim(credential.user.uid, username);
         }
@@ -1282,16 +1353,6 @@ function AuthDialog({ authError, isBeta = false, onClose, onDemoLogin, onGoogleL
                 <input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} />
                 <span>記住我</span>
               </label>
-            )}
-            {isBeta && (
-              <>
-          <div className="auth-divider"><span>測試預覽</span></div>
-                <button className="ghost-btn beta-demo-login" type="button" onClick={onDemoLogin}>
-                  <UserRoundPlus size={18} />
-                  使用 Demo Account
-                </button>
-            <small className="form-note beta-demo-note">測試帳戶只供預覽，不會寫入資料或影響正式版。</small>
-              </>
             )}
           </>
         ) : (
@@ -1451,10 +1512,99 @@ function BetaAccountSettings({ authUser, profile }) {
           <span>{authUser?.email || ""}</span>
         </div>
       </div>
-      {profile?.isDemo ? (
-        <p className="muted">示範帳戶不會儲存名稱；請使用正式帳戶登入後更改。</p>
+      <UsernameEditForm authUser={authUser} profile={profile} />
+      <AffiliateLinkCard profile={profile} />
+    </section>
+  );
+}
+
+function AffiliateLinkCard({ profile, compact = false }) {
+  const [copied, setCopied] = useState(false);
+  const [contact, setContact] = useState(profile?.phoneNumber || profile?.email || "");
+  const [message, setMessage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState("");
+  const code = profile?.affiliateCode || "";
+  const status = profile?.affiliateStatus || (code ? "approved" : "none");
+  const affiliateUrl = code
+    ? `${window.location.origin}${window.location.pathname}?ref=${encodeURIComponent(code)}`
+    : "";
+
+  async function copyAffiliateLink() {
+    if (!affiliateUrl) return;
+    await navigator.clipboard.writeText(affiliateUrl);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1800);
+  }
+
+  async function submitApplication(event) {
+    event.preventDefault();
+    setFormError("");
+    setSubmitting(true);
+    try {
+      await httpsCallable(functions, "submitAffiliateApplication", {
+        limitedUseAppCheckTokens: true,
+      })({ contact: contact.trim(), message: message.trim() });
+      setMessage("");
+    } catch (error) {
+      setFormError(getSafeErrorMessage(error, "未能提交 Affiliate 申請，請稍後再試。"));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <section className={compact ? "affiliate-link-card compact" : "affiliate-link-card"}>
+      <div>
+        <strong>Affiliate 計劃</strong>
+        <small>申請獲管理員批准後，系統先會發出及啟用你的專屬連結。</small>
+      </div>
+      {status === "approved" && affiliateUrl ? (
+        <div className="affiliate-link-row">
+          <input value={affiliateUrl} readOnly aria-label="Affiliate link" />
+          <button className="small-btn" type="button" onClick={copyAffiliateLink}>
+            <Copy size={15} />
+            {copied ? "已複製" : "複製"}
+          </button>
+        </div>
+      ) : status === "pending" ? (
+        <p className="affiliate-status pending"><Clock3 size={16} />申請審批中，批准後會喺呢度顯示專屬連結。</p>
       ) : (
-        <UsernameEditForm authUser={authUser} profile={profile} />
+        <form className="affiliate-application-form" onSubmit={submitApplication}>
+          {status === "rejected" && (
+            <p className="affiliate-status rejected">
+              上次申請未獲批准{profile?.affiliateReviewNote ? `：${profile.affiliateReviewNote}` : "。你可以更新資料後重新申請。"}
+            </p>
+          )}
+          <label>
+            聯絡資料
+            <input
+              value={contact}
+              onChange={(event) => setContact(event.target.value)}
+              placeholder="電話、WhatsApp、Email 或社交平台"
+              minLength={3}
+              maxLength={200}
+              required
+            />
+          </label>
+          <label>
+            留言
+            <textarea
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              placeholder="簡單介紹自己、推廣渠道或合作方式"
+              minLength={5}
+              maxLength={2000}
+              rows={compact ? 3 : 4}
+              required
+            />
+          </label>
+          {formError && <p className="error-note">{formError}</p>}
+          <button className="primary-btn" type="submit" disabled={submitting}>
+            <Send size={16} />
+            {submitting ? "提交中…" : status === "rejected" ? "重新申請" : "申請 Affiliate Link"}
+          </button>
+        </form>
       )}
     </section>
   );
@@ -1694,6 +1844,7 @@ function AccountPanel({ authUser, profile, setActiveTab }) {
         <Shield size={16} />
         玩家
       </div>
+      <AffiliateLinkCard profile={profile} compact />
     </aside>
   );
 }
@@ -1744,16 +1895,15 @@ function FileUpload({ id, label, file, onChange, required = false, disabled = fa
 }
 
 function DrawCard({ profile }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
-  const [rooms, setRooms] = useState([]);
-  const [roomsLoading, setRoomsLoading] = useState(true);
+  const isBeta = IS_BETA;
+  const [activeRooms, setActiveRooms] = useState([]);
+  const [activeRoomsLoading, setActiveRoomsLoading] = useState(true);
+  const [requestedRoom, setRequestedRoom] = useState(null);
+  const [requestedRoomLoading, setRequestedRoomLoading] = useState(false);
   const [roomsError, setRoomsError] = useState("");
-  const [cardLibrary, setCardLibrary] = useState([]);
-  const [cardsLoading, setCardsLoading] = useState(true);
-  const shouldLoadPrivateCardData =
-    import.meta.env.VITE_APP_VARIANT !== "beta" || Boolean(profile?.uid && !profile?.isDemo);
-  const cardCategories = useCardCategories(cardLibrary, shouldLoadPrivateCardData);
+  const shouldLoadPrivateCardData = !IS_BETA || Boolean(profile?.uid);
   const [roomSlug, setRoomSlug] = useState(getRoomSlugFromUrl);
+  const topShowcaseCards = useTopShowcaseCards();
   const [slots, setSlots] = useState([]);
   const [slotsLoading, setSlotsLoading] = useState(false);
   const [buyingNumber, setBuyingNumber] = useState(null);
@@ -1768,63 +1918,102 @@ function DrawCard({ profile }) {
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const pendingRoomRoundRef = useRef("");
 
+  // Only live, scheduled and draft rooms are watched; archived rooms load on demand.
   useEffect(() => {
-    const drawsQuery = query(
+    const activeQuery = query(
       collection(db, "draws"),
-      orderBy("createdAt", "desc"),
+      where("status", "in", ["live", "scheduled", "draft"]),
     );
-    const stopDraws = onSnapshot(
-      drawsQuery,
+    return onSnapshot(
+      activeQuery,
       LIVE_SNAPSHOT_OPTIONS,
       (snapshot) => {
-        const allDraws = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-        setRooms(allDraws);
-        setRoomsError("");
-        if (isSnapshotReady(snapshot)) setRoomsLoading(false);
-      },
-      async (error) => {
-        console.error("Room list listener failed.", error);
-        setRoomsError(getSafeErrorMessage(error, "未能載入房間。"));
-        try {
-          const fallbackSnapshot = await getDocs(collection(db, "draws"));
-          const fallbackRooms = fallbackSnapshot.docs
-            .map((item) => ({ id: item.id, ...item.data() }))
-            .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
-          setRooms(fallbackRooms);
-        } catch (fallbackError) {
-          console.error("Room list fallback failed.", fallbackError);
-          setRoomsError(getSafeErrorMessage(fallbackError, "未能載入房間。"));
-        } finally {
-          setRoomsLoading(false);
-        }
-      },
-    );
-
-    return stopDraws;
-  }, []);
-
-  useEffect(() => {
-    setCardsLoading(true);
-    const cardsQuery = shouldLoadPrivateCardData
-      ? query(collection(db, "cards"), orderBy("createdAt", "desc"))
-      : query(collection(db, "publicCardShowcase"), where("active", "==", true));
-    const stopCards = onSnapshot(
-      cardsQuery,
-      LIVE_SNAPSHOT_OPTIONS,
-      (snapshot) => {
-        setCardLibrary(snapshot.docs
+        setActiveRooms(snapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }))
-          .filter((card) => !card.archived));
-        if (isSnapshotReady(snapshot)) setCardsLoading(false);
+          .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt)));
+        setRoomsError("");
+        if (isSnapshotReady(snapshot)) setActiveRoomsLoading(false);
       },
       (error) => {
-        console.error("Card library listener failed.", error);
-        setCardsLoading(false);
+        console.error("Room list listener failed.", error);
+        setRoomsError(getSafeErrorMessage(error, "未能載入房間。"));
+        setActiveRoomsLoading(false);
       },
     );
+  }, []);
 
-    return stopCards;
-  }, [shouldLoadPrivateCardData]);
+  const requestedRoomIsActive = Boolean(roomSlug && activeRooms.some(
+    (room) => room.id === roomSlug || room.slug === roomSlug,
+  ));
+
+  // A link to an archived room (e.g. from the archive page) loads just that room.
+  useEffect(() => {
+    if (!roomSlug || activeRoomsLoading || requestedRoomIsActive) {
+      setRequestedRoom(null);
+      setRequestedRoomLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    let stopRoom = () => {};
+    setRequestedRoomLoading(true);
+    const watchRoom = (roomRef) => {
+      stopRoom = onSnapshot(roomRef, (snapshot) => {
+        if (cancelled) return;
+        setRequestedRoom(snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null);
+        setRequestedRoomLoading(false);
+      }, () => {
+        if (!cancelled) setRequestedRoomLoading(false);
+      });
+    };
+    getDoc(doc(db, "draws", roomSlug))
+      .then(async (snapshot) => {
+        if (cancelled) return;
+        if (snapshot.exists()) {
+          watchRoom(snapshot.ref);
+          return;
+        }
+        const bySlug = await getDocs(query(collection(db, "draws"), where("slug", "==", roomSlug), limit(1)));
+        if (cancelled) return;
+        if (bySlug.empty) {
+          setRequestedRoom(null);
+          setRequestedRoomLoading(false);
+        } else {
+          watchRoom(bySlug.docs[0].ref);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setRequestedRoomLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      stopRoom();
+    };
+  }, [activeRoomsLoading, requestedRoomIsActive, roomSlug]);
+
+  const rooms = useMemo(
+    () => (requestedRoom && !activeRooms.some((room) => room.id === requestedRoom.id)
+      ? [...activeRooms, requestedRoom]
+      : activeRooms),
+    [activeRooms, requestedRoom],
+  );
+  const roomsLoading = activeRoomsLoading || requestedRoomLoading;
+
+  // Cards are loaded only for the pools of the rooms on screen, plus their hell cards.
+  const [hellCardIds, setHellCardIds] = useState([]);
+  const roomPoolCardIds = useMemo(() => rooms.flatMap((room) => getRoomPoolIds(room)), [rooms]);
+  const { docsById: roomCardsById, loading: cardsLoading } = useDocsByIds(
+    shouldLoadPrivateCardData ? "cards" : "publicCardShowcase",
+    [...roomPoolCardIds, ...hellCardIds],
+  );
+  const cardLibrary = useMemo(
+    () => Object.values(roomCardsById).filter((card) => !card.archived && card.active !== false),
+    [roomCardsById],
+  );
+  useEffect(() => {
+    const nextHellIds = [...new Set(cardLibrary.map((card) => String(card.hellCardId || "")).filter(Boolean))].sort();
+    setHellCardIds((current) => (current.join("|") === nextHellIds.join("|") ? current : nextHellIds));
+  }, [cardLibrary]);
+  const cardCategories = useCardCategories(cardLibrary, shouldLoadPrivateCardData);
 
   useEffect(() => {
     function handleRouteChange() {
@@ -1935,7 +2124,7 @@ function DrawCard({ profile }) {
   }, [activeRoundId, selectedCardId]);
 
   useEffect(() => {
-    if (!selectedRoom?.id || !activeRoundId || !profile?.uid || profile.isDemo) {
+    if (!selectedRoom?.id || !activeRoundId || !profile?.uid) {
       setSlots([]);
       setSlotsLoading(false);
       return undefined;
@@ -1973,7 +2162,7 @@ function DrawCard({ profile }) {
     );
 
     return stopSlots;
-  }, [activeRoundId, profile?.isDemo, profile?.uid, selectedRoom?.id]);
+  }, [activeRoundId, profile?.uid, selectedRoom?.id]);
 
   useEffect(() => {
     if (!selectedSlotNumber) return;
@@ -1995,10 +2184,6 @@ function DrawCard({ profile }) {
     }
     if (!profile?.uid) {
       alert("請先登入／註冊，再付款鎖定號碼。");
-      return;
-    }
-    if (profile.isDemo) {
-      alert("測試帳戶只供預覽，不會購買號碼或扣除代幣。");
       return;
     }
     if (!selectedTargetCard) {
@@ -2059,6 +2244,11 @@ function DrawCard({ profile }) {
         const recordRef = doc(collection(db, "drawRecords"));
         const userSnap = await transaction.get(userRef);
         const slotSnap = await transaction.get(slotRef);
+        // Rules require the card library's own name and image on the purchase.
+        const cardSnap = await transaction.get(doc(db, "cards", purchase.card.id));
+        if (!cardSnap.exists()) throw new Error("此卡牌已下架，請重新選擇。");
+        const libraryName = String(cardSnap.data().name || "");
+        const libraryImageUrl = String(cardSnap.data().thumbUrl || cardSnap.data().imageUrl || "");
         const currentTokens = Number(userSnap.data()?.tokens || 0);
         const tokenCost = purchase.tokenCost;
 
@@ -2082,8 +2272,8 @@ function DrawCard({ profile }) {
           username: claimedUsername,
           tokenCost,
           targetCardId: purchase.card.id,
-          targetCardName: purchase.card.name,
-          targetCardImageUrl: purchase.card.imageUrl || "",
+          targetCardName: libraryName,
+          targetCardImageUrl: libraryImageUrl,
           targetCardValue: tokenCost,
           shareMode: purchase.shareMode,
           round: purchase.roundId,
@@ -2092,6 +2282,7 @@ function DrawCard({ profile }) {
         transaction.set(recordRef, {
           slotId: String(purchase.slot.number),
           uid: profile.uid,
+          affiliateReferrerUid: profile.referredByUid || "",
           username: claimedUsername,
           drawId: purchase.roomId,
           drawTitle: purchase.roomTitle,
@@ -2102,8 +2293,8 @@ function DrawCard({ profile }) {
           number: purchase.slot.number,
           tokenCost,
           targetCardId: purchase.card.id,
-          targetCardName: purchase.card.name,
-          targetCardImageUrl: purchase.card.imageUrl || "",
+          targetCardName: libraryName,
+          targetCardImageUrl: libraryImageUrl,
           targetCardValue: tokenCost,
           shareMode: purchase.shareMode,
           createdAt: serverTimestamp(),
@@ -2279,7 +2470,7 @@ function DrawCard({ profile }) {
     <>
       {isBeta && (
         <BetaSingleHallIntro
-          cards={cardLibrary}
+          cards={topShowcaseCards}
           rooms={[selectedRoom]}
           onOpenRoom={openRoom}
           onSelectCard={(card) => {
@@ -2387,7 +2578,7 @@ function DrawCard({ profile }) {
             >
               <X size={20} />
             </button>
-            {profile?.uid && !profile?.isDemo ? (
+            {profile?.uid ? (
               <ChatRoom drawId={selectedRoom.id} profile={profile} />
             ) : (
               <section className="panel chat-panel guest-chat-panel">
@@ -2423,14 +2614,8 @@ function DrawCard({ profile }) {
 function BetaRecentRecords({ profile }) {
   const [records, setRecords] = useState([]);
   const [recordsLoading, setRecordsLoading] = useState(Boolean(profile));
-  const demoCards = useBetaDemoCards(Boolean(profile?.isDemo));
 
   useEffect(() => {
-    if (profile?.isDemo) {
-      setRecords(enrichDemoRecords(BETA_DEMO_RECORDS, demoCards));
-      setRecordsLoading(false);
-      return undefined;
-    }
     if (!profile?.uid) {
       setRecords([]);
       setRecordsLoading(false);
@@ -2455,7 +2640,7 @@ function BetaRecentRecords({ profile }) {
       console.error("Home record listener failed.", error);
       setRecordsLoading(false);
     });
-  }, [demoCards, profile?.isDemo, profile?.uid]);
+  }, [profile?.uid]);
 
   return (
     <aside className="beta-home-records">
@@ -2546,17 +2731,24 @@ function HomepageBanner() {
 }
 
 // Keeps completed broadcasts off the draw homepage and exposes them on a dedicated public page.
+const ARCHIVE_PAGE_SIZE = 20;
+
 function LiveArchivePage({ onOpenRoom }) {
   const [rooms, setRooms] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [pageSize, setPageSize] = useState(ARCHIVE_PAGE_SIZE);
 
+  // Archived rooms load a page at a time instead of the whole history.
   useEffect(() => {
-    const roomsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
+    const roomsQuery = query(
+      collection(db, "draws"),
+      where("status", "==", "completed"),
+      orderBy("createdAt", "desc"),
+      limit(pageSize),
+    );
     return onSnapshot(roomsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
-      setRooms(snapshot.docs
-        .map((item) => ({ id: item.id, ...item.data() }))
-        .filter((room) => room.status === "completed"));
+      setRooms(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
       setError("");
       if (isSnapshotReady(snapshot)) setLoading(false);
     }, (snapshotError) => {
@@ -2564,7 +2756,7 @@ function LiveArchivePage({ onOpenRoom }) {
       setError(getSafeErrorMessage(snapshotError, "未能載入過往直播及賽果。"));
       setLoading(false);
     });
-  }, []);
+  }, [pageSize]);
 
   if (loading) return <InlineLoading label="正在載入過往直播及賽果..." />;
 
@@ -2591,6 +2783,15 @@ function LiveArchivePage({ onOpenRoom }) {
   return (
     <div className="live-archive-page">
       <LiveArchiveList rooms={rooms} onOpenRoom={onOpenRoom} />
+      {rooms.length >= pageSize && (
+        <button
+          className="secondary-btn live-archive-more"
+          type="button"
+          onClick={() => setPageSize((current) => current + ARCHIVE_PAGE_SIZE)}
+        >
+          載入更多過往直播
+        </button>
+      )}
     </div>
   );
 }
@@ -2604,7 +2805,7 @@ function LiveArchiveList({ rooms, onOpenRoom }) {
           <p className="eyebrow">直播紀錄</p>
           <h2 id="live-archive-title">過往直播及賽果</h2>
         </div>
-        <span>{rooms.length} 個已封存直播</span>
+        <span>顯示 {rooms.length} 個已封存直播</span>
       </div>
       <div className="live-archive-strip">
         {rooms.map((room) => {
@@ -2830,11 +3031,6 @@ function RoomRecordsDrawer({ currentRoomId, profile }) {
 
   useEffect(() => {
     if (!open) return undefined;
-    if (profile.isDemo) {
-      setRecords(BETA_DEMO_RECORDS);
-      setLoading(false);
-      return undefined;
-    }
 
     setLoading(true);
     const recordsQuery = query(collection(db, "drawRecords"), where("uid", "==", profile.uid));
@@ -2851,7 +3047,7 @@ function RoomRecordsDrawer({ currentRoomId, profile }) {
       console.error("Room record drawer listener failed.", error);
       setLoading(false);
     });
-  }, [open, profile.isDemo, profile.uid]);
+  }, [open, profile.uid]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -3098,7 +3294,7 @@ function BetaPsaCarousel({ cards, rooms, onOpenRoom, onSelectCard }) {
 }
 
 function RoomList({ rooms, cards = [], error, loading, onOpenRoom, profile }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const isBeta = IS_BETA;
   const [betaFilter, setBetaFilter] = useState("live");
   const [rulesOpen, setRulesOpen] = useState(false);
   const betaFilters = [
@@ -3525,7 +3721,7 @@ function NumberGrid({
   onSelectNumber,
   onBuy,
 }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const isBeta = IS_BETA;
 
   if (!isRoomPurchasable(draw)) {
     return (
@@ -3966,7 +4162,7 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
 });
 
 function ChatRoom({ drawId, profile }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const isBeta = IS_BETA;
   const chatLogRef = useRef(null);
   const [messages, setMessages] = useState([]);
   const [messagesLoading, setMessagesLoading] = useState(true);
@@ -3982,7 +4178,7 @@ function ChatRoom({ drawId, profile }) {
     const messagesQuery = query(
       collection(db, "draws", drawId, "messages"),
       orderBy("createdAt", "asc"),
-      limitToLast(100),
+      limitToLast(30),
     );
     const stopMessages = onSnapshot(messagesQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setMessages(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
@@ -4049,6 +4245,7 @@ function ChatRoom({ drawId, profile }) {
 
         transaction.update(userRef, {
           lastChatAt: serverTimestamp(),
+          lastChatMessageId: messageRef.id,
           updatedAt: serverTimestamp(),
         });
         transaction.set(messageRef, {
@@ -4177,71 +4374,37 @@ function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
     [rewards],
   );
 
-  async function claimReward(tier, tierIndex, reward) {
-    if (!tier?.id || profile?.isDemo) return;
-    const rewardId = reward?.id || `vip_${profile.uid}_${tier.id}`;
+  async function claimReward(reward) {
+    if (!reward?.id) return;
+    const rewardId = reward.id;
     setClaimingId(rewardId);
     try {
       await runTransaction(db, async (transaction) => {
         const rewardRef = doc(db, "drawRecords", rewardId);
         const rewardSnapshot = await transaction.get(rewardRef);
 
-        if (rewardSnapshot.exists()) {
-          const savedReward = rewardSnapshot.data();
-          if (savedReward.uid !== profile.uid || savedReward.source !== "vip") {
-            throw new Error("VIP 獎勵記錄不正確，請聯絡客服。");
-          }
-          if (savedReward.cardId || savedReward.vipRewardStatus === "claimed") return;
-          if (savedReward.vipRewardStatus !== "claimable" || !savedReward.targetCardId) {
-            throw new Error("呢份 VIP 獎勵暫時未能領取。");
-          }
-          transaction.update(rewardRef, {
-            vipRewardStatus: "claimed",
-            cardId: savedReward.targetCardId,
-            cardName: savedReward.targetCardName || "VIP 升級獎勵",
-            cardCategory: "VIP 獎勵",
-            cardImageUrl: savedReward.targetCardImageUrl || "",
-            cardValue: Number(savedReward.targetCardValue || 0),
-            cardConversionValue: Number(savedReward.targetCardValue || 0),
-            collectionStatus: "pending",
-            claimedAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-          return;
+        // Rewards are issued by the server when an admin approves a deposit.
+        if (!rewardSnapshot.exists()) {
+          throw new Error("VIP 獎勵需要管理員批准入數後先會發放。");
         }
-
-        const targetCardId = getVipRewardCardId(tier);
-        const rewardName = tier.rewardName || "VIP 升級獎勵";
-        const rewardValue = Number(tier.rewardConversionValue || 0);
-        transaction.set(rewardRef, {
-          source: "vip",
-          vipTierId: tier.id,
-          vipTierIndex: tierIndex,
-          uid: profile.uid,
-          username: profile.username || profile.displayName || "VIP member",
-          drawId: "vip-program",
-          drawTitle: `${tier.name} 升級獎勵`,
-          roomSlug: "vip-program",
-          roomLink: "",
-          round: "vip-reward",
-          roundSort: 0,
-          number: tierIndex + 1,
-          tokenCost: 0,
-          targetCardId,
-          targetCardName: rewardName,
-          targetCardImageUrl: tier.rewardImageUrl || "",
-          targetCardValue: rewardValue,
+        const savedReward = rewardSnapshot.data();
+        if (savedReward.uid !== profile.uid || savedReward.source !== "vip") {
+          throw new Error("VIP 獎勵記錄不正確，請聯絡客服。");
+        }
+        if (savedReward.cardId || savedReward.vipRewardStatus === "claimed") return;
+        if (savedReward.vipRewardStatus !== "claimable" || !savedReward.targetCardId) {
+          throw new Error("呢份 VIP 獎勵暫時未能領取。");
+        }
+        transaction.update(rewardRef, {
           vipRewardStatus: "claimed",
-          cardId: targetCardId,
-          cardName: rewardName,
+          cardId: savedReward.targetCardId,
+          cardName: savedReward.targetCardName || "VIP 升級獎勵",
           cardCategory: "VIP 獎勵",
-          cardImageUrl: tier.rewardImageUrl || "",
-          cardValue: rewardValue,
-          cardConversionValue: rewardValue,
+          cardImageUrl: savedReward.targetCardImageUrl || "",
+          cardValue: Number(savedReward.targetCardValue || 0),
+          cardConversionValue: Number(savedReward.targetCardValue || 0),
           collectionStatus: "pending",
-          unlockedAt: serverTimestamp(),
           claimedAt: serverTimestamp(),
-          createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       });
@@ -4288,13 +4451,14 @@ function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
           const rewardId = reward?.id || `vip_${profile.uid}_${tier.id}`;
           const rewardClaimed = claimedRewardIds.has(rewardId)
             || Boolean(reward?.cardId || reward?.vipRewardStatus === "claimed");
-          const rewardClaimable = Boolean(tier.done && !rewardClaimed);
+          // Only rewards the server issued after an approved deposit can be claimed.
+          const rewardClaimable = Boolean(reward?.vipRewardStatus === "claimable" && !rewardClaimed);
           const tierState = rewardClaimed
             ? "已領取"
             : rewardClaimable
               ? "可領取"
               : tier.done
-                ? "已達成"
+                ? "等待批准發放"
                 : tier.active ? `${Math.round(tier.progress)}%` : "未解鎖";
 
           return <article
@@ -4320,7 +4484,7 @@ function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
                   className="vip-claim-btn"
                   type="button"
                   disabled={claimingId === rewardId}
-                  onClick={() => claimReward(tier, index, reward)}
+                  onClick={() => claimReward(reward)}
                 >
                   <Gift size={14} />{claimingId === rewardId ? "領取中..." : "領取"}
                 </button>
@@ -4335,10 +4499,10 @@ function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
 }
 
 function TokenRequest({ profile }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
-  const tokenPackages = useTokenPackages(!profile.isDemo);
-  const paymentSettings = usePaymentSettings(!profile.isDemo);
-  const vipTiers = useVipProgram(!profile.isDemo);
+  const isBeta = IS_BETA;
+  const tokenPackages = useTokenPackages(true);
+  const paymentSettings = usePaymentSettings(true);
+  const vipTiers = useVipProgram(true);
   const [selectedPackage, setSelectedPackage] = useState(tokenPackages[0].hkd);
   const [customHkd, setCustomHkd] = useState("");
   const [proof, setProof] = useState(null);
@@ -4375,19 +4539,6 @@ function TokenRequest({ profile }) {
   }, [selectedPackage, tokenPackages]);
 
   useEffect(() => {
-    if (profile.isDemo) {
-      setRequests([
-        {
-          id: "demo-token-request",
-          amount: 1050,
-          hkdAmount: 1000,
-          status: "approved",
-          fpsName: "Demo Player",
-        },
-      ]);
-      setRequestsLoading(false);
-      return undefined;
-    }
     setRequestsLoading(true);
     const requestsQuery = query(
       collection(db, "tokenRequests"),
@@ -4406,13 +4557,9 @@ function TokenRequest({ profile }) {
     });
 
     return stopRequests;
-  }, [profile.isDemo, profile.uid]);
+  }, [profile.uid]);
 
   useEffect(() => {
-    if (profile.isDemo) {
-      setVipRewards([]);
-      return undefined;
-    }
     const rewardsQuery = query(
       collection(db, "drawRecords"),
       where("uid", "==", profile.uid),
@@ -4425,22 +4572,17 @@ function TokenRequest({ profile }) {
       console.error("VIP reward listener failed.", error);
       setVipRewards([]);
     });
-  }, [profile.isDemo, profile.uid]);
+  }, [profile.uid]);
 
   async function submitRequest(event) {
     event.preventDefault();
-
-    if (profile.isDemo) {
-      alert("測試帳戶只供預覽，不會提交代幣申請。");
-      return;
-    }
 
     if (!requestMethod) {
       alert("請先選擇付款購買代幣，或推廣活動兌換代幣。");
       return;
     }
-    if (requestMethod === "payment" && (!Number.isSafeInteger(hkdAmount) || hkdAmount < 500 || hkdAmount > 1000000 || tokenAmount < 1 || tokenAmount > 1000000)) {
-      alert("請選擇套餐，或輸入最少 HK$500 的自訂金額。");
+    if (requestMethod === "payment" && (!Number.isSafeInteger(hkdAmount) || hkdAmount < MIN_CUSTOM_PAYMENT_HKD || hkdAmount > 1000000 || tokenAmount < 1 || tokenAmount > 1000000)) {
+      alert(`請選擇套餐，或輸入最少 HK$${MIN_CUSTOM_PAYMENT_HKD} 的自訂金額。`);
       return;
     }
     const cleanPromoCode = parsedPromoCode?.code || normalizePromoCode(promoCode);
@@ -4483,7 +4625,7 @@ function TokenRequest({ profile }) {
       return;
     }
     if (latestRequestAt && now - latestRequestAt < TOKEN_REQUEST_COOLDOWN_MS) {
-      alert("每次代幣申請需要相隔最少 10 分鐘。");
+      alert("每次代幣申請需要相隔最少 1 分鐘。");
       return;
     }
     if (dailyRequestCount >= TOKEN_REQUEST_DAILY_LIMIT) {
@@ -4494,64 +4636,75 @@ function TokenRequest({ profile }) {
     setSubmitting(true);
     try {
       const claimedUsername = await ensureUsernameClaim(profile.uid, profile.username);
-      const requestRef = doc(collection(db, "tokenRequests"));
       const isPaymentRequest = requestMethod === "payment";
-      let verifiedPromo = null;
-      let promoRedemptionRef = null;
-      if (!isPaymentRequest) {
-        const promoRef = doc(db, "promoCodes", parsedPromoCode.code);
-        promoRedemptionRef = doc(db, "promoRedemptions", getPromoRedemptionId(parsedPromoCode.code, profile.uid));
-        const [promoSnapshot, redemptionSnapshot] = await Promise.all([
-          getDoc(promoRef),
-          getDoc(promoRedemptionRef),
-        ]);
-        if (!promoSnapshot.exists() || promoSnapshot.data().active !== true
-          || promoSnapshot.data().code !== parsedPromoCode.code
-          || Number(promoSnapshot.data().amount || 0) !== parsedPromoCode.amount) {
-          throw new Error("邀請碼未啟用、已停用或代幣數目不正確。");
-        }
-        if (redemptionSnapshot.exists()) {
-          throw new Error("你已經使用過呢個邀請碼，每位用戶只可以使用一次。");
-        }
-        verifiedPromo = promoSnapshot.data();
+      if (isPaymentRequest) {
+        // The server stores the proof first and only then creates the pending request.
+        await submitTokenPaymentRequest({
+          proof,
+          hkdAmount,
+          amount: tokenAmount,
+          packageType: usingCustomAmount ? "custom" : "preset",
+          fpsIdentifier: requestFpsIdentifier,
+          fpsName: requestFpsName,
+        });
+        setProof(null);
+        setRequestMethod("");
+        setFpsIdentifier("");
+        setFpsName("");
+        setSelectedPackage(tokenPackages[0].hkd);
+        setCustomHkd("");
+        return;
       }
-      const safeProofName = isPaymentRequest ? getSafeProofName(proof) : "";
-      const proofPath = isPaymentRequest ? `token-proofs/${profile.uid}/${requestRef.id}` : "";
+      const requestRef = doc(collection(db, "tokenRequests"));
+      const promoRef = doc(db, "promoCodes", parsedPromoCode.code);
+      const promoRedemptionRef = doc(db, "promoRedemptions", getPromoRedemptionId(parsedPromoCode.code, profile.uid));
+      const [promoSnapshot, redemptionSnapshot] = await Promise.all([
+        getDoc(promoRef),
+        getDoc(promoRedemptionRef),
+      ]);
+      if (!promoSnapshot.exists() || promoSnapshot.data().active !== true
+        || promoSnapshot.data().code !== parsedPromoCode.code
+        || Number(promoSnapshot.data().amount || 0) !== parsedPromoCode.amount) {
+        throw new Error("邀請碼未啟用、已停用或代幣數目不正確。");
+      }
+      if (redemptionSnapshot.exists()) {
+        throw new Error("你已經使用過呢個邀請碼，每位用戶只可以使用一次。");
+      }
+      const verifiedPromo = promoSnapshot.data();
       const profileWindowStartedAt = toMillis(profile.tokenRequestWindowStartedAt);
       const activeWindow = profileWindowStartedAt > 0 && now - profileWindowStartedAt < TOKEN_REQUEST_WINDOW_MS;
       const batch = writeBatch(db);
 
       batch.set(requestRef, {
         uid: profile.uid,
+        affiliateReferrerUid: profile.referredByUid || "",
         username: claimedUsername,
         email: profile.email || "",
-        amount: isPaymentRequest ? tokenAmount : verifiedPromo.amount,
-        hkdAmount: isPaymentRequest ? hkdAmount : 0,
-        exchangeRate: isPaymentRequest ? tokenAmount / hkdAmount : 0,
-        packageType: isPaymentRequest ? (usingCustomAmount ? "custom" : "preset") : "promo",
+        amount: verifiedPromo.amount,
+        hkdAmount: 0,
+        exchangeRate: 0,
+        packageType: "promo",
         fpsIdentifier: requestFpsIdentifier,
         fpsName: requestFpsName,
-        proofMode: isPaymentRequest ? "storage" : "promo",
-        proofPath,
-        proofFileName: safeProofName,
+        proofMode: "promo",
+        proofPath: "",
+        proofFileName: "",
         proofUrl: "",
-        status: isPaymentRequest ? "awaiting_upload" : "pending",
+        status: "pending",
         adminNote: "",
-        promoCode: isPaymentRequest ? "" : cleanPromoCode,
-        promoCodeId: isPaymentRequest ? "" : parsedPromoCode.code,
+        promoCode: cleanPromoCode,
+        promoCodeId: parsedPromoCode.code,
         quotaVersion: 1,
         createdAt: serverTimestamp(),
       });
-      if (!isPaymentRequest) {
-        batch.set(promoRedemptionRef, {
-          uid: profile.uid,
-          promoCodeId: parsedPromoCode.code,
-          code: parsedPromoCode.code,
-          amount: verifiedPromo.amount,
-          requestId: requestRef.id,
-          createdAt: serverTimestamp(),
-        });
-      }
+      batch.set(promoRedemptionRef, {
+        uid: profile.uid,
+        promoCodeId: parsedPromoCode.code,
+        code: parsedPromoCode.code,
+        amount: verifiedPromo.amount,
+        requestId: requestRef.id,
+        createdAt: serverTimestamp(),
+      });
       batch.update(doc(db, "users", profile.uid), {
         lastTokenRequestId: requestRef.id,
         lastTokenRequestAt: serverTimestamp(),
@@ -4562,16 +4715,6 @@ function TokenRequest({ profile }) {
       });
       await batch.commit();
 
-      if (isPaymentRequest) {
-        const proofInfo = await createProofInfo({ proof, profile, requestId: requestRef.id });
-        await updateDoc(requestRef, {
-          status: "pending",
-          proofUrl: proofInfo.proofUrl,
-          uploadedAt: serverTimestamp(),
-        });
-      }
-
-      setProof(null);
       setPromoCode("");
       setRequestMethod("");
       setFpsIdentifier("");
@@ -4654,7 +4797,7 @@ function TokenRequest({ profile }) {
                 onClick={() => setSelectedPackage("custom")}
               >
                 <strong>自訂金額</strong>
-                <span>HK$500 起</span>
+                <span>HK$100 起</span>
               </button>
             </div>
           </div>
@@ -4663,7 +4806,7 @@ function TokenRequest({ profile }) {
               自訂付款金額（HKD）
               <input
                 type="number"
-                min="500"
+                min={MIN_CUSTOM_PAYMENT_HKD}
                 step="1"
                 value={customHkd}
                 onChange={(event) => setCustomHkd(event.target.value)}
@@ -4776,13 +4919,13 @@ function getSafeProofName(proof) {
   return proof.name.replace(/[^\w.-]+/g, "_").slice(0, 80) || "proof.jpg";
 }
 
-async function createProofInfo({ proof, profile, requestId }) {
+async function submitTokenPaymentRequest({ proof, ...request }) {
   if (!proof) {
     throw new Error("請上傳 JPEG、PNG 或 WebP 付款證明。");
   }
 
   const allowedTypes = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
-  const contentType = proof.type || "";
+  const contentType = proof.type === "image/jpg" ? "image/jpeg" : proof.type || "";
   if (!allowedTypes.has(contentType)) {
     throw new Error("付款證明必須是 JPEG、PNG 或 WebP 圖片。");
   }
@@ -4790,17 +4933,53 @@ async function createProofInfo({ proof, profile, requestId }) {
     throw new Error("付款證明圖片不可超過 2MB。");
   }
 
-  const safeName = getSafeProofName(proof);
-  const proofPath = `token-proofs/${profile.uid}/${requestId}`;
-  const proofRef = ref(storage, proofPath);
-  await uploadBytes(proofRef, proof, { contentType });
+  const { data } = await httpsCallable(functions, "submitTokenPaymentRequest")({
+    ...request,
+    contentType,
+    proofFileName: getSafeProofName(proof),
+    base64: await blobToBase64(proof),
+  });
+  return data;
+}
 
-  return {
-    proofMode: "storage",
-    proofPath,
-    proofFileName: safeName,
-    proofUrl: await getDownloadURL(proofRef),
-  };
+// Split the review queue so requests ready to review are not buried by
+// ones still waiting for payment proof or already processed.
+const TOKEN_REVIEW_TABS = [
+  { id: "awaiting", label: "未審核", statuses: ["awaiting_upload"] },
+  { id: "submitted", label: "已提交證明", statuses: ["pending"] },
+  { id: "reviewed", label: "已審核", statuses: ["approved", "rejected"] },
+];
+
+function TokenRequestReview({ requests, loading, onApprove, onReject }) {
+  const [reviewView, setReviewView] = useState("submitted");
+  const requestsByTab = Object.fromEntries(TOKEN_REVIEW_TABS.map((tab) => [
+    tab.id,
+    requests.filter((request) => tab.statuses.includes(request.status)),
+  ]));
+
+  return (
+    <>
+      <div className="collection-tabs admin-status-tabs">
+        {TOKEN_REVIEW_TABS.map((tab) => (
+          <button
+            className={reviewView === tab.id ? "active" : ""}
+            key={tab.id}
+            type="button"
+            onClick={() => setReviewView(tab.id)}
+          >
+            {tab.label} {requestsByTab[tab.id].length}
+          </button>
+        ))}
+      </div>
+      <RequestList
+        requests={requestsByTab[reviewView]}
+        loading={loading}
+        adminMode
+        onApprove={onApprove}
+        onReject={onReject}
+      />
+    </>
+  );
 }
 
 function RequestList({ requests, loading = false, adminMode = false, onApprove, onReject }) {
@@ -4824,7 +5003,7 @@ function RequestList({ requests, loading = false, adminMode = false, onApprove, 
                 {adminMode && request.username ? ` - ${request.username}` : ""}
               </strong>
               <span>{formatDate(request.createdAt)}</span>
-              {request.hkdAmount && <span>付款金額：HK${formatTokenNumber(request.hkdAmount)}</span>}
+              {Number(request.hkdAmount) > 0 && <span>付款金額：HK${formatTokenNumber(request.hkdAmount)}</span>}
               {request.promoCode && <span>活動碼：{request.promoCode}</span>}
             </div>
           </div>
@@ -4858,47 +5037,17 @@ function RequestList({ requests, loading = false, adminMode = false, onApprove, 
 }
 
 function MyRecords({ profile }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const isBeta = IS_BETA;
   const [records, setRecords] = useState([]);
   const [slotRecords, setSlotRecords] = useState([]);
-  const [roomsById, setRoomsById] = useState({});
   const [recordsError, setRecordsError] = useState("");
   const [recordsLoading, setRecordsLoading] = useState(true);
-  const [historyRoomsLoading, setHistoryRoomsLoading] = useState(true);
   const [activePage, setActivePage] = useState(1);
   const [completedPage, setCompletedPage] = useState(1);
   const [historyPage, setHistoryPage] = useState(1);
-  const demoCards = useBetaDemoCards(Boolean(profile.isDemo));
 
   useEffect(() => {
-    if (profile.isDemo) {
-      setRecords(enrichDemoRecords(BETA_DEMO_RECORDS, demoCards));
-      setRoomsById({
-        "demo-live-room": { id: "demo-live-room", status: "live", title: "Beta Live Card Draw" },
-        "demo-complete-room": { id: "demo-complete-room", status: "completed", title: "Weekend Card Break" },
-      });
-      setRecordsError("");
-      setRecordsLoading(false);
-      setHistoryRoomsLoading(false);
-      return undefined;
-    }
     setRecordsLoading(true);
-    setHistoryRoomsLoading(true);
-    const roomsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
-    const stopRooms = onSnapshot(
-      roomsQuery,
-      LIVE_SNAPSHOT_OPTIONS,
-      (snapshot) => {
-        setRoomsById(
-          Object.fromEntries(snapshot.docs.map((item) => [item.id, { id: item.id, ...item.data() }])),
-        );
-        if (isSnapshotReady(snapshot)) setHistoryRoomsLoading(false);
-      },
-      (error) => {
-        console.error("History room listener failed.", error);
-        setHistoryRoomsLoading(false);
-      },
-    );
 
     const recordsQuery = query(
       collection(db, "drawRecords"),
@@ -4923,17 +5072,10 @@ function MyRecords({ profile }) {
       },
     );
 
-    return () => {
-      stopRooms();
-      stopRecords();
-    };
-  }, [demoCards, profile.isDemo, profile.uid]);
+    return stopRecords;
+  }, [profile.uid]);
 
   useEffect(() => {
-    if (profile.isDemo) {
-      setSlotRecords([]);
-      return undefined;
-    }
     const slotQuery = query(
       collectionGroup(db, "slots"),
       where("uid", "==", profile.uid),
@@ -4965,8 +5107,13 @@ function MyRecords({ profile }) {
         console.error("Slot history listener failed.", error);
       },
     );
-  }, [profile.isDemo, profile.uid]);
+  }, [profile.uid]);
 
+  // Only the rooms this player bought in are needed to label the history.
+  const { docsById: roomsById, loading: historyRoomsLoading } = useDocsByIds(
+    "draws",
+    [...records, ...slotRecords].map((record) => record.drawId),
+  );
   const mergedRecords = useMemo(
     () => mergePurchaseRecords(records, slotRecords, roomsById),
     [records, roomsById, slotRecords],
@@ -5160,7 +5307,7 @@ function getPaginationPage(items, requestedPage, pageSize) {
 }
 
 function CollectionPage({ profile }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const isBeta = IS_BETA;
   const [records, setRecords] = useState([]);
   const [activeStatus, setActiveStatus] = useState("pending");
   const [collectionError, setCollectionError] = useState("");
@@ -5179,17 +5326,10 @@ function CollectionPage({ profile }) {
     note: "",
   });
   const [shippingBusy, setShippingBusy] = useState(false);
-  const demoCards = useBetaDemoCards(Boolean(profile.isDemo));
   const shippingRegion = SHIPPING_REGIONS.find((region) => region.id === shippingForm.region)
     || SHIPPING_REGIONS[0];
 
   useEffect(() => {
-    if (profile.isDemo) {
-      setRecords(enrichDemoRecords(BETA_DEMO_COLLECTION, demoCards));
-      setCollectionError("");
-      setCollectionLoading(false);
-      return undefined;
-    }
     setCollectionLoading(true);
     const recordsQuery = query(
       collection(db, "drawRecords"),
@@ -5216,7 +5356,7 @@ function CollectionPage({ profile }) {
     );
 
     return stopRecords;
-  }, [demoCards, isBeta, profile.isDemo, profile.uid]);
+  }, [isBeta, profile.uid]);
 
   const visibleRecords = records.filter((record) => {
     if (!isBeta) return (record.collectionStatus || "pending") === activeStatus;
@@ -5256,10 +5396,6 @@ function CollectionPage({ profile }) {
   );
 
   async function convertCardToTokens(record, { skipConfirm = false } = {}) {
-    if (profile.isDemo) {
-      alert("Demo Account 只供預覽，不會轉回代幣。");
-      return false;
-    }
     const refund = getCardConversionRefund(record);
 
     if (!refund || record.convertedToTokens) return false;
@@ -5313,10 +5449,6 @@ function CollectionPage({ profile }) {
   }
 
   async function convertSelectedCards() {
-    if (profile.isDemo) {
-      alert("Demo Account 只供預覽，不會轉回代幣。");
-      return;
-    }
     const selectedRecords = isBeta
       ? visibleRecords.filter((record) => selectedPendingIds.includes(record.id))
       : visibleRecords;
@@ -5372,7 +5504,7 @@ function CollectionPage({ profile }) {
   async function submitShippingRequest(event) {
     event.preventDefault();
     if (!shippingForm.name.trim() || !shippingForm.phone.trim() || !shippingForm.address.trim()) {
-      alert("請填寫收件人、電話及完整地址。");
+      alert(shippingForm.method === "sf-pickup" ? "請填寫收件人、電話並選擇順豐自提點。" : "請填寫收件人、電話及完整地址。");
       return;
     }
     const validMethod = shippingRegion.sfAvailable
@@ -5382,12 +5514,6 @@ function CollectionPage({ profile }) {
       alert("配送地區與配送方式不相符，請重新選擇。");
       return;
     }
-    if (profile.isDemo) {
-      alert("Demo Account 只供預覽，不會提交配送資料。");
-      setShippingIds([]);
-      return;
-    }
-
     setShippingBusy(true);
     try {
       for (let start = 0; start < shippingIds.length; start += FIRESTORE_SAFE_BATCH_SIZE) {
@@ -5665,20 +5791,25 @@ function CollectionPage({ profile }) {
               ) : (
                 <p className="form-note shipping-region-note">請直接填寫{shippingRegion.label}完整收件地址。</p>
               )}
-              <label>
-                {shippingForm.method === "sf-pickup" ? "自提點資料" : "配送地址"}
-                <textarea
-                  rows={3}
+              {shippingForm.method === "sf-pickup" ? (
+                <SfPickupPointPicker
                   value={shippingForm.address}
-                  onChange={(event) => setShippingForm((current) => ({ ...current, address: event.target.value }))}
-                  placeholder={shippingForm.method === "sf-pickup"
-                    ? "請輸入香港順豐站、智能櫃或服務中心名稱、地址或編號"
-                    : shippingRegion.sfAvailable
+                  onChange={(address) => setShippingForm((current) => ({ ...current, address }))}
+                />
+              ) : (
+                <label>
+                  配送地址
+                  <textarea
+                    rows={3}
+                    value={shippingForm.address}
+                    onChange={(event) => setShippingForm((current) => ({ ...current, address: event.target.value }))}
+                    placeholder={shippingRegion.sfAvailable
                       ? "請輸入香港完整順豐配送地址"
                       : `請輸入${shippingRegion.label}完整收件地址`}
-                  required
-                />
-              </label>
+                    required
+                  />
+                </label>
+              )}
               <label>備註<textarea rows={2} value={shippingForm.note} onChange={(event) => setShippingForm((current) => ({ ...current, note: event.target.value }))} placeholder="選填" /></label>
               <button className="primary-btn" type="submit" disabled={shippingBusy}>
                 <Package size={17} />{shippingBusy ? "提交中..." : "確認申請配送"}
@@ -5691,10 +5822,442 @@ function CollectionPage({ profile }) {
   );
 }
 
-// Kept only as migration reference; Vite removes this entire block from public assets.
-// eslint-disable-next-line no-unused-vars
-function AdminPanel({ profile }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+// Official SF Express Hong Kong stations and public lockers, generated by
+// scripts/update-sf-pickup-points.mjs and fetched only when this picker opens.
+let sfPickupPointsPromise = null;
+
+function loadSfPickupPoints() {
+  sfPickupPointsPromise ||= fetch("/sf-pickup-points.json")
+    .then((response) => {
+      if (!response.ok) throw new Error("未能載入順豐自提點。");
+      return response.json();
+    })
+    .then((data) => ({
+      areas: data.areas,
+      updatedAt: data.updatedAt,
+      points: data.points.map(([type, area, district, code, name, address, hours]) => ({
+        type, area, district, code, name, address, hours,
+      })),
+    }))
+    .catch((error) => {
+      sfPickupPointsPromise = null;
+      throw error;
+    });
+  return sfPickupPointsPromise;
+}
+
+function formatSfPickupPoint(point) {
+  const kind = point.type === "station" ? "順豐站" : "順豐自助櫃";
+  return `【${kind}】${point.code} ${point.name}｜${point.address}`;
+}
+
+function SfPickupPointPicker({ value, onChange }) {
+  const [data, setData] = useState(null);
+  const [loadError, setLoadError] = useState("");
+  const [area, setArea] = useState("");
+  const [district, setDistrict] = useState("");
+  const [pointType, setPointType] = useState("all");
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    loadSfPickupPoints()
+      .then((result) => {
+        if (!cancelled) setData(result);
+      })
+      .catch((error) => {
+        if (!cancelled) setLoadError(getSafeErrorMessage(error, "未能載入順豐自提點。"));
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const points = data?.points || [];
+  const typedPoints = pointType === "all" ? points : points.filter((point) => point.type === pointType);
+  const districts = [...new Set(typedPoints.filter((point) => point.area === area).map((point) => point.district))];
+  const keyword = search.trim().toLowerCase();
+  const visiblePoints = keyword
+    ? typedPoints.filter((point) => `${point.code} ${point.name} ${point.address} ${point.district}`.toLowerCase().includes(keyword)).slice(0, 80)
+    : typedPoints.filter((point) => point.area === area && point.district === district);
+  const selectedPoint = points.find((point) => formatSfPickupPoint(point) === value) || null;
+
+  if (loadError) {
+    return <p className="error-note" role="alert">{loadError}</p>;
+  }
+  if (!data) {
+    return <InlineLoading label="正在載入順豐自提點..." />;
+  }
+
+  return (
+    <fieldset className="sf-pickup-picker">
+      <legend>選擇順豐自提點</legend>
+      <div className="sf-pickup-types" role="radiogroup" aria-label="自提點類型">
+        {[["all", "全部"], ["station", "順豐站"], ["locker", "順豐自助櫃"]].map(([id, label]) => (
+          <button
+            aria-checked={pointType === id}
+            className={pointType === id ? "active" : ""}
+            key={id}
+            role="radio"
+            type="button"
+            onClick={() => {
+              setPointType(id);
+              setDistrict("");
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <label>
+        搜尋
+        <input
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="輸入地區、街道、商場或網點代碼，例如 旺角、852BF"
+        />
+      </label>
+      {!keyword && (
+        <div className="sf-pickup-filters">
+          <label>
+            地區
+            <select value={area} onChange={(event) => { setArea(event.target.value); setDistrict(""); }}>
+              <option value="">請選擇</option>
+              {data.areas.map((item) => <option key={item} value={item}>{item}</option>)}
+            </select>
+          </label>
+          <label>
+            分區
+            <select value={district} onChange={(event) => setDistrict(event.target.value)} disabled={!area}>
+              <option value="">請選擇</option>
+              {districts.map((item) => <option key={item} value={item}>{item}</option>)}
+            </select>
+          </label>
+        </div>
+      )}
+      {(keyword || district) && (
+        visiblePoints.length ? (
+          <div className="sf-pickup-list" role="listbox" aria-label="順豐自提點">
+            {visiblePoints.map((point) => {
+              const selected = selectedPoint?.code === point.code;
+              return (
+                <button
+                  aria-selected={selected}
+                  className={selected ? "sf-pickup-option selected" : "sf-pickup-option"}
+                  key={point.code}
+                  role="option"
+                  type="button"
+                  onClick={() => onChange(formatSfPickupPoint(point))}
+                >
+                  <strong>
+                    <span className={`sf-pickup-badge ${point.type}`}>{point.type === "station" ? "順豐站" : "自助櫃"}</span>
+                    {point.name}
+                  </strong>
+                  <span>{point.address}</span>
+                  <small>{point.code} · {point.hours}</small>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="muted">找不到符合的自提點。</p>
+        )
+      )}
+      {selectedPoint ? (
+        <p className="sf-pickup-selected"><Check size={15} />已選：{selectedPoint.name}（{selectedPoint.code}）</p>
+      ) : (
+        <p className="form-note">資料來源：順豐香港官網（{data.updatedAt} 更新）。只列出公眾可使用的順豐站及自助櫃。</p>
+      )}
+    </fieldset>
+  );
+}
+
+const AFFILIATE_STATUS_LABELS = { pending: "待審批", approved: "已批准", rejected: "已拒絕" };
+
+function affiliateRange(preset, customStart, customEnd) {
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (preset === "today") return [startOfDay, new Date(startOfDay.getTime() + 86400000)];
+  if (preset === "month") return [new Date(now.getFullYear(), now.getMonth(), 1), new Date(now.getFullYear(), now.getMonth() + 1, 1)];
+  if (preset === "year") return [new Date(now.getFullYear(), 0, 1), new Date(now.getFullYear() + 1, 0, 1)];
+  const start = customStart ? new Date(`${customStart}T00:00:00`) : null;
+  const end = customEnd ? new Date(`${customEnd}T00:00:00`) : null;
+  return [start, end ? new Date(end.getTime() + 86400000) : null];
+}
+
+// Web replacement for the retired macOS affiliate screens: review applications
+// and read per-referrer reports computed by the adminAffiliateReport function.
+function AffiliateManager() {
+  const [applications, setApplications] = useState([]);
+  const [affiliates, setAffiliates] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busyUid, setBusyUid] = useState("");
+  const [applicationView, setApplicationView] = useState("pending");
+  const [referrerUid, setReferrerUid] = useState("");
+  const [preset, setPreset] = useState("month");
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
+  const [report, setReport] = useState(null);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+
+  async function loadAffiliateData() {
+    setLoading(true);
+    try {
+      const [applicationResult, overviewResult] = await Promise.all([
+        httpsCallable(functions, "adminAffiliateApplications")({}),
+        httpsCallable(functions, "adminAffiliateOverview")({}),
+      ]);
+      setApplications(applicationResult.data.items || []);
+      setAffiliates(overviewResult.data.items || []);
+    } catch (error) {
+      showSafeError(error, "未能載入 Affiliate 資料。");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadAffiliateData();
+  }, []);
+
+  async function review(application, decision) {
+    const reviewNote = decision === "rejected" ? window.prompt("拒絕原因（必填）：", "") : "";
+    if (reviewNote === null) return;
+    if (decision === "rejected" && !reviewNote.trim()) {
+      alert("拒絕申請時請填寫原因。");
+      return;
+    }
+    if (decision === "approved" && !window.confirm(`確認批准 ${application.username || application.email || "此會員"} 的 Affiliate 申請？`)) return;
+    setBusyUid(application.uid);
+    try {
+      await httpsCallable(functions, "adminReviewAffiliateApplication")({ uid: application.uid, decision, reviewNote });
+      await loadAffiliateData();
+    } catch (error) {
+      showSafeError(error, "未能完成審批，請稍後再試。");
+    } finally {
+      setBusyUid("");
+    }
+  }
+
+  async function downloadAllReports() {
+    const [start, end] = affiliateRange(preset, customStart, customEnd);
+    if (!start || !end || end <= start) {
+      alert("請選擇有效日期範圍。");
+      return;
+    }
+    setDownloading(true);
+    try {
+      const rows = [];
+      const report = httpsCallable(functions, "adminAffiliateReport");
+      for (const affiliate of affiliates) {
+        const { data } = await report({
+          referrerUid: affiliate.uid,
+          startAt: start.toISOString(),
+          endAt: end.toISOString(),
+        });
+        const referrer = {
+          推薦人: affiliate.username || "",
+          推薦人電郵: affiliate.email || "",
+          推薦碼: affiliate.affiliateCode || "",
+        };
+        data.referees.forEach((row) => rows.push({
+          ...referrer,
+          類型: "會員",
+          會員: row.username || row.uid,
+          會員電郵: row.email || "",
+          入金HKD: row.depositsHkd,
+          消費代幣: row.spendTokens,
+          已開獎消費: row.settledSpendTokens,
+          派出卡牌價值: row.payoutTokens,
+          平台盈虧: row.gainLossTokens,
+          抽卡次數: row.drawCount,
+          未開獎: row.pendingDrawCount,
+        }));
+        rows.push({
+          ...referrer,
+          類型: "推薦人合計",
+          會員: `${data.totals.refereeCount} 位會員`,
+          會員電郵: "",
+          入金HKD: data.totals.depositsHkd,
+          消費代幣: data.totals.spendTokens,
+          已開獎消費: data.totals.settledSpendTokens,
+          派出卡牌價值: data.totals.payoutTokens,
+          平台盈虧: data.totals.gainLossTokens,
+          抽卡次數: data.totals.drawCount,
+          未開獎: data.totals.pendingDrawCount,
+        });
+      }
+      const headers = ["推薦人", "推薦人電郵", "推薦碼", "類型", "會員", "會員電郵", "入金HKD", "消費代幣", "已開獎消費", "派出卡牌價值", "平台盈虧", "抽卡次數", "未開獎"];
+      const day = (date) => new Intl.DateTimeFormat("en-CA").format(date);
+      const lastDay = new Date(end.getTime() - 86400000);
+      downloadTextFile(`affiliate-report-${day(start)}_${day(lastDay)}.csv`, createCsvText(headers, rows));
+    } catch (error) {
+      showSafeError(error, "未能下載推薦報表。");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  async function loadReport(event) {
+    event.preventDefault();
+    const [start, end] = affiliateRange(preset, customStart, customEnd);
+    if (!referrerUid || !start || !end || end <= start) {
+      alert("請選擇推薦人及有效日期範圍。");
+      return;
+    }
+    setReportLoading(true);
+    try {
+      const { data } = await httpsCallable(functions, "adminAffiliateReport")({
+        referrerUid,
+        startAt: start.toISOString(),
+        endAt: end.toISOString(),
+      });
+      setReport(data);
+    } catch (error) {
+      showSafeError(error, "未能載入推薦報表。");
+    } finally {
+      setReportLoading(false);
+    }
+  }
+
+  const visibleApplications = applications.filter((item) => (
+    applicationView === "pending" ? item.status === "pending" : item.status !== "pending"
+  ));
+  const pendingCount = applications.filter((item) => item.status === "pending").length;
+
+  if (loading) return <section className="panel"><InlineLoading label="正在載入 Affiliate 資料..." /></section>;
+
+  return (
+    <div className="affiliate-admin">
+      <section className="panel">
+        <div className="section-heading compact">
+          <UserRoundPlus size={22} />
+          <div>
+            <h2>Affiliate 申請</h2>
+            <p className="muted">批准後系統會為會員建立專屬推薦連結；拒絕時需要填寫原因。</p>
+          </div>
+        </div>
+        <div className="collection-tabs admin-status-tabs">
+          <button className={applicationView === "pending" ? "active" : ""} type="button" onClick={() => setApplicationView("pending")}>
+            待審批 {pendingCount}
+          </button>
+          <button className={applicationView === "reviewed" ? "active" : ""} type="button" onClick={() => setApplicationView("reviewed")}>
+            已處理 {applications.length - pendingCount}
+          </button>
+        </div>
+        {visibleApplications.length ? (
+          <div className="record-list">
+            {visibleApplications.map((item) => (
+              <article className="record-item affiliate-application-item" key={item.uid}>
+                <div>
+                  <strong>{item.username || "未設定用戶名"} · {item.email || "無電郵"}</strong>
+                  <p className="muted">聯絡：{item.contact}</p>
+                  <p>{item.message}</p>
+                  {item.reviewNote && <p className="muted">備註：{item.reviewNote}</p>}
+                </div>
+                <div className="request-actions">
+                  <span className={`status-pill ${item.status}`}>{AFFILIATE_STATUS_LABELS[item.status] || item.status}</span>
+                  {item.status === "pending" && (
+                    <>
+                      <button className="small-btn" type="button" disabled={busyUid === item.uid} onClick={() => review(item, "approved")}>
+                        <Check size={15} />批准
+                      </button>
+                      <button className="small-btn" type="button" disabled={busyUid === item.uid} onClick={() => review(item, "rejected")}>
+                        <X size={15} />拒絕
+                      </button>
+                    </>
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">{applicationView === "pending" ? "暫時未有待審批申請。" : "暫時未有已處理申請。"}</p>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="section-heading compact">
+          <ListChecks size={22} />
+          <div>
+            <h2>推薦報表</h2>
+            <p className="muted">入金只計管理員核實並批准的金額；消費不計 VIP 獎勵；盈虧 = 已開獎消費 − 派出卡牌價值。</p>
+          </div>
+        </div>
+        {affiliates.length ? (
+          <form className="affiliate-report-form" onSubmit={loadReport}>
+            <label>
+              推薦人
+              <select value={referrerUid} onChange={(event) => { setReferrerUid(event.target.value); setReport(null); }}>
+                <option value="">請選擇</option>
+                {affiliates.map((item) => (
+                  <option key={item.uid} value={item.uid}>{item.username || item.email} · {item.refereeCount} 位會員</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              期間
+              <select value={preset} onChange={(event) => setPreset(event.target.value)}>
+                <option value="today">今日</option>
+                <option value="month">本月</option>
+                <option value="year">今年</option>
+                <option value="custom">自訂</option>
+              </select>
+            </label>
+            {preset === "custom" && (
+              <>
+                <label>開始<input type="date" value={customStart} onChange={(event) => setCustomStart(event.target.value)} /></label>
+                <label>結束<input type="date" value={customEnd} onChange={(event) => setCustomEnd(event.target.value)} /></label>
+              </>
+            )}
+            <button className="primary-btn" type="submit" disabled={reportLoading}>
+              {reportLoading ? "載入中..." : "查看報表"}
+            </button>
+            <button className="secondary-btn" type="button" disabled={downloading} onClick={downloadAllReports}>
+              <Download size={16} />
+              {downloading ? "下載中..." : "下載全部推薦人報表"}
+            </button>
+          </form>
+        ) : (
+          <p className="muted">暫時未有已批准的推薦人。</p>
+        )}
+        {report && (
+          <div className="affiliate-report">
+            <div className="affiliate-summary">
+              <div><span>推薦會員</span><strong>{formatTokenNumber(report.totals.refereeCount)}</strong></div>
+              <div><span>入金（HK$）</span><strong>{formatTokenNumber(report.totals.depositsHkd)}</strong></div>
+              <div><span>消費代幣</span><strong>{formatTokenNumber(report.totals.spendTokens)}</strong></div>
+              <div><span>派出卡牌價值</span><strong>{formatTokenNumber(report.totals.payoutTokens)}</strong></div>
+              <div><span>平台盈虧</span><strong>{formatTokenNumber(report.totals.gainLossTokens)}</strong></div>
+              <div><span>抽卡次數（未開獎）</span><strong>{report.totals.drawCount}（{report.totals.pendingDrawCount}）</strong></div>
+            </div>
+            {report.referees.length ? (
+              <div className="affiliate-report-table" role="table">
+                <div role="row" className="affiliate-report-row header">
+                  <span>會員</span><span>入金 HK$</span><span>消費</span><span>派出價值</span><span>盈虧</span><span>抽卡</span>
+                </div>
+                {report.referees.map((row) => (
+                  <div role="row" className="affiliate-report-row" key={row.uid}>
+                    <span>{row.username || row.email || row.uid}</span>
+                    <span>{formatTokenNumber(row.depositsHkd)}</span>
+                    <span>{formatTokenNumber(row.spendTokens)}</span>
+                    <span>{formatTokenNumber(row.payoutTokens)}</span>
+                    <span>{formatTokenNumber(row.gainLossTokens)}</span>
+                    <span>{row.drawCount}（{row.pendingDrawCount}）</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="muted">此推薦人暫時未有推薦會員。</p>
+            )}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function LiveDrawAdminPanel({ profile }) {
+  const isBeta = IS_BETA;
   const [activeAdminSection, setActiveAdminSection] = useState(isBeta ? "live" : "rooms");
   const [requests, setRequests] = useState([]);
   const [draws, setDraws] = useState([]);
@@ -5713,6 +6276,7 @@ function AdminPanel({ profile }) {
         { id: "live", label: "直播管理", eyebrow: "Live", icon: Gavel },
         BETA_BANNER_SECTION,
         ...ADMIN_SECTIONS.filter((section) => !["rooms", "create-room"].includes(section.id)),
+        { id: "affiliate", label: "Affiliate", eyebrow: "Affiliate program", icon: UserRoundPlus },
         BETA_PAYMENT_SECTION,
       ]
     : ADMIN_SECTIONS;
@@ -5805,119 +6369,26 @@ function AdminPanel({ profile }) {
     });
   }, [activeAdminSection]);
 
+  // Reviews run server-side so token grants, VIP rewards and the audit log commit together.
+  async function reviewTokenRequest(payload) {
+    await httpsCallable(functions, "adminReviewTokenRequest")(payload);
+  }
+
   async function approveRequest(request) {
     // Promo requests can be approved directly; only verified bank payments count towards VIP deposits.
     const isPromo = request.proofMode === "promo";
     const verifiedInput = isPromo ? "0" : window.prompt("請先核對銀行實際入帳及付款證明，再輸入實際收到的港幣金額：");
     if (verifiedInput === null) return;
     const verifiedHkdAmount = Number(verifiedInput);
-    if (!Number.isSafeInteger(verifiedHkdAmount) || (!isPromo && verifiedHkdAmount < 500)) {
+    if (!Number.isSafeInteger(verifiedHkdAmount) || (!isPromo && verifiedHkdAmount < MIN_CUSTOM_PAYMENT_HKD)) {
       alert("請輸入已核實的有效入帳金額。");
       return;
     }
 
     try {
-      await runTransaction(db, async (transaction) => {
-        const requestRef = doc(db, "tokenRequests", request.id);
-        const userRef = doc(db, "users", request.uid);
-        const requestSnap = await transaction.get(requestRef);
-        const userSnap = await transaction.get(userRef);
-        const packagesSnap = await transaction.get(doc(db, "settings", "tokenPackages"));
-
-        if (!requestSnap.exists() || !["awaiting_upload", "pending"].includes(requestSnap.data().status)) {
-          throw new Error("This request has already been reviewed.");
-        }
-        if (!userSnap.exists()) {
-          throw new Error("User profile was not found.");
-        }
-
-        const requestData = requestSnap.data();
-        if (requestData.proofMode !== request.proofMode || requestData.promoCode !== request.promoCode || requestData.amount !== request.amount) {
-          throw new Error("申請資料已變更，請重新審核。");
-        }
-        if (isPromo) {
-          const promoSnapshot = await transaction.get(doc(db, "promoCodes", requestData.promoCodeId || "invalid"));
-          const redemptionSnapshot = await transaction.get(doc(
-            db,
-            "promoRedemptions",
-            getPromoRedemptionId(requestData.promoCodeId || "invalid", requestData.uid),
-          ));
-          if (!promoSnapshot.exists() || promoSnapshot.data().active !== true
-            || promoSnapshot.data().code !== requestData.promoCode
-            || Number(promoSnapshot.data().amount || 0) !== Number(requestData.amount || 0)
-            || !redemptionSnapshot.exists()
-            || redemptionSnapshot.data().requestId !== request.id) {
-            throw new Error("邀請碼未啟用、資料不符，或缺少使用紀錄，暫時不可批准。");
-          }
-        }
-        const userData = userSnap.data();
-        const packageSettings = packagesSnap.exists() ? packagesSnap.data() : null;
-        const approvedTokens = getVerifiedTokenGrant(requestData, verifiedHkdAmount, packageSettings);
-        const totalDeposits = Number(userData.totalDeposits || 0) + verifiedHkdAmount;
-        const previousVipLevel = Number(userData.vipLevel ?? -1);
-        const vipState = getVipState(vipTiers, totalDeposits);
-        const attainedTiers = isPromo ? [] : vipTiers.filter(
-          (tier, index) =>
-            index > previousVipLevel &&
-            index <= vipState.currentIndex,
-        );
-
-        transaction.update(requestRef, {
-          status: "approved",
-          verifiedHkdAmount,
-          promoReviewed: isPromo,
-          reviewedAt: serverTimestamp(),
-          reviewedBy: profile.uid,
-        });
-        transaction.update(userRef, {
-          tokens: increment(approvedTokens),
-          lastTokenGrantRequestId: request.id,
-          totalDeposits,
-          vipLevel: isPromo ? previousVipLevel : vipState.currentIndex,
-          lastVipRewardTier: attainedTiers.at(-1)?.id || userData.lastVipRewardTier || "",
-          ...(requestData.quotaVersion === 1 ? {
-            pendingTokenRequestCount: Math.max(0, Number(userData.pendingTokenRequestCount || 0) - 1),
-            lastTokenRequestClosedId: request.id,
-          } : {}),
-          updatedAt: serverTimestamp(),
-        });
-
-        attainedTiers.forEach((tier) => {
-          const rewardCard = cards.find((card) => card.id === tier.rewardCardId);
-          const rewardName = rewardCard?.name || tier.rewardName;
-          const rewardImageUrl = rewardCard?.imageUrl || tier.rewardImageUrl || "";
-          const rewardConversionValue = Number(
-            rewardCard?.conversionValue ?? rewardCard?.tokenValue ?? tier.rewardConversionValue ?? 0,
-          );
-          const rewardRef = doc(db, "drawRecords", `vip_${request.uid}_${tier.id}`);
-          transaction.set(rewardRef, {
-            source: "vip",
-            vipTierId: tier.id,
-            vipTierIndex: vipTiers.findIndex((item) => item.id === tier.id),
-            uid: request.uid,
-            username: requestData.username || userData.username || "VIP member",
-            drawId: "vip-program",
-            drawTitle: `${tier.name} 升級獎勵`,
-            roomSlug: "vip-program",
-            roomLink: "",
-            round: "vip-reward",
-            roundSort: 0,
-            number: vipTiers.findIndex((item) => item.id === tier.id) + 1,
-            tokenCost: 0,
-            targetCardId: getVipRewardCardId(tier),
-            targetCardName: rewardName,
-            targetCardImageUrl: rewardImageUrl,
-            targetCardValue: rewardConversionValue,
-            vipRewardStatus: "claimable",
-            unlockedAt: serverTimestamp(),
-            assignedBy: profile.uid,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        });
-      });
+      await reviewTokenRequest({ requestId: request.id, decision: "approved", verifiedHkdAmount });
     } catch (error) {
-      showSafeError(error);
+      showSafeError(error, "未能批准申請，請稍後再試。");
     }
   }
 
@@ -5926,35 +6397,12 @@ function AdminPanel({ profile }) {
     if (reason === null) return;
 
     try {
-      await runTransaction(db, async (transaction) => {
-        const requestRef = doc(db, "tokenRequests", request.id);
-        const requestSnap = await transaction.get(requestRef);
-        if (!requestSnap.exists() || requestSnap.data().status !== "pending") {
-          throw new Error("這個申請已經處理。");
-        }
-        const requestData = requestSnap.data();
-        const userRef = requestData.quotaVersion === 1 ? doc(db, "users", requestData.uid) : null;
-        const userSnap = userRef ? await transaction.get(userRef) : null;
-        if (userRef && !userSnap.exists()) throw new Error("找不到申請用戶。");
-
-        transaction.update(requestRef, {
-          status: "rejected",
-          adminNote: reason,
-          reviewedAt: serverTimestamp(),
-          reviewedBy: profile.uid,
-        });
-        if (userRef && userSnap) {
-          transaction.update(userRef, {
-            pendingTokenRequestCount: Math.max(0, Number(userSnap.data().pendingTokenRequestCount || 0) - 1),
-            lastTokenRequestClosedId: request.id,
-            updatedAt: serverTimestamp(),
-          });
-        }
-      });
+      await reviewTokenRequest({ requestId: request.id, decision: "rejected", adminNote: reason });
     } catch (error) {
       showSafeError(error, "未能駁回申請，請稍後再試。");
     }
   }
+
 
   async function completeDraw(draw) {
     const confirmed = window.confirm(
@@ -6014,7 +6462,7 @@ function AdminPanel({ profile }) {
 
       {activeAdminSection === "create-room" && (
         <div className="admin-section">
-          <CreateDrawForm profile={profile} cards={cards} />
+          <CreateDrawForm profile={profile} cards={cards} previousDraws={draws} />
         </div>
       )}
       {activeAdminSection === "cards" && (
@@ -6037,6 +6485,11 @@ function AdminPanel({ profile }) {
           <PromoCodeManager profile={profile} />
         </div>
       )}
+      {isBeta && activeAdminSection === "affiliate" && (
+        <div className="admin-section">
+          <AffiliateManager />
+        </div>
+      )}
       {isBeta && activeAdminSection === "payment" && (
         <div className="admin-section narrow-admin-section">
           <PaymentSettingsManager profile={profile} />
@@ -6049,10 +6502,9 @@ function AdminPanel({ profile }) {
       )}
       {activeAdminSection === "requests" && (
         <section className="panel admin-section narrow-admin-section">
-          <RequestList
+          <TokenRequestReview
             requests={requests}
             loading={adminLoading.requests}
-            adminMode
             onApprove={approveRequest}
             onReject={rejectRequest}
           />
@@ -6157,7 +6609,7 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
     const syncLegacyResults = async () => {
       const entries = Array.from(repairsByDraw.entries());
       for (let start = 0; start < entries.length; start += 400) {
-        const batch = writeBatch(db);
+        const batch = adminWriteBatch();
         entries.slice(start, start + 400).forEach(([drawId, rounds]) => {
           const updates = { updatedAt: serverTimestamp(), updatedBy: profile.uid };
           rounds.forEach((sides, roundId) => {
@@ -6303,7 +6755,7 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
     if (!selectedSession || saving) return;
     setSaving(true);
     try {
-      const batch = writeBatch(db);
+      const batch = adminWriteBatch();
       if (selectedDraw) {
         batch.update(doc(db, "draws", selectedDraw.id), {
           roundResultSides: {
@@ -6323,7 +6775,7 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
           cardId: resultCard.id,
           cardName: resultCard.name,
           cardCategory: getCardCategory(resultCard),
-          cardImageUrl: resultCard.imageUrl || "",
+          cardImageUrl: getCardThumbUrl(resultCard),
           cardValue,
           cardConversionValue: Number(resultCard.conversionValue ?? resultCard.tokenValue ?? 0),
           resultSide,
@@ -6488,7 +6940,7 @@ function ShippingRequestManager({ records, loading = false }) {
     }
     setSavingId(record.id);
     try {
-      await updateDoc(doc(db, "drawRecords", record.id), {
+      await adminUpdateDoc(doc(db, "drawRecords", record.id), {
         collectionStatus: "shipping",
         deliveryStatus: "in_transit",
         trackingNumber,
@@ -6506,7 +6958,7 @@ function ShippingRequestManager({ records, loading = false }) {
   async function markDelivered(record) {
     setSavingId(record.id);
     try {
-      await updateDoc(doc(db, "drawRecords", record.id), {
+      await adminUpdateDoc(doc(db, "drawRecords", record.id), {
         collectionStatus: "shipped",
         deliveryStatus: "delivered",
         deliveredAt: serverTimestamp(),
@@ -6929,7 +7381,7 @@ function SingleLiveManagement({ cards, draws, loading = false, profile }) {
           <strong>尚未建立直播</strong>
           <span>只需建立一次；之後所有日期、場次和賽果都在同一個直播內管理。</span>
         </div>
-        <CreateDrawForm profile={profile} cards={cards} />
+        <CreateDrawForm profile={profile} cards={cards} previousDraws={draws} />
       </div>
     );
   }
@@ -6998,7 +7450,7 @@ function BroadcastDetailsEditor({ draw, profile }) {
     }
     setSaving(true);
     try {
-      await updateDoc(doc(db, "draws", draw.id), {
+      await adminUpdateDoc(doc(db, "draws", draw.id), {
         title: cleanTitle,
         kickUrl: cleanKickChannel,
         updatedAt: serverTimestamp(),
@@ -7019,7 +7471,7 @@ function BroadcastDetailsEditor({ draw, profile }) {
     if (!window.confirm(`確認${action}${formatRoundLabel(currentRoundId)}購買？`)) return;
 
     try {
-      await updateDoc(doc(db, "draws", draw.id), {
+      await adminUpdateDoc(doc(db, "draws", draw.id), {
         buyingBlockedRounds: nextBlockedRounds,
         buyingBlockedRound: buyingBlocked ? "" : currentRoundId,
         updatedAt: serverTimestamp(),
@@ -7091,7 +7543,7 @@ export function FutureLiveScheduleManager({ draw, draws, profile }) {
         rangeNumbers(1, totalRounds).map((roundNumber) => [toRoundId(roundNumber), shareMode]),
       );
 
-      await setDoc(newDrawRef, {
+      await adminSetDoc(newDrawRef, {
         title: cleanTitle,
         slug: normalizeSlug(`${cleanTitle}-${Date.now()}`),
         kickUrl: String(draw.kickUrl || ""),
@@ -7147,7 +7599,7 @@ export function FutureLiveScheduleManager({ draw, draws, profile }) {
         alert("呢個未來直播已經有預購記錄，唔可以取消。請先處理相關訂單。");
         return;
       }
-      await updateDoc(doc(db, "draws", item.id), {
+      await adminUpdateDoc(doc(db, "draws", item.id), {
         status: "cancelled",
         preorderOpen: false,
         cancelledAt: serverTimestamp(),
@@ -7165,7 +7617,7 @@ export function FutureLiveScheduleManager({ draw, draws, profile }) {
     if (!window.confirm(`確認開始「${item.title}」？目前直播會封存，預購號碼會完整保留。`)) return;
     setSaving(true);
     try {
-      const batch = writeBatch(db);
+      const batch = adminWriteBatch();
       draws.filter((candidate) => candidate.status === "live").forEach((candidate) => {
         batch.update(doc(db, "draws", candidate.id), {
           status: "completed",
@@ -7262,7 +7714,7 @@ export function FutureLiveScheduleManager({ draw, draws, profile }) {
 }
 
 // Creates an independent scheduled broadcast without changing the current live session.
-function AddBroadcastForm({ cards, currentLive, profile }) {
+function AddBroadcastForm({ cards, currentLive }) {
   const now = new Date();
   const initialDate = addLocalDays(now, 1);
   initialDate.setHours(20, 0, 0, 0);
@@ -7294,6 +7746,14 @@ function AddBroadcastForm({ cards, currentLive, profile }) {
         ? current.filter((id) => id !== cardId)
         : [...current, cardId],
     );
+  }
+
+  function selectAllPoolCards() {
+    setSelectedCardIds(cards.map((card) => card.id));
+  }
+
+  function clearPoolCards() {
+    setSelectedCardIds([]);
   }
 
   async function createBroadcast(event) {
@@ -7332,7 +7792,13 @@ function AddBroadcastForm({ cards, currentLive, profile }) {
         rangeNumbers(1, cleanTotalRounds).map((roundNumber) => [toRoundId(roundNumber), shareMode]),
       );
 
-      await setDoc(newDrawRef, {
+      // Live creation stays behind the server-side admin endpoint. Firestore rules
+      // therefore remain closed to direct browser writes, even for this page.
+      await httpsCallable(functions, "adminWrite")({
+        collection: "draws",
+        documentId: newDrawRef.id,
+        mode: "create",
+        data: {
         title: cleanTitle,
         slug: normalizeSlug(`${cleanTitle}-${Date.now()}`),
         kickUrl: cleanKickChannel,
@@ -7342,7 +7808,7 @@ function AddBroadcastForm({ cards, currentLive, profile }) {
         currentRound: 1,
         round: toRoundId(1),
         status: "scheduled",
-        scheduledAt: Timestamp.fromDate(firstRoundDate),
+        scheduledAt: firstRoundDate.toISOString(),
         preorderOpen: true,
         shareMode,
         roundShareModes,
@@ -7358,11 +7824,13 @@ function AddBroadcastForm({ cards, currentLive, profile }) {
         thumbnailUrl: "",
         roomLink: makeRoomLink(newDrawRef.id),
         previousLiveId: currentLive?.id || "",
-        createdBy: profile.uid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+        },
       });
-      await ensureRoomRoundSlots(newDrawRef.id, rangeNumbers(1, cleanTotalRounds), cleanCardCount);
+      await httpsCallable(functions, "adminEnsureDrawSlots")({
+        drawId: newDrawRef.id,
+        totalRounds: cleanTotalRounds,
+        cardCount: cleanCardCount,
+      });
       setOpen(false);
       alert("新直播已加入直播列表，狀態為直播預告；目前直播不受影響。");
     } catch (error) {
@@ -7387,6 +7855,10 @@ function AddBroadcastForm({ cards, currentLive, profile }) {
         <div className="new-live-pool-picker">
           <div className="room-pool-header">
             <div><strong>直播卡池</strong><span>{selectedCardIds.length} 張已選 · 預設沿用上一場</span></div>
+            <div className="pool-bulk-actions">
+              <button className="small-btn" type="button" onClick={selectAllPoolCards}>全選全部</button>
+              <button className="small-btn" type="button" onClick={clearPoolCards} disabled={!selectedCardIds.length}>取消全選</button>
+            </div>
           </div>
           <div className="card-search">
             <Search size={16} />
@@ -7404,7 +7876,7 @@ function AddBroadcastForm({ cards, currentLive, profile }) {
                 <b className="mini-card-selection-state">
                   {selectedCardIds.includes(card.id) ? <><Check size={12} />已選</> : "未選"}
                 </b>
-                {card.imageUrl ? <img src={card.imageUrl} alt="" /> : <span className="mini-card-placeholder"><Package size={15} /></span>}
+                {card.imageUrl ? <img src={getCardThumbUrl(card)} alt="" loading="lazy" /> : <span className="mini-card-placeholder"><Package size={15} /></span>}
                 <span>{card.name}</span>
                 <small><TokenAmount value={card.tokenValue || 0} /></small>
               </button>
@@ -7432,7 +7904,7 @@ function RoomManagementList({ cards, draws, loading = false, onCompleteDraw, onC
 
   async function updateRoomStatus(draw, status) {
     try {
-      await updateDoc(doc(db, "draws", draw.id), { status, updatedAt: serverTimestamp() });
+      await adminUpdateDoc(doc(db, "draws", draw.id), { status, updatedAt: serverTimestamp() });
     } catch (error) {
       showSafeError(error);
     }
@@ -7451,7 +7923,7 @@ function RoomManagementList({ cards, draws, loading = false, onCompleteDraw, onC
     if (!window.confirm(confirmText)) return;
 
     try {
-      await updateDoc(doc(db, "draws", draw.id), {
+      await adminUpdateDoc(doc(db, "draws", draw.id), {
         buyingBlockedRounds: nextBlockedRounds,
         buyingBlockedRound: !blocked ? currentRoundId : "",
         updatedAt: serverTimestamp(),
@@ -7569,7 +8041,7 @@ function TokenPackageManager({ profile }) {
 
     setSaving(true);
     try {
-      await setDoc(doc(db, "settings", "tokenPackages"), {
+      await adminSetDoc(doc(db, "settings", "tokenPackages"), {
         packages,
         rateVersion: TOKEN_PACKAGE_RATE_VERSION,
         updatedAt: serverTimestamp(),
@@ -7673,7 +8145,7 @@ function PromoCodeManager({ profile }) {
     try {
       const promoRef = doc(db, "promoCodes", parsed.code);
       const existing = await getDoc(promoRef);
-      await setDoc(promoRef, {
+      await adminSetDoc(promoRef, {
         code: parsed.code,
         prefix: parsed.prefix,
         amount: parsed.amount,
@@ -7694,7 +8166,7 @@ function PromoCodeManager({ profile }) {
 
   async function togglePromoCode(promo) {
     try {
-      await updateDoc(doc(db, "promoCodes", promo.id), {
+      await adminUpdateDoc(doc(db, "promoCodes", promo.id), {
         active: !promo.active,
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
@@ -7785,14 +8257,15 @@ function HomepageBannerManager({ profile }) {
     if (!imageFile) return;
     setSaving(true);
     try {
-      const bannerImageUrl = await imageFileToCompressedDataUrl(imageFile, {
+      const bannerDataUrl = await imageFileToCompressedDataUrl(imageFile, {
         maxWidth: 1600,
         maxHeight: 600,
         quality: 0.82,
         minQuality: 0.62,
         targetBytes: 520 * 1024,
       });
-      await setDoc(doc(db, "publicSiteSettings", "homepage"), {
+      const bannerImageUrl = await uploadAdminImage(bannerDataUrl, "site", "homepage-banner");
+      await adminSetDoc(doc(db, "publicSiteSettings", "homepage"), {
         bannerImageUrl,
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
@@ -7810,7 +8283,7 @@ function HomepageBannerManager({ profile }) {
     if (!window.confirm("確認恢復預設首頁 Banner？")) return;
     setSaving(true);
     try {
-      await setDoc(doc(db, "publicSiteSettings", "homepage"), {
+      await adminSetDoc(doc(db, "publicSiteSettings", "homepage"), {
         bannerImageUrl: "",
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
@@ -7873,7 +8346,7 @@ function PaymentSettingsManager({ profile }) {
     setSaving(true);
     setSaved(false);
     try {
-      await setDoc(doc(db, "settings", "payment"), {
+      await adminSetDoc(doc(db, "settings", "payment"), {
         fpsIdentifier: form.fpsIdentifier.trim(),
         fpsName: form.fpsName.trim(),
         updatedAt: serverTimestamp(),
@@ -7934,7 +8407,7 @@ function VipProgramManager({ cards, profile, tiers }) {
               ...tier,
               rewardCardId: cardId,
               rewardName: card?.name || "待設定升級獎勵",
-              rewardImageUrl: card?.imageUrl || "",
+              rewardImageUrl: getCardThumbUrl(card),
               rewardConversionValue: Number(card?.conversionValue ?? card?.tokenValue ?? 0),
             }
           : tier,
@@ -7951,7 +8424,7 @@ function VipProgramManager({ cards, profile, tiers }) {
 
     setSaving(true);
     try {
-      await setDoc(doc(db, "settings", "vipProgram"), {
+      await adminSetDoc(doc(db, "settings", "vipProgram"), {
         tiers: normalized,
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
@@ -8027,7 +8500,7 @@ function VipProgramManager({ cards, profile, tiers }) {
 }
 
 function AdminRoomRecordsPanel({ cards, records, profile, loading = false }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const isBeta = IS_BETA;
   const [roomFilter, setRoomFilter] = useState("all");
   const [roundFilter, setRoundFilter] = useState("all");
   const [drawRecordStatus, setDrawRecordStatus] = useState("active");
@@ -8134,11 +8607,11 @@ function AdminRoomRecordsPanel({ cards, records, profile, loading = false }) {
         : collectionStatus === "shipping"
           ? { deliveryStatus: "in_transit", dispatchedAt: serverTimestamp(), shippedAt: serverTimestamp() }
           : {};
-      await updateDoc(doc(db, "drawRecords", record.id), {
+      await adminUpdateDoc(doc(db, "drawRecords", record.id), {
         cardId: card.id,
         cardName: card.name,
         cardCategory: getCardCategory(card),
-        cardImageUrl: card.imageUrl || "",
+        cardImageUrl: getCardThumbUrl(card),
         cardValue,
         cardConversionValue: Number(card.conversionValue ?? card.tokenValue ?? 0),
         resultSide,
@@ -8344,7 +8817,7 @@ function AdminBlindBoxConfirmModal({ assignment, saving, onCancel, onConfirm }) 
       <section className="modal blind-box-modal admin-blind-box-modal" role="dialog" aria-modal="true" aria-labelledby="admin-blind-box-title" onMouseDown={(event) => event.stopPropagation()}>
         <button className="icon-btn modal-close" type="button" onClick={onCancel} disabled={saving} aria-label="取消生成盲盒"><X size={19} /></button>
         <div className="admin-blind-box-preview">
-          {card.imageUrl ? <img src={card.imageUrl} alt={card.name} /> : <Package size={42} />}
+          {card.imageUrl ? <img src={getCardThumbUrl(card)} alt={card.name} loading="lazy" /> : <Package size={42} />}
         </div>
 
         <h2 id="admin-blind-box-title">確認生成盲盒</h2>
@@ -8519,7 +8992,15 @@ function CreateCardForm({ cards, profile }) {
     const pricesById = new Map();
 
     allCards.forEach((card) => {
-      if (card.pricingMode === "manual") return;
+      if (card.pricingMode === "manual") {
+        // Older manual prices may carry decimals; round them to whole tokens.
+        const current = getCardModePrices(card);
+        const rounded = normalizeManualCardPrices(current);
+        if (rounded && ["half", "fifth", "tenth"].some((key) => rounded[key] !== current[key])) {
+          pricesById.set(card.id, rounded);
+        }
+        return;
+      }
       const hellCard = cardsById.get(String(card.hellCardId || ""));
       if (!hellCard) return;
       const prices = calculateAutomaticCardPrices(
@@ -8574,7 +9055,7 @@ function CreateCardForm({ cards, profile }) {
     });
 
     for (let start = 0; start < writes.length; start += 450) {
-      const batch = writeBatch(db);
+      const batch = adminWriteBatch();
       writes.slice(start, start + 450).forEach((write) => write(batch));
       await batch.commit();
     }
@@ -8643,7 +9124,7 @@ function CreateCardForm({ cards, profile }) {
 
     try {
       const nextCategories = normalizeCardCategories([...cardCategories, cleanCategory]);
-      await setDoc(doc(db, "settings", "cardCategories"), {
+      await adminSetDoc(doc(db, "settings", "cardCategories"), {
         categories: nextCategories,
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
@@ -8678,7 +9159,7 @@ function CreateCardForm({ cards, profile }) {
       const nextCategories = normalizeCardCategories(
         cardCategories.map((item) => (item === category ? cleanCategory : item)),
       );
-      await setDoc(doc(db, "settings", "cardCategories"), {
+      await adminSetDoc(doc(db, "settings", "cardCategories"), {
         categories: nextCategories,
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
@@ -8711,7 +9192,7 @@ function CreateCardForm({ cards, profile }) {
     setSavingCategory(category);
     try {
       const nextCategories = cardCategories.filter((item) => item !== category);
-      await setDoc(doc(db, "settings", "cardCategories"), {
+      await adminSetDoc(doc(db, "settings", "cardCategories"), {
         categories: nextCategories,
         updatedAt: serverTimestamp(),
         updatedBy: profile.uid,
@@ -8767,10 +9248,8 @@ function CreateCardForm({ cards, profile }) {
 
     setCreating(true);
     try {
-      const imageUrl = await imageFileToCompressedDataUrl(
-        newCard.imageFile,
-        CARD_IMAGE_COMPRESSION,
-      );
+      const cardRef = doc(collection(db, "cards"));
+      const { imageUrl, thumbUrl } = await createCardImageSet(newCard.imageFile, cardRef.id);
 
       const cardData = {
         name: cleanName,
@@ -8782,13 +9261,14 @@ function CreateCardForm({ cards, profile }) {
         conversionValue: Number(newCard.conversionValue),
         hellCardId: newCard.hellCardId || "",
         imageUrl,
-        imageMode: "compressed-data-url",
+        thumbUrl,
+        imageMode: "storage",
         createdBy: profile.uid,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
-      const cardRef = await addDoc(collection(db, "cards"), cardData);
-      await setDoc(doc(db, "publicCardShowcase", cardRef.id), {
+      await adminSetDoc(cardRef, cardData);
+      await adminSetDoc(doc(db, "publicCardShowcase", cardRef.id), {
         ...getPublicCardPayload(cardData),
         updatedBy: profile.uid,
       }, { merge: true });
@@ -8855,15 +9335,12 @@ function CreateCardForm({ cards, profile }) {
       };
 
       if (draft.imageFile) {
-        updates.imageUrl = await imageFileToCompressedDataUrl(
-          draft.imageFile,
-          CARD_IMAGE_COMPRESSION,
-        );
-        updates.imageMode = "compressed-data-url";
+        Object.assign(updates, await createCardImageSet(draft.imageFile, card.id));
+        updates.imageMode = "storage";
       }
 
-      await updateDoc(doc(db, "cards", card.id), updates);
-      await setDoc(doc(db, "publicCardShowcase", card.id), {
+      await adminUpdateDoc(doc(db, "cards", card.id), updates);
+      await adminSetDoc(doc(db, "publicCardShowcase", card.id), {
         ...getPublicCardPayload({ ...card, ...updates }),
         updatedBy: profile.uid,
       }, { merge: true });
@@ -8872,7 +9349,7 @@ function CreateCardForm({ cards, profile }) {
         cardCategory: draft.category || CARD_CATEGORIES[0],
         cardValue: cleanModePrices.half,
         cardConversionValue: cleanConversionValue,
-        ...(updates.imageUrl ? { cardImageUrl: updates.imageUrl } : {}),
+        ...(updates.imageUrl ? { cardImageUrl: updates.thumbUrl || updates.imageUrl } : {}),
         updatedAt: serverTimestamp(),
       });
       await updateRoomPoolCardsForCard(card.id, {
@@ -8911,7 +9388,7 @@ function CreateCardForm({ cards, profile }) {
     setDeletingCardId(card.id);
     try {
       const roomsSnapshot = await getDocs(collection(db, "draws"));
-      const batch = writeBatch(db);
+      const batch = adminWriteBatch();
 
       roomsSnapshot.docs.forEach((roomDoc) => {
         const room = roomDoc.data();
@@ -8997,7 +9474,7 @@ function CreateCardForm({ cards, profile }) {
     setPublishingShowcase(true);
     try {
       const existingSnapshot = await getDocs(collection(db, "publicCardShowcase"));
-      const batch = writeBatch(db);
+      const batch = adminWriteBatch();
 
       existingSnapshot.docs.forEach((item) => {
         batch.set(item.ref, { active: false, updatedAt: serverTimestamp() }, { merge: true });
@@ -9040,7 +9517,7 @@ function CreateCardForm({ cards, profile }) {
         ...importedRows.map((row) => row.category),
       ]);
       if (importedCategories.length !== cardCategories.length) {
-        await setDoc(doc(db, "settings", "cardCategories"), {
+        await adminSetDoc(doc(db, "settings", "cardCategories"), {
           categories: importedCategories,
           updatedAt: serverTimestamp(),
           updatedBy: profile.uid,
@@ -9072,16 +9549,14 @@ function CreateCardForm({ cards, profile }) {
           updatedBy: profile.uid,
         };
 
-        if (row.imageUrl) {
-          updates.imageUrl = row.imageUrl;
-          updates.imageMode = row.imageUrl.startsWith("data:image/")
-            ? "imported-data-url"
-            : "external-url";
-        }
+        const importedImage = row.imageUrl
+          ? await resolveImportedCardImage(row.imageUrl, matchedCard?.id || "import")
+          : null;
+        if (importedImage) Object.assign(updates, importedImage);
 
         if (matchedCard) {
-          await updateDoc(doc(db, "cards", matchedCard.id), updates);
-          await setDoc(doc(db, "publicCardShowcase", matchedCard.id), {
+          await adminUpdateDoc(doc(db, "cards", matchedCard.id), updates);
+          await adminSetDoc(doc(db, "publicCardShowcase", matchedCard.id), {
             ...getPublicCardPayload({ ...matchedCard, ...updates }),
             updatedBy: profile.uid,
           }, { merge: true });
@@ -9090,7 +9565,7 @@ function CreateCardForm({ cards, profile }) {
             cardCategory: row.category || CARD_CATEGORIES[0],
             cardValue: row.tokenValue,
             cardConversionValue: row.conversionValue,
-            ...(row.imageUrl ? { cardImageUrl: row.imageUrl } : {}),
+            ...(importedImage ? { cardImageUrl: importedImage.thumbUrl || importedImage.imageUrl } : {}),
             updatedAt: serverTimestamp(),
           });
           await updateRoomPoolCardsForCard(matchedCard.id, {
@@ -9112,19 +9587,16 @@ function CreateCardForm({ cards, profile }) {
             allowedShareModes: row.allowedShareModes,
             conversionValue: row.conversionValue,
             hellCardId: row.hellCardId || "",
-            imageUrl: row.imageUrl || "",
-            imageMode: row.imageUrl
-              ? row.imageUrl.startsWith("data:image/")
-                ? "imported-data-url"
-                : "external-url"
-              : "excel-import-no-image",
+            imageUrl: importedImage?.imageUrl || "",
+            thumbUrl: importedImage?.thumbUrl || "",
+            imageMode: importedImage?.imageMode || "excel-import-no-image",
             createdBy: profile.uid,
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
           };
-          const cardRef = await addDoc(collection(db, "cards"), docData);
+          const cardRef = await adminAddDoc(collection(db, "cards"), docData);
           if (docData.imageUrl) {
-            await setDoc(doc(db, "publicCardShowcase", cardRef.id), {
+            await adminSetDoc(doc(db, "publicCardShowcase", cardRef.id), {
               ...getPublicCardPayload(docData),
               updatedBy: profile.uid,
             }, { merge: true });
@@ -9658,7 +10130,7 @@ function RoomPoolEditor({ draw, cards, singleLive = false }) {
 
     setSaving(true);
     try {
-      await updateDoc(doc(db, "draws", draw.id), {
+      await adminUpdateDoc(doc(db, "draws", draw.id), {
         poolCards,
         poolCardIds: poolCards.map((card) => card.id),
         poolCardValues,
@@ -9717,7 +10189,7 @@ function RoomPoolEditor({ draw, cards, singleLive = false }) {
                   {selectedIds.includes(card.id) ? <><Check size={12} />已選</> : "未選"}
                 </b>
                 {card.imageUrl ? (
-                  <img src={card.imageUrl} alt="" />
+                  <img src={getCardThumbUrl(card)} alt="" loading="lazy" />
                 ) : (
                   <span className="mini-card-placeholder">
                     <Package size={15} />
@@ -9763,7 +10235,7 @@ function LiveRoundSettingsList({ allDraws, cards, currentLive, profile, schedule
 
     setUpdatingId(broadcast.id);
     try {
-      await runTransaction(db, async (transaction) => {
+      await runAdminTransaction(async (transaction) => {
         const liveStateRef = doc(db, "settings", "liveState");
         const targetRef = doc(db, "draws", broadcast.id);
         const liveStateSnapshot = await transaction.get(liveStateRef);
@@ -9825,7 +10297,7 @@ function LiveRoundSettingsList({ allDraws, cards, currentLive, profile, schedule
 
     setUpdatingId(broadcast.id);
     try {
-      await runTransaction(db, async (transaction) => {
+      await runAdminTransaction(async (transaction) => {
         const liveStateRef = doc(db, "settings", "liveState");
         const drawRef = doc(db, "draws", broadcast.id);
         const liveStateSnapshot = await transaction.get(liveStateRef);
@@ -9973,7 +10445,7 @@ function RoomRoundSettings({ draw }) {
         }
       }
 
-      await updateDoc(doc(db, "draws", draw.id), {
+      await adminUpdateDoc(doc(db, "draws", draw.id), {
         totalRounds: nextTotal,
         currentRound: nextCurrent,
         round: toRoundId(nextCurrent),
@@ -10000,7 +10472,7 @@ function RoomRoundSettings({ draw }) {
         file,
         `draw-results/${draw.id}/${roundId}-${Date.now()}.webp`,
       );
-      await updateDoc(doc(db, "draws", draw.id), {
+      await adminUpdateDoc(doc(db, "draws", draw.id), {
         [`roundResultImages.${roundId}`]: imageUrl,
         updatedAt: serverTimestamp(),
       });
@@ -10008,6 +10480,22 @@ function RoomRoundSettings({ draw }) {
       alert(`${formatRoundLabel(roundId)}賽果相片已上載。`);
     } catch (error) {
       showSafeError(error, "賽果相片上載失敗，請重新選擇圖片再試。");
+    } finally {
+      setUploadingRoundId("");
+    }
+  }
+
+  // Lets an admin withdraw a wrongly uploaded result; the round shows "no result" again.
+  async function removeRoundResult(roundId) {
+    if (!window.confirm(`確認移除${formatRoundLabel(roundId)}的賽果相片？玩家頁面會即時不再顯示。`)) return;
+    setUploadingRoundId(roundId);
+    try {
+      await adminUpdateDoc(doc(db, "draws", draw.id), {
+        [`roundResultImages.${roundId}`]: "",
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      showSafeError(error, "未能移除賽果相片，請稍後再試。");
     } finally {
       setUploadingRoundId("");
     }
@@ -10090,10 +10578,20 @@ function RoomRoundSettings({ draw }) {
               {uploadingRoundId === roundId ? (
                 <span className="round-result-empty">正在壓縮及上載...</span>
               ) : resultImage ? (
-                <a className="round-result-preview" href={resultImage} target="_blank" rel="noreferrer">
-                  <img src={resultImage} alt={`第 ${roundNumber} 場賽果`} />
-                  查看現有相片
-                </a>
+                <div className="round-result-current">
+                  <a className="round-result-preview" href={resultImage} target="_blank" rel="noreferrer">
+                    <img src={resultImage} alt={`第 ${roundNumber} 場賽果`} />
+                    查看現有相片
+                  </a>
+                  <button
+                    className="small-btn round-result-remove"
+                    type="button"
+                    disabled={Boolean(uploadingRoundId)}
+                    onClick={() => removeRoundResult(roundId)}
+                  >
+                    <X size={14} />移除賽果相片
+                  </button>
+                </div>
               ) : (
                 <span className="round-result-empty">未有賽果相片</span>
               )}
@@ -10105,14 +10603,15 @@ function RoomRoundSettings({ draw }) {
   );
 }
 
-function CreateDrawForm({ profile, cards }) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+function CreateDrawForm({ cards, previousDraws = [] }) {
+  const isBeta = IS_BETA;
   const [form, setForm] = useState(DEFAULT_DRAW);
   const [thumbnailFile, setThumbnailFile] = useState(null);
   const [selectedCardIds, setSelectedCardIds] = useState([]);
   const [cardSearch, setCardSearch] = useState("");
   const [visibleLimit, setVisibleLimit] = useState(ADMIN_CARD_BATCH_SIZE);
   const [creating, setCreating] = useState(false);
+  const hasAppliedPreviousPool = useRef(false);
   const filteredCards = useMemo(
     () => filterCards(cards, cardSearch),
     [cards, cardSearch],
@@ -10126,6 +10625,18 @@ function CreateDrawForm({ profile, cards }) {
     setVisibleLimit(ADMIN_CARD_BATCH_SIZE);
   }, [cardSearch]);
 
+  // A new beta live starts from the latest saved pool, while only retaining cards
+  // that still exist in the library. This leaves every old live untouched.
+  useEffect(() => {
+    if (!isBeta || hasAppliedPreviousPool.current || !cards.length || !previousDraws.length) return;
+    const latestDraw = [...previousDraws]
+      .sort((left, right) => toMillis(right.updatedAt || right.createdAt) - toMillis(left.updatedAt || left.createdAt))[0];
+    const availableIds = new Set(cards.map((card) => card.id));
+    const inheritedIds = getRoomPoolIds(latestDraw).filter((cardId) => availableIds.has(cardId));
+    if (inheritedIds.length) setSelectedCardIds(inheritedIds);
+    hasAppliedPreviousPool.current = true;
+  }, [cards, isBeta, previousDraws]);
+
   function updateField(field, value) {
     setForm((current) => ({ ...current, [field]: value }));
   }
@@ -10136,6 +10647,14 @@ function CreateDrawForm({ profile, cards }) {
         ? current.filter((id) => id !== cardId)
         : [...current, cardId],
     );
+  }
+
+  function selectAllPoolCards() {
+    setSelectedCardIds(cards.map((card) => card.id));
+  }
+
+  function clearPoolCards() {
+    setSelectedCardIds([]);
   }
 
   async function createDraw(event) {
@@ -10170,7 +10689,6 @@ function CreateDrawForm({ profile, cards }) {
     setCreating(true);
     try {
       const drawRef = doc(collection(db, "draws"));
-      const batch = writeBatch(db);
       const slug = normalizeSlug(form.slug || form.title);
       const poolCards = cards
         .filter((card) => selectedCardIds.includes(card.id))
@@ -10201,7 +10719,13 @@ function CreateDrawForm({ profile, cards }) {
         ]),
       );
 
-      batch.set(drawRef, {
+      // Keep browser clients out of direct Firestore writes. The admin callable
+      // verifies the signed-in administrator before creating the broadcast.
+      await httpsCallable(functions, "adminWrite")({
+        collection: "draws",
+        documentId: drawRef.id,
+        mode: "create",
+        data: {
         title: form.title.trim(),
         slug,
         kickUrl: getKickChannel(form.kickUrl),
@@ -10223,13 +10747,13 @@ function CreateDrawForm({ profile, cards }) {
           ? "compressed-data-url"
           : "external-url",
         roomLink: makeRoomLink(drawRef.id),
-        createdBy: profile.uid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+        },
       });
-
-      await batch.commit();
-      await ensureRoomRoundSlots(drawRef.id, rangeNumbers(1, totalRounds), cardCount);
+      await httpsCallable(functions, "adminEnsureDrawSlots")({
+        drawId: drawRef.id,
+        totalRounds,
+        cardCount,
+      });
       setForm(DEFAULT_DRAW);
       setThumbnailFile(null);
       setSelectedCardIds([]);
@@ -10351,7 +10875,18 @@ function CreateDrawForm({ profile, cards }) {
           )}
         </div>
         <div className="form-field">
-          <span>{isBeta ? "直播卡池" : "房間卡池"}</span>
+          <div className="room-pool-header">
+            <div>
+              <strong>{isBeta ? "直播卡池" : "房間卡池"}</strong>
+              <span>{selectedCardIds.length} 張已選{isBeta && previousDraws.length ? " · 已沿用最近直播卡池" : ""}</span>
+            </div>
+            {cards.length > 0 && (
+              <div className="pool-bulk-actions">
+                <button className="small-btn" type="button" onClick={selectAllPoolCards}>全選全部</button>
+                <button className="small-btn" type="button" onClick={clearPoolCards} disabled={!selectedCardIds.length}>取消全選</button>
+              </div>
+            )}
+          </div>
           {cards.length ? (
             <>
               <div className="card-search">
@@ -10374,7 +10909,7 @@ function CreateDrawForm({ profile, cards }) {
                     onClick={() => toggleRoomCard(card.id)}
                   >
                     {card.imageUrl ? (
-                      <img src={card.imageUrl} alt={card.name} />
+                      <img src={getCardThumbUrl(card)} alt={card.name} loading="lazy" />
                     ) : (
                       <div className="image-placeholder">
                         <Package size={22} />
@@ -10433,6 +10968,7 @@ function getPublicCardPayload(card) {
   return {
     name: String(card?.name || ""),
     imageUrl: String(card?.imageUrl || ""),
+    thumbUrl: String(card?.thumbUrl || ""),
     tokenValue: Number(card?.tokenValue || 0),
     modePrices: getCardModePrices(card),
     allowedShareModes: getCardAllowedShareModes(card),
@@ -10477,6 +11013,7 @@ function buildRoomCards(room, cards, roundId = "") {
         name: String(source.name || legacyCard?.name || ""),
         category: getCardCategory(source || legacyCard),
         imageUrl: String(libraryCard?.imageUrl || legacyCard?.imageUrl || ""),
+        thumbUrl: String(libraryCard?.thumbUrl || ""),
         tokenValue,
         modePrices: getCardModePrices(priceSource),
         allowedShareModes: getCardAllowedShareModes(availabilitySource),
@@ -10538,7 +11075,9 @@ function createCsvText(headers, rows) {
 }
 
 function escapeCsvCell(value) {
-  const text = String(value ?? "");
+  let text = String(value ?? "");
+  // Player-controlled text (e.g. usernames) must not run as a spreadsheet formula.
+  if (/^[=+\-@\t\r]/.test(text) && !/^-?\d+(\.\d+)?$/.test(text)) text = `'${text}`;
   if (!/[",\n\r]/.test(text)) return text;
   return `"${text.replace(/"/g, '""')}"`;
 }
@@ -10610,9 +11149,9 @@ function normalizeImportedCardRows(rows) {
       const category = normalizeCardCategory(row.category || row.cat || row.type || "");
       const legacyPrice = Number(row.tokenvalue || row.price || row.token || row.value || 0);
       const modePrices = {
-        half: Number(row.pricehalf || row.halfprice || legacyPrice),
-        fifth: Number(row.pricefifth || row.fifthprice || legacyPrice),
-        tenth: Number(row.pricetenth || row.tenthprice || legacyPrice),
+        half: Math.round(Number(row.pricehalf || row.halfprice || legacyPrice)),
+        fifth: Math.round(Number(row.pricefifth || row.fifthprice || legacyPrice)),
+        tenth: Math.round(Number(row.pricetenth || row.tenthprice || legacyPrice)),
       };
       const tokenValue = modePrices.half;
       const pricingMode = String(row.pricingmode || row.pricing || "").trim().toLowerCase() === "manual"
@@ -10722,7 +11261,7 @@ function useTokenPackages(enabled = true) {
 }
 
 function usePaymentSettings(enabled = true) {
-  const isBeta = import.meta.env.VITE_APP_VARIANT === "beta";
+  const isBeta = IS_BETA;
   const fallbackSettings = isBeta
     ? BETA_DUMMY_PAYMENT_SETTINGS
     : EMPTY_PAYMENT_SETTINGS;
@@ -10828,6 +11367,69 @@ function getTokenBonusRate(tokenPackage) {
   return Math.max(0, Math.round(((Number(tokenPackage?.tokens || 0) - baseTokens) / baseTokens) * 100));
 }
 
+// Listens to specific documents in chunks of 30 (Firestore's "in" limit) so pages
+// read only the documents they show instead of whole collections.
+function useDocsByIds(collectionName, ids, enabled = true) {
+  const idsKey = [...new Set(ids.filter(Boolean).map(String))].sort().join("|");
+  const [docsById, setDocsById] = useState({});
+  const [loading, setLoading] = useState(Boolean(idsKey));
+
+  useEffect(() => {
+    const idList = idsKey ? idsKey.split("|") : [];
+    if (!enabled || !idList.length) {
+      setDocsById({});
+      setLoading(false);
+      return undefined;
+    }
+    setLoading(true);
+    const chunks = [];
+    for (let index = 0; index < idList.length; index += 30) chunks.push(idList.slice(index, index + 30));
+    const results = chunks.map(() => null);
+    const publish = () => {
+      if (!results.every(Boolean)) return;
+      setDocsById(Object.fromEntries(results.flat().map((item) => [item.id, item])));
+      setLoading(false);
+    };
+    const stops = chunks.map((chunk, index) => onSnapshot(
+      query(collection(db, collectionName), where(documentId(), "in", chunk)),
+      LIVE_SNAPSHOT_OPTIONS,
+      (snapshot) => {
+        results[index] = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+        publish();
+      },
+      (error) => {
+        console.error(`${collectionName} listener failed.`, error);
+        results[index] = [];
+        publish();
+      },
+    ));
+    return () => stops.forEach((stop) => stop());
+  }, [collectionName, enabled, idsKey]);
+
+  return { docsById, loading };
+}
+
+// The homepage marquee only needs the highest-priced public cards.
+function useTopShowcaseCards() {
+  const [cards, setCards] = useState([]);
+
+  useEffect(() => {
+    const topQuery = query(
+      collection(db, "publicCardShowcase"),
+      where("active", "==", true),
+      orderBy("tokenValue", "desc"),
+      limit(24),
+    );
+    return onSnapshot(topQuery, (snapshot) => {
+      setCards(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+    }, (error) => {
+      console.error("Showcase marquee listener failed.", error);
+    });
+  }, []);
+
+  return cards;
+}
+
 function useCardCategories(cards = [], enabled = true) {
   const [categories, setCategories] = useState(CARD_CATEGORIES);
 
@@ -10878,54 +11480,19 @@ function normalizeTokenPackages(packages) {
   return [...uniquePackages.values()].sort((left, right) => left.hkd - right.hkd);
 }
 
-// Calculate the grant from verified payment and protected rates; reject stale or forged claims.
-function getVerifiedTokenGrant(request, verifiedHkdAmount, settings) {
-  const isPromo = request.proofMode === "promo";
-  if (isPromo) {
-    if (!parsePromoCode(request.promoCode)
-      || request.promoCodeId !== request.promoCode
-      || request.packageType !== "promo"
-      || request.hkdAmount !== 0
-      || request.exchangeRate !== 0
-      || verifiedHkdAmount !== 0
-      || !Number.isSafeInteger(request.amount)
-      || request.amount < 1
-      || request.amount > 1000000) {
-      throw new Error("邀請碼申請資料不完整或代幣數目不正確，請拒絕此申請。");
-    }
-    return request.amount;
-  }
-  const pricingAmount = verifiedHkdAmount;
-  if (request.proofMode !== "storage" || !request.proofUrl || request.hkdAmount !== verifiedHkdAmount) {
-    throw new Error("實際入帳金額與申請不符，或缺少付款證明。請拒絕此申請並要求重新提交。");
-  }
-  const savedPackages = settings ? normalizeTokenPackages(settings.packages) : TOKEN_PACKAGES;
-  const packages = settings && Number(settings.rateVersion || 1) < TOKEN_PACKAGE_RATE_VERSION
-    ? savedPackages.map((item) => ({ ...item, tokens: Math.max(1, Math.round(item.tokens / 2)) }))
-    : savedPackages;
-  const grant = request.packageType === "custom"
-    ? calculateTokenAmount(pricingAmount)
-    : request.packageType === "preset"
-      ? packages.find((item) => item.hkd === pricingAmount && item.tokens === request.amount)?.tokens
-      : 0;
-  if (!Number.isSafeInteger(grant) || grant < 1 || grant > 1000000
-    || grant !== request.amount || request.exchangeRate !== grant / pricingAmount) {
-    throw new Error("申請代幣數量不符合目前套餐價格。請拒絕此申請並要求重新提交。");
-  }
-  return grant;
-}
-
 function calculateTokenAmount(hkdAmount) {
   const amount = Number(hkdAmount || 0);
-  if (amount < 500) return 0;
+  if (!Number.isSafeInteger(amount) || amount < MIN_CUSTOM_PAYMENT_HKD) return 0;
 
-  let bonusRate = 0.05;
+  let bonusRate = 0;
   if (amount >= 30000) {
     bonusRate = 0.17;
   } else if (amount >= 10000) {
     bonusRate = 0.1;
   } else if (amount >= 3000) {
     bonusRate = 0.08;
+  } else if (amount >= CUSTOM_PAYMENT_BONUS_THRESHOLD_HKD) {
+    bonusRate = 0.05;
   }
 
   return Math.floor(amount * (1 + bonusRate));
@@ -11208,12 +11775,18 @@ function rangeNumbers(start, end) {
 
 function normalizePhoneNumber(value) {
   const compact = String(value || "").replace(/[\s()-]/g, "");
-  const normalized = compact.startsWith("+")
+  const normalized = (compact.startsWith("+")
     ? `+${compact.slice(1).replace(/\D/g, "")}`
-    : `+852${compact.replace(/\D/g, "")}`;
+    : `+852${compact.replace(/\D/g, "")}`)
+    // Taiwan numbers are often typed with the local trunk 0 (+886 0912...).
+    .replace(/^\+8860(9\d{8})$/, "+886$1");
 
   if (!/^\+[1-9]\d{7,14}$/.test(normalized)) {
     throw new Error("請輸入有效手機號碼，例如 +852 9123 4567。");
+  }
+  // SMS delivery is limited to Hong Kong and Taiwan in Firebase Auth.
+  if (!/^\+852\d{8}$/.test(normalized) && !/^\+8869\d{8}$/.test(normalized)) {
+    throw new Error("手機登入只支援香港（+852）及台灣（+886）號碼。台灣號碼請輸入 +886 9XX XXX XXX。");
   }
 
   return normalized;
@@ -11226,7 +11799,7 @@ function getPhoneAuthErrorMessage(error) {
     "auth/code-expired": "驗證碼已過期，請重新發送。",
     "auth/too-many-requests": "嘗試次數過多，請稍後再試。",
     "auth/quota-exceeded": "今日 SMS 驗證配額已用完，請使用 Google 登入或稍後再試。",
-    "auth/operation-not-allowed": "手機登入尚未啟用，請聯絡管理員。",
+    "auth/operation-not-allowed": "此手機號碼地區暫不支援 SMS 登入，只支援香港及台灣號碼。",
     "auth/captcha-check-failed": "安全驗證失敗，請重新整理後再試。",
     "auth/missing-phone-number": "請輸入手機號碼。",
   };
@@ -11265,79 +11838,92 @@ function showSafeError(error, fallback) {
   alert(getSafeErrorMessage(error, fallback));
 }
 
-async function deleteRoomWithChildren(drawId) {
-  const slotsSnapshot = await getDocs(collection(db, "draws", drawId, "slots"));
-  const messagesSnapshot = await getDocs(collection(db, "draws", drawId, "messages"));
-  const roundsSnapshot = await getDocs(collection(db, "draws", drawId, "rounds"));
-  const allRefs = [
-    ...slotsSnapshot.docs.map((item) => item.ref),
-    ...messagesSnapshot.docs.map((item) => item.ref),
-  ];
-
-  for (const roundItem of roundsSnapshot.docs) {
-    const roundSlotsSnapshot = await getDocs(
-      collection(db, "draws", drawId, "rounds", roundItem.id, "slots"),
+// Admin-owned collections are server-write only. These helpers mirror the
+// Firestore write API but send every write through the audited adminBatchWrite.
+function encodeAdminValue(value) {
+  if (value instanceof FieldValue) {
+    if (value.isEqual(serverTimestamp())) return { __adminServerTimestamp: true };
+    throw new Error("管理後台不支援此資料操作。");
+  }
+  if (value instanceof Timestamp) return { __adminTimestampMillis: value.toMillis() };
+  if (value instanceof Date) return { __adminTimestampMillis: value.getTime() };
+  if (Array.isArray(value)) return value.map(encodeAdminValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, encodeAdminValue(item)]),
     );
-    allRefs.push(...roundSlotsSnapshot.docs.map((item) => item.ref), roundItem.ref);
   }
+  return value;
+}
 
-  allRefs.push(doc(db, "draws", drawId));
+function adminWriteBatch() {
+  const operations = [];
+  const add = (ref, mode, data) => {
+    operations.push({ path: ref.path, mode, ...(data ? { data: encodeAdminValue(data) } : {}) });
+  };
+  return {
+    set(ref, data, options) {
+      add(ref, options?.merge ? "upsert" : "set", data);
+    },
+    update(ref, data) {
+      add(ref, "update", data);
+    },
+    delete(ref) {
+      add(ref, "delete");
+    },
+    async commit() {
+      const write = httpsCallable(functions, "adminBatchWrite");
+      for (let index = 0; index < operations.length; index += 100) {
+        await write({ operations: operations.slice(index, index + 100) });
+      }
+    },
+  };
+}
 
-  for (let index = 0; index < allRefs.length; index += 450) {
-    const batch = writeBatch(db);
-    allRefs.slice(index, index + 450).forEach((itemRef) => batch.delete(itemRef));
-    await batch.commit();
-  }
+// Reads happen first; the collected writes then commit together on the server.
+async function runAdminTransaction(callback) {
+  const batch = adminWriteBatch();
+  await callback({
+    get: (ref) => getDoc(ref),
+    set: (ref, data, options) => batch.set(ref, data, options),
+    update: (ref, data) => batch.update(ref, data),
+    delete: (ref) => batch.delete(ref),
+  });
+  await batch.commit();
+}
+
+async function adminSetDoc(ref, data, options) {
+  const batch = adminWriteBatch();
+  batch.set(ref, data, options);
+  await batch.commit();
+}
+
+async function adminUpdateDoc(ref, data) {
+  const batch = adminWriteBatch();
+  batch.update(ref, data);
+  await batch.commit();
+}
+
+async function adminAddDoc(collectionRef, data) {
+  const ref = doc(collectionRef);
+  const batch = adminWriteBatch();
+  batch.set(ref, data);
+  await batch.commit();
+  return ref;
+}
+
+async function deleteRoomWithChildren(drawId) {
+  await httpsCallable(functions, "adminDeleteDraw")({ drawId });
 }
 
 async function ensureRoomRoundSlots(drawId, roundNumbers, cardCount) {
-  let batch = writeBatch(db);
-  let writes = 0;
-  const cleanCardCount = Math.max(4, Math.min(100, Math.round(Number(cardCount) || 30)));
-
-  async function flush() {
-    if (!writes) return;
-    await batch.commit();
-    batch = writeBatch(db);
-    writes = 0;
-  }
-
-  for (const roundNumber of roundNumbers) {
-    const roundId = toRoundId(roundNumber);
-    const roundRef = doc(db, "draws", drawId, "rounds", roundId);
-    const slotsRef = collection(db, "draws", drawId, "rounds", roundId, "slots");
-    const existingSnapshot = await getDocs(slotsRef);
-    const existingNumbers = new Set(existingSnapshot.docs.map((item) => item.id));
-
-    batch.set(
-      roundRef,
-      {
-        round: roundId,
-        roundNumber,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-    writes += 1;
-
-    for (let number = 1; number <= cleanCardCount; number += 1) {
-      const slotId = String(number);
-      if (existingNumbers.has(slotId)) continue;
-      batch.set(doc(db, "draws", drawId, "rounds", roundId, "slots", slotId), {
-        number,
-        round: roundId,
-        status: "available",
-        createdAt: serverTimestamp(),
-      });
-      writes += 1;
-
-      if (writes >= 450) {
-        await flush();
-      }
-    }
-  }
-
-  await flush();
+  await httpsCallable(functions, "adminEnsureDrawSlots")({
+    drawId,
+    totalRounds: Math.max(0, ...roundNumbers),
+    cardCount,
+  });
 }
 
 async function updateAssignedRecordsForCard(cardId, updates) {
@@ -11346,7 +11932,7 @@ async function updateAssignedRecordsForCard(cardId, updates) {
   );
 
   for (let index = 0; index < recordsSnapshot.docs.length; index += 450) {
-    const batch = writeBatch(db);
+    const batch = adminWriteBatch();
     recordsSnapshot.docs.slice(index, index + 450).forEach((item) => {
       batch.update(item.ref, updates);
     });
@@ -11360,7 +11946,7 @@ async function updateRoomPoolCardsForCard(cardId, updates) {
   );
 
   for (let index = 0; index < roomsSnapshot.docs.length; index += 450) {
-    const batch = writeBatch(db);
+    const batch = adminWriteBatch();
     roomsSnapshot.docs.slice(index, index + 450).forEach((item) => {
       const poolCards = normalizeRoomCards(item.data().poolCards)
         .map((card) => (card.id === cardId ? { ...card, ...updates } : card))
@@ -11457,6 +12043,42 @@ function formatFutureLiveDate(value) {
   }).format(value);
 }
 
+function getCardThumbUrl(card) {
+  return String(card?.thumbUrl || card?.imageUrl || "");
+}
+
+// Stores an image file in Cloud Storage through the audited admin function.
+async function uploadAdminImage(dataUrl, scope, ownerId) {
+  const imageBlob = dataUrlToBlob(dataUrl);
+  const { data } = await httpsCallable(functions, "adminUploadImage")({
+    scope,
+    ownerId,
+    contentType: imageBlob.type || "image/webp",
+    base64: await blobToBase64(imageBlob),
+  });
+  return data.url;
+}
+
+// Cards keep a full image for detail views and a small thumbnail for lists.
+async function createCardImageSet(source, ownerId) {
+  const [fullDataUrl, thumbDataUrl] = await Promise.all([
+    imageFileToCompressedDataUrl(source, CARD_IMAGE_COMPRESSION),
+    imageFileToCompressedDataUrl(source, CARD_THUMB_COMPRESSION),
+  ]);
+  const [imageUrl, thumbUrl] = await Promise.all([
+    uploadAdminImage(fullDataUrl, "card", ownerId),
+    uploadAdminImage(thumbDataUrl, "card", ownerId),
+  ]);
+  return { imageUrl, thumbUrl };
+}
+
+async function resolveImportedCardImage(url, ownerId) {
+  if (String(url).startsWith("data:image/")) {
+    return { ...await createCardImageSet(dataUrlToBlob(url), ownerId), imageMode: "storage" };
+  }
+  return { imageUrl: url, thumbUrl: "", imageMode: "external-url" };
+}
+
 async function uploadCompressedImage(file, path) {
   const dataUrl = await imageFileToCompressedDataUrl(file, {
     maxWidth: 1280,
@@ -11468,6 +12090,16 @@ async function uploadCompressedImage(file, path) {
   // Convert the local data URL directly. Using fetch(data:) can fail in Chrome/Safari
   // before Firebase Storage is contacted, resulting in the unhelpful "Failed to fetch" alert.
   const imageBlob = dataUrlToBlob(dataUrl);
+  const drawResult = String(path).match(/^draw-results\/([^/]+)\//);
+  if (drawResult) {
+    const { data } = await httpsCallable(functions, "adminUploadImage")({
+      scope: "draw-result",
+      ownerId: drawResult[1],
+      contentType: imageBlob.type || "image/webp",
+      base64: await blobToBase64(imageBlob),
+    });
+    return data.url;
+  }
   const imageRef = ref(storage, path);
   try {
     await uploadBytes(imageRef, imageBlob, { contentType: imageBlob.type || "image/webp" });
@@ -11478,6 +12110,16 @@ async function uploadCompressedImage(file, path) {
     throw error;
   }
   return getDownloadURL(imageRef);
+}
+
+async function blobToBase64(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
 }
 
 function dataUrlToBlob(dataUrl) {
@@ -11547,7 +12189,7 @@ async function renameCategoryInCards(oldCategory, newCategory) {
   });
 
   for (let index = 0; index < refsAndUpdates.length; index += 450) {
-    const batch = writeBatch(db);
+    const batch = adminWriteBatch();
     refsAndUpdates.slice(index, index + 450).forEach(([itemRef, updates]) => {
       batch.update(itemRef, updates);
     });

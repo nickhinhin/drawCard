@@ -118,24 +118,6 @@
   justify-self: start;
 }
 
-.beta-mode .beta-demo-login {
-  width: 100%;
-  min-height: 48px;
-  margin-top: 10px;
-  border-color: var(--beta-red);
-  color: #fff;
-}
-
-.beta-mode .beta-demo-login:hover {
-  background: var(--beta-red);
-}
-
-.beta-mode .auth-dialog .beta-demo-note {
-  margin-top: 8px;
-  color: #b6b6bc;
-  text-align: center;
-}
-
 .beta-mode .auth-dialog-backdrop {
   background: rgba(0, 0, 0, .86);
 }
@@ -356,6 +338,38 @@
 .beta-mode strong,
 .beta-mode b,
 .beta-mode label {
+  color: var(--beta-white);
+}
+
+/* The live setup notice belongs to the web admin workspace, so it must not
+   inherit the light-site `--soft` background used by the older layout. */
+.beta-mode .single-live-note {
+  border: 1px solid var(--beta-line);
+  border-left: 4px solid var(--beta-red);
+  background: linear-gradient(135deg, #17171d, var(--beta-panel));
+  color: var(--beta-white);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.beta-mode .single-live-note strong {
+  color: var(--beta-white);
+}
+
+.beta-mode .single-live-note span {
+  color: var(--beta-muted);
+}
+
+.beta-mode .room-pool-header strong {
+  color: var(--beta-white);
+}
+
+.beta-mode .room-pool-header span {
+  color: var(--beta-muted);
+}
+
+.beta-mode .pool-bulk-actions .small-btn {
+  border-color: #3a3a43;
+  background: #17171d;
   color: var(--beta-white);
 }
 
@@ -5682,4 +5696,276 @@
     grid-template-columns: 1fr 1fr;
     padding: 0 12px 12px;
   }
+}
+
+.beta-mode .affiliate-link-card {
+  border-color: var(--beta-line);
+  background: var(--beta-panel-2);
+  color: var(--beta-white);
+}
+
+.beta-mode .affiliate-link-card strong,
+.beta-mode .affiliate-application-form label {
+  color: var(--beta-white);
+}
+
+.beta-mode .affiliate-link-card small {
+  color: var(--beta-muted);
+}
+
+.beta-mode .affiliate-status.pending {
+  color: #fbbf24;
+}
+
+.beta-mode .affiliate-status.rejected {
+  color: var(--beta-red-text);
+}
+
+/* SF Express pickup point picker in the shipping request dialog. */
+.beta-mode .sf-pickup-picker {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.beta-mode .sf-pickup-picker legend {
+  margin-bottom: 8px;
+  padding: 0;
+  color: var(--beta-white);
+  font-weight: 800;
+}
+
+.beta-mode .sf-pickup-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.beta-mode .sf-pickup-types button {
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid #34343b;
+  border-radius: 3px;
+  background: #0d0d11;
+  color: #c0c0c8;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.beta-mode .sf-pickup-types button.active {
+  border-color: var(--beta-red);
+  color: #fff;
+  background: color-mix(in srgb, var(--beta-red) 18%, #0d0d11);
+}
+
+.beta-mode .sf-pickup-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.beta-mode .sf-pickup-list {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.beta-mode .sf-pickup-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 4px;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #34343b;
+  border-radius: 3px;
+  background: #0d0d11;
+  color: #d8d8de;
+  text-align: left;
+  cursor: pointer;
+}
+
+.beta-mode .sf-pickup-option:hover {
+  border-color: #55555f;
+}
+
+.beta-mode .sf-pickup-option.selected {
+  border-color: var(--beta-red);
+  outline: 1px solid var(--beta-red);
+}
+
+.beta-mode .sf-pickup-option strong {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #fff;
+  font-size: 0.95rem;
+}
+
+.beta-mode .sf-pickup-option span {
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .sf-pickup-option small {
+  color: var(--beta-muted);
+}
+
+.beta-mode .sf-pickup-badge {
+  flex: none;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.beta-mode .sf-pickup-badge.station {
+  background: color-mix(in srgb, var(--beta-red) 22%, transparent);
+  color: var(--beta-red-text);
+}
+
+.beta-mode .sf-pickup-badge.locker {
+  background: #25252c;
+  color: #c0c0c8;
+}
+
+.beta-mode .sf-pickup-selected {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: #4ade80;
+  font-weight: 800;
+}
+
+@media (max-width: 560px) {
+  .beta-mode .sf-pickup-filters {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Chosen file name in upload fields; the base theme's dark text is invisible here. */
+.beta-mode .file-upload-name {
+  color: var(--beta-muted);
+}
+
+.beta-mode .file-upload-name.selected {
+  color: var(--beta-white);
+}
+
+.beta-mode .live-archive-more {
+  display: block;
+  margin: 16px auto 0;
+}
+
+/* Affiliate admin section. */
+.beta-mode .affiliate-admin {
+  display: grid;
+  gap: 18px;
+}
+
+.beta-mode .affiliate-application-item {
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.beta-mode .affiliate-application-item p {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .affiliate-application-item .request-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.beta-mode .status-pill {
+  padding: 3px 8px;
+  border-radius: 3px;
+  background: #25252c;
+  color: #c0c0c8;
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.beta-mode .status-pill.pending { color: #fbbf24; }
+.beta-mode .status-pill.approved { color: #4ade80; }
+.beta-mode .status-pill.rejected { color: var(--beta-red-text); }
+
+.beta-mode .affiliate-report-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  align-items: end;
+  gap: 12px;
+}
+
+.beta-mode .affiliate-report-form label {
+  display: grid;
+  gap: 6px;
+  font-weight: 800;
+}
+
+.beta-mode .affiliate-report {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.beta-mode .affiliate-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.beta-mode .affiliate-summary > div {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid #34343b;
+  border-radius: 3px;
+  background: #0d0d11;
+}
+
+.beta-mode .affiliate-summary span {
+  color: var(--beta-muted);
+  font-size: 0.82rem;
+}
+
+.beta-mode .affiliate-summary strong {
+  color: #fff;
+  font-size: 1.15rem;
+}
+
+.beta-mode .affiliate-report-table {
+  display: grid;
+  overflow-x: auto;
+}
+
+.beta-mode .affiliate-report-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 2fr) repeat(5, minmax(90px, 1fr));
+  gap: 8px;
+  padding: 10px 4px;
+  border-bottom: 1px solid #29292f;
+  color: #d8d8de;
+  font-size: 0.88rem;
+}
+
+.beta-mode .affiliate-report-row.header {
+  color: var(--beta-muted);
+  font-weight: 800;
+}
+
+.beta-mode .round-result-current {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
 }

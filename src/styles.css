@@ -497,6 +497,94 @@ a {
   line-height: 1.2;
 }
 
+.affiliate-link-card {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--paper) 92%, var(--brand) 8%);
+}
+
+.affiliate-link-card > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.affiliate-link-card small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.affiliate-link-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.affiliate-link-row input {
+  min-width: 0;
+  font-size: 0.82rem;
+}
+
+.affiliate-link-card.compact {
+  padding: 14px;
+}
+
+.affiliate-application-form {
+  display: grid;
+  gap: 12px;
+}
+
+.affiliate-application-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--zinc-900);
+  font-size: 0.88rem;
+  font-weight: 800;
+}
+
+.affiliate-application-form textarea {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.affiliate-application-form .primary-btn {
+  justify-content: center;
+}
+
+.affiliate-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 11px 12px;
+  border-radius: 8px;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.affiliate-status.pending {
+  background: color-mix(in srgb, #f59e0b 14%, transparent);
+  color: #b45309;
+}
+
+.affiliate-status.rejected {
+  background: color-mix(in srgb, var(--brand) 10%, transparent);
+  color: var(--brand);
+}
+
+@media (max-width: 560px) {
+  .affiliate-link-row {
+    grid-template-columns: 1fr;
+  }
+
+  .affiliate-link-row .small-btn {
+    justify-content: center;
+  }
+}
+
 .profile-row span {
   max-width: 180px;
   overflow: hidden;
@@ -3617,6 +3705,19 @@ textarea:focus {
   color: var(--muted);
   font-size: 0.86rem;
   font-weight: 700;
+}
+
+.room-pool-header .pool-bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.pool-bulk-actions .small-btn {
+  min-height: 34px;
+  padding-inline: 12px;
+  white-space: nowrap;
 }
 
 .compact-save {

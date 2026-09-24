@@ -76,7 +76,7 @@ service cloud.firestore {
       let user = userDoc(uid).data;
       return !("lastTokenRequestAt" in user)
         || !(user.lastTokenRequestAt is timestamp)
-        || request.time >= user.lastTokenRequestAt + duration.value(10, "m");
+        || request.time >= user.lastTokenRequestAt + duration.value(1, "m");
     }
 
     function tokenRequestWindowActive(uid) {
@@ -171,7 +171,6 @@ service cloud.firestore {
             "displayName",
             "photoURL",
             "phoneNumber",
-            "referralCode",
             "ageConfirmed",
             "ageConfirmedAt",
             "updatedAt"
@@ -194,11 +193,6 @@ service cloud.firestore {
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(["phoneNumber"])
           || (request.resource.data.phoneNumber is string
             && request.resource.data.phoneNumber.size() <= 24)
-        )
-        && (
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(["referralCode"])
-          || (request.resource.data.referralCode is string
-            && request.resource.data.referralCode.size() <= 40)
         )
         && (
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(["ageConfirmed"])
@@ -272,11 +266,16 @@ service cloud.firestore {
         || request.time >= userDoc(request.auth.uid).data.lastChatAt + duration.value(3, "s");
     }
 
+    // Each cooldown update names exactly one message, so a batch cannot post several.
     function isChatRateLimitUpdate(uid) {
       return isOwner(uid)
         && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["lastChatAt", "updatedAt"])
+          .hasOnly(["lastChatAt", "lastChatMessageId", "updatedAt"])
         && request.resource.data.lastChatAt == request.time
+        && request.resource.data.lastChatMessageId is string
+        && request.resource.data.lastChatMessageId.size() > 0
+        && request.resource.data.lastChatMessageId.size() <= 40
+        && request.resource.data.updatedAt == request.time
         && chatCooldownPassed();
     }
 
@@ -356,8 +355,13 @@ service cloud.firestore {
           || drawDoc(drawId).data.buyingBlockedRound != request.resource.data.round
         )
         && request.resource.data.targetCardId in drawDoc(drawId).data.poolCardIds
-        && request.resource.data.targetCardName is string
-        && request.resource.data.targetCardImageUrl is string
+        // Name and image come from the card library so buyers cannot relabel a cheap card.
+        && request.resource.data.targetCardName == cardDoc(request.resource.data.targetCardId).data.get("name", "")
+        && request.resource.data.targetCardImageUrl in [
+          cardDoc(request.resource.data.targetCardId).data.get("thumbUrl", ""),
+          cardDoc(request.resource.data.targetCardId).data.get("imageUrl", ""),
+          ""
+        ]
         && request.resource.data.shareMode in ["1/2", "1/5", "1/10"]
         && request.resource.data.shareMode == drawRoundShareMode(drawId, roundId)
         && exists(/databases/$(database)/documents/cards/$(request.resource.data.targetCardId))
@@ -399,9 +403,14 @@ service cloud.firestore {
         && data.keys().hasOnly([
           "uid", "username", "drawId", "drawTitle", "roomSlug", "roomLink",
           "round", "roundSort", "slotId", "number", "tokenCost", "targetCardId",
-          "targetCardName", "targetCardImageUrl", "targetCardValue", "shareMode", "createdAt"
+          "targetCardName", "targetCardImageUrl", "targetCardValue", "shareMode",
+          "affiliateReferrerUid", "createdAt"
         ])
         && data.uid == request.auth.uid
+        // Keep purchases from an older cached web build working. If the optional
+        // attribution field is present it must still match the server-owned profile.
+        && (!("affiliateReferrerUid" in data)
+          || data.affiliateReferrerUid == userDoc(request.auth.uid).data.get("referredByUid", ""))
         && data.slotId is string
         && get(path).data.status == "available"
         && slot.status == "locked"
@@ -416,6 +425,14 @@ service cloud.firestore {
         && slot.targetCardImageUrl == data.targetCardImageUrl
         && slot.targetCardValue == data.targetCardValue
         && slot.shareMode == data.shareMode
+        // Display fields must describe the real room so records cannot impersonate another draw.
+        && data.drawTitle == drawDoc(data.drawId).data.get("title", "")
+        && (data.roomSlug == data.drawId || data.roomSlug == drawDoc(data.drawId).data.get("slug", ""))
+        && data.roomLink is string
+        && data.roomLink.matches("^https?://[A-Za-z0-9.:-]+/?[?]room=" + data.drawId + "$")
+        && data.roundSort is int
+        && data.roundSort >= 0
+        && data.roundSort <= 100000
         && data.createdAt == request.time;
     }
 
@@ -505,71 +522,6 @@ service cloud.firestore {
         && request.resource.data.updatedAt == request.time;
     }
 
-    // Let existing members claim a previously attained tier even when the reward
-    // document predates the claim workflow. The immutable VIP settings and the
-    // admin-controlled deposit total define the exact reward that may be created.
-    function isVipRewardDirectClaim(recordId) {
-      let reward = request.resource.data;
-      let tierIndex = reward.vipTierIndex;
-      let programPath = /databases/$(database)/documents/settings/vipProgram;
-      let tiers = exists(programPath)
-        ? get(programPath).data.tiers
-        : [
-          {"id": "vip0", "name": "VIP0", "threshold": 3000, "rewardCardId": "", "rewardName": "M2 卡包", "rewardImageUrl": "", "rewardConversionValue": 0},
-          {"id": "vip1", "name": "VIP1", "threshold": 10000, "rewardCardId": "", "rewardName": "M2A 卡盒", "rewardImageUrl": "", "rewardConversionValue": 0},
-          {"id": "vip2", "name": "VIP2", "threshold": 30000, "rewardCardId": "", "rewardName": "升級實體卡獎勵", "rewardImageUrl": "", "rewardConversionValue": 0},
-          {"id": "vip3", "name": "VIP3", "threshold": 100000, "rewardCardId": "", "rewardName": "升級實體卡獎勵", "rewardImageUrl": "", "rewardConversionValue": 0},
-          {"id": "vip4", "name": "VIP4", "threshold": 300000, "rewardCardId": "", "rewardName": "升級實體卡獎勵", "rewardImageUrl": "", "rewardConversionValue": 0}
-        ];
-      let tier = tiers[tierIndex];
-      let configuredCardId = tier.get("rewardCardId", "");
-      let expectedCardId = configuredCardId.size() > 0
-        ? configuredCardId
-        : "vip-reward-" + tier.id;
-      return signedIn()
-        && tierIndex is int
-        && tierIndex >= 0
-        && tierIndex < tiers.size()
-        && userDoc(request.auth.uid).data.get("totalDeposits", 0) >= tier.threshold
-        && recordId == "vip_" + request.auth.uid + "_" + tier.id
-        && reward.keys().hasOnly([
-          "source", "vipTierId", "vipTierIndex", "uid", "username",
-          "drawId", "drawTitle", "roomSlug", "roomLink", "round", "roundSort",
-          "number", "tokenCost", "targetCardId", "targetCardName",
-          "targetCardImageUrl", "targetCardValue", "vipRewardStatus", "cardId",
-          "cardName", "cardCategory", "cardImageUrl", "cardValue",
-          "cardConversionValue", "collectionStatus", "unlockedAt", "claimedAt",
-          "createdAt", "updatedAt"
-        ])
-        && reward.source == "vip"
-        && reward.vipTierId == tier.id
-        && reward.uid == request.auth.uid
-        && reward.drawId == "vip-program"
-        && reward.drawTitle == tier.name + " 升級獎勵"
-        && reward.roomSlug == "vip-program"
-        && reward.roomLink == ""
-        && reward.round == "vip-reward"
-        && reward.roundSort == 0
-        && reward.number == tierIndex + 1
-        && reward.tokenCost == 0
-        && reward.targetCardId == expectedCardId
-        && reward.targetCardName == tier.get("rewardName", "VIP 升級獎勵")
-        && reward.targetCardImageUrl == tier.get("rewardImageUrl", "")
-        && reward.targetCardValue == tier.get("rewardConversionValue", 0)
-        && reward.vipRewardStatus == "claimed"
-        && reward.cardId == reward.targetCardId
-        && reward.cardName == reward.targetCardName
-        && reward.cardCategory == "VIP 獎勵"
-        && reward.cardImageUrl == reward.targetCardImageUrl
-        && reward.cardValue == reward.targetCardValue
-        && reward.cardConversionValue == reward.targetCardValue
-        && reward.collectionStatus == "pending"
-        && reward.unlockedAt == request.time
-        && reward.claimedAt == request.time
-        && reward.createdAt == request.time
-        && reward.updatedAt == request.time;
-    }
-
     function isShippingRequest() {
       return signedIn()
         && resource.data.uid == request.auth.uid
@@ -616,12 +568,13 @@ service cloud.firestore {
         && request.resource.data.updatedAt == request.time;
     }
 
-    function isValidRoomMessage(drawId) {
+    function isValidRoomMessage(drawId, messageId) {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
         && drawDoc(drawId).data.status == "live"
         && chatCooldownPassed()
         && afterUserDoc(request.auth.uid).data.lastChatAt == request.time
+        && afterUserDoc(request.auth.uid).data.get("lastChatMessageId", "") == messageId
         && request.resource.data.keys().hasOnly([
           "drawId",
           "source",
@@ -640,13 +593,6 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time;
     }
 
-    function isSafeStorageProofUrl(url, uid) {
-      return url is string
-        && url.size() > 0
-        && url.size() <= 4000
-        && url.matches("https://firebasestorage\\.googleapis\\.com/v0/b/drawcard-26e01\\.firebasestorage\\.app/o/token-proofs%2F" + uid + "%2F[^\\s?#]+(\\?[^\\s]*)?");
-    }
-
     // Preset rates come from protected settings; custom rates use the published tiers.
     function validTokenPricing(data) {
       let settingsPath = /databases/$(database)/documents/settings/tokenPackages;
@@ -657,8 +603,8 @@ service cloud.firestore {
         {"hkd": 30000, "tokens": 35100}
       ]);
       let rateVersion = settings.get("rateVersion", exists(settingsPath) ? 1 : 2);
-      let rate = data.hkdAmount >= 30000 ? 1.17 : data.hkdAmount >= 10000 ? 1.1 : data.hkdAmount >= 3000 ? 1.08 : 1.05;
-      return data.hkdAmount is int && data.hkdAmount >= 500 && data.hkdAmount <= 1000000
+      let rate = data.hkdAmount >= 30000 ? 1.17 : data.hkdAmount >= 10000 ? 1.1 : data.hkdAmount >= 3000 ? 1.08 : data.hkdAmount >= 500 ? 1.05 : 1.0;
+      return data.hkdAmount is int && data.hkdAmount >= 100 && data.hkdAmount <= 1000000
         && data.amount is int && data.amount > 0 && data.amount <= 1000000
         && data.exchangeRate == float(data.amount) / data.hkdAmount
         && (
@@ -766,12 +712,16 @@ service cloud.firestore {
           "adminNote",
           "promoCode",
           "promoCodeId",
+          "affiliateReferrerUid",
           "quotaVersion",
           "createdAt"
         ])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == userDoc(request.auth.uid).data.username
         && request.resource.data.email == userDoc(request.auth.uid).data.email
+        // Existing clients created before affiliate reporting did not send this field.
+        && (!("affiliateReferrerUid" in request.resource.data)
+          || request.resource.data.affiliateReferrerUid == userDoc(request.auth.uid).data.get("referredByUid", ""))
         && request.resource.data.amount is int
         && request.resource.data.amount > 0
         && request.resource.data.amount <= 1000000
@@ -779,42 +729,16 @@ service cloud.firestore {
         && request.resource.data.adminNote == ""
         && request.resource.data.promoCode is string
         && request.resource.data.promoCode.size() <= 80
-        && (
-          (
-            request.resource.data.proofMode == "storage"
-            && request.resource.data.proofPath is string
-            && request.resource.data.proofPath == "token-proofs/" + request.auth.uid + "/" + requestId
-            && request.resource.data.proofFileName is string
-            && request.resource.data.proofFileName.size() > 0
-            && request.resource.data.proofFileName.size() <= 200
-            && request.resource.data.proofUrl == ""
-            && request.resource.data.promoCode == ""
-            && request.resource.data.promoCodeId == ""
-            && request.resource.data.status == "awaiting_upload"
-            && validTokenPricing(request.resource.data)
-          )
-          || (request.resource.data.proofMode == "promo"
-            && request.resource.data.promoCode.size() > 0
-            && request.resource.data.proofPath == ""
-            && request.resource.data.proofFileName == ""
-            && request.resource.data.proofUrl == ""
-            && request.resource.data.status == "pending"
-            && isValidPromoRequest(request.resource.data, requestId))
-        )
-        && request.resource.data.createdAt == request.time;
-    }
-
-    function isTokenProofFinalize() {
-      return signedIn()
-        && resource.data.uid == request.auth.uid
-        && resource.data.quotaVersion == 1
-        && resource.data.proofMode == "storage"
-        && resource.data.status == "awaiting_upload"
-        && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["status", "proofUrl", "uploadedAt"])
+        // Payment requests are created by submitTokenPaymentRequest only after the
+        // proof is stored; clients may create promo-code requests directly.
+        && request.resource.data.proofMode == "promo"
+        && request.resource.data.promoCode.size() > 0
+        && request.resource.data.proofPath == ""
+        && request.resource.data.proofFileName == ""
+        && request.resource.data.proofUrl == ""
         && request.resource.data.status == "pending"
-        && isSafeStorageProofUrl(request.resource.data.proofUrl, request.auth.uid)
-        && request.resource.data.uploadedAt == request.time;
+        && isValidPromoRequest(request.resource.data, requestId)
+        && request.resource.data.createdAt == request.time;
     }
 
     function isValidTokenRequestReview(requestId) {
@@ -844,38 +768,9 @@ service cloud.firestore {
 
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();
-      allow create: if isOwner(uid)
-        && request.resource.data.keys().hasOnly([
-          "uid", "email", "displayName", "photoURL", "username", "tokens",
-          "role", "phoneNumber", "referralCode", "ageConfirmed", "ageConfirmedAt",
-          "createdAt", "updatedAt"
-        ])
-        && request.resource.data.uid == request.auth.uid
-        && (
-          (("email" in request.auth.token) && request.resource.data.email == request.auth.token.email)
-          || (!("email" in request.auth.token) && request.resource.data.email == "")
-        )
-        && request.resource.data.tokens == 0
-        && request.resource.data.role == "user"
-        && request.resource.data.username == ""
-        && request.resource.data.displayName is string
-        && request.resource.data.displayName.size() <= 80
-        && request.resource.data.photoURL is string
-        && request.resource.data.photoURL.size() <= 500
-        && (
-          !("phoneNumber" in request.resource.data)
-          || (request.resource.data.phoneNumber is string
-            && request.resource.data.phoneNumber.size() <= 24)
-        )
-        && (
-          !("referralCode" in request.resource.data)
-          || (request.resource.data.referralCode is string
-            && request.resource.data.referralCode.size() <= 40)
-        )
-        && (
-          !("ageConfirmed" in request.resource.data)
-          || request.resource.data.ageConfirmed == true
-        );
+      // Account creation and affiliate attribution are atomic in ensureAffiliateAccount.
+      // The Admin SDK bypasses rules; clients cannot race a forged profile into place.
+      allow create: if false;
       allow update: if isProfileEdit(uid) ||
         ("lastPurchaseRecordId" in request.resource.data && isTokenSpend(uid)) ||
         ("lastConversionRecordId" in request.resource.data && isCardConversionUserEdit(uid)) ||
@@ -911,8 +806,22 @@ service cloud.firestore {
     match /tokenRequests/{requestId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
       allow create: if isValidTokenRequestCreate(requestId);
-      allow update: if isTokenProofFinalize();
+      // Payment requests are created complete by submitTokenPaymentRequest; clients never update them.
+      allow update: if false;
       allow delete: if false;
+    }
+
+    // Affiliate codes and relationships are server-owned and immutable to every client.
+    match /affiliateCodes/{codeId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /affiliateReferrals/{referralId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /affiliateApplications/{applicationId} {
+      allow read, create, update, delete: if false;
     }
 
     match /promoCodes/{codeId} {
@@ -962,7 +871,7 @@ service cloud.firestore {
 
       match /messages/{messageId} {
         allow read: if signedIn();
-        allow create: if isValidRoomMessage(drawId)
+        allow create: if isValidRoomMessage(drawId, messageId)
           && request.resource.data.source == "draw";
         allow update, delete: if false;
       }
@@ -990,7 +899,8 @@ service cloud.firestore {
 
     match /drawRecords/{recordId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
-      allow create: if isMatchingRoundDrawRecord(recordId) || isVipRewardDirectClaim(recordId);
+      // VIP rewards are issued only by adminReviewTokenRequest after an admin approves a deposit.
+      allow create: if isMatchingRoundDrawRecord(recordId);
       allow update: if isVipRewardClaim() || isCardTokenConversion(recordId) || isShippingRequest();
       allow delete: if false;
     }

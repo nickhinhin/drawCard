@@ -10,7 +10,6 @@ import {
   query,
   runTransaction,
   serverTimestamp,
-  updateDoc,
   where,
   writeBatch,
 } from "firebase/firestore";
@@ -20,15 +19,9 @@ import {
   getAuth,
   signOut,
 } from "firebase/auth";
-import {
-  connectStorageEmulator,
-  getDownloadURL,
-  getStorage,
-  ref as storageRef,
-  uploadBytes,
-} from "firebase/storage";
+import { connectStorageEmulator, getStorage } from "firebase/storage";
 
-const projectId = "drawcard-26e01";
+const projectId = "livedraw-7e3c2";
 const firestorePort = Number(process.env.FIRESTORE_EMULATOR_HOST?.split(":").at(-1) || 8080);
 const authPort = Number(process.env.FIREBASE_AUTH_EMULATOR_HOST?.split(":").at(-1) || 9099);
 const storagePort = Number(process.env.FIREBASE_STORAGE_EMULATOR_HOST?.split(":").at(-1) || 9199);
@@ -186,6 +179,7 @@ async function run() {
           name: `projects/${projectId}/databases/(default)/documents/draws/${drawId}`,
           fields: {
             status: string("live"),
+            title: string("Permission audit room"),
             round: string("round-001"),
             currentRound: integer(1),
             shareMode: string("1/5"),
@@ -271,7 +265,7 @@ async function run() {
         drawId,
         drawTitle: "Permission audit room",
         roomSlug: drawId,
-        roomLink: `/room=${drawId}`,
+        roomLink: `https://livedraw-7e3c2.web.app/?room=${drawId}`,
         round: "round-001",
         roundSort: 1,
         number: 1,
@@ -325,28 +319,24 @@ async function run() {
       tokenRequestWindowCount: 1,
       updatedAt: serverTimestamp(),
     });
-    await quotaBatch.commit();
-
-    const proofRef = storageRef(storage, proofPath);
-    await uploadBytes(
-      proofRef,
-      new Blob(["permission audit"], { type: "image/jpeg" }),
-      { contentType: "image/jpeg" },
-    );
-    await getDownloadURL(proofRef);
-
-    await updateDoc(tokenRequestRef, {
-      status: "pending",
-      proofUrl: `https://firebasestorage.googleapis.com/v0/b/drawcard-26e01.firebasestorage.app/o/token-proofs%2F${uid}%2F${tokenRequestRef.id}?alt=media&token=test`,
-      uploadedAt: serverTimestamp(),
-    });
+    // Payment requests are created by the submitTokenPaymentRequest function only
+    // after the proof is stored, so a browser-created "awaiting_upload" request must fail.
+    let clientPaymentRequestRejected = false;
+    try {
+      await quotaBatch.commit();
+    } catch (error) {
+      clientPaymentRequestRejected = /permission|insufficient/i.test(String(error?.code || error?.message));
+    }
+    if (!clientPaymentRequestRejected) {
+      throw new Error("A browser-created payment request without proof was accepted.");
+    }
 
     await runTransaction(firestore, async (transaction) => {
       const currentUser = await transaction.get(userRef);
       const messageRef = doc(collection(firestore, "draws", drawId, "messages"));
       if (!currentUser.exists()) throw new Error("Test user cannot be reloaded.");
 
-      transaction.update(userRef, { lastChatAt: serverTimestamp(), updatedAt: serverTimestamp() });
+      transaction.update(userRef, { lastChatAt: serverTimestamp(), lastChatMessageId: messageRef.id, updatedAt: serverTimestamp() });
       transaction.set(messageRef, {
         drawId,
         source: "draw",
@@ -366,6 +356,7 @@ async function run() {
           name: `projects/${projectId}/databases/(default)/documents/draws/${scheduledDrawId}`,
           fields: {
             status: string("scheduled"),
+            title: string("Scheduled permission audit room"),
             preorderOpen: boolean(true),
             round: string("round-001"),
             currentRound: integer(1),
@@ -435,7 +426,7 @@ async function run() {
         drawId: scheduledDrawId,
         drawTitle: "Scheduled permission audit room",
         roomSlug: scheduledDrawId,
-        roomLink: `/room=${scheduledDrawId}`,
+        roomLink: `https://livedraw-7e3c2.web.app/?room=${scheduledDrawId}`,
         round: "round-001",
         roundSort: 1,
         number: 1,
@@ -509,7 +500,7 @@ async function run() {
       || slotAfter.data()?.status !== "locked"
       || scheduledSlotAfter.data()?.status !== "locked"
       || recordsAfter.size < 2
-      || requestsAfter.empty
+      || !requestsAfter.empty
       || !duplicateUsernameRejected
     ) {
       throw new Error(`Permission audit completed but persisted data was not correct: ${JSON.stringify({
@@ -526,7 +517,7 @@ async function run() {
       })}`);
     }
 
-    console.log("PASS: username repair, rename and duplicate rejection; live purchase, scheduled preorder, proof upload, token request, record reads, and live chat are allowed by Firebase rules.");
+    console.log("PASS: username repair, rename and duplicate rejection; live purchase, scheduled preorder, record reads, and live chat are allowed; browser-created payment requests without proof are rejected.");
   } finally {
     await signOut(auth).catch(() => undefined);
     await deleteApp(app);

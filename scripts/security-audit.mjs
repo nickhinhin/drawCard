@@ -40,10 +40,14 @@ async function seed(documents) {
   if (!response.ok) throw new Error(await response.text());
 }
 
-const baseUser = { uid, username, email: user.email, role: "user", tokens: 100 };
+const baseUser = {
+  uid, username, email: user.email, role: "user", tokens: 100,
+  affiliateCode: "AFF00000000000000000000", referredByUid: "",
+};
 const baseSlot = { number: 1, round: "round-001", status: "available" };
 const baseDraw = {
   status: "live",
+  title: "Audit Room",
   round: "round-001",
   currentRound: 1,
   shareMode: "1/2",
@@ -52,7 +56,12 @@ const baseDraw = {
   poolCardValues: { card: 10 },
 };
 const purchasedSlot = { ...baseSlot, status: "locked", uid, username, tokenCost: 10, targetCardId: "card", targetCardName: "Card", targetCardImageUrl: "", targetCardValue: 10, shareMode: "1/2" };
-const baseRecord = { uid, username, drawId: "room", round: "round-001", number: 1, tokenCost: 10, targetCardId: "card", targetCardValue: 10, shareMode: "1/2" };
+const baseRecord = {
+  uid, username, drawId: "room", drawTitle: "Audit Room", roomSlug: "room",
+  roomLink: "https://livedraw-7e3c2.web.app/?room=room", roundSort: 1,
+  round: "round-001", number: 1, tokenCost: 10,
+  targetCardId: "card", targetCardValue: 10, shareMode: "1/2", affiliateReferrerUid: "",
+};
 const assignedRecord = { ...baseRecord, cardId: "card", cardValue: 100, cardConversionValue: 80, collectionStatus: "pending" };
 const claimableVipReward = {
   source: "vip", vipTierId: "vip0", uid, username, targetCardId: "card",
@@ -87,6 +96,7 @@ const validRequest = {
   proofMode: "storage", proofPath: `token-proofs/${uid}/receipt.jpg`, proofFileName: "receipt.jpg",
   proofUrl: `https://firebasestorage.googleapis.com/v0/b/demo/o/token-proofs%2F${uid}%2Freceipt.jpg`,
   promoCode: "", promoCodeId: "", status: "pending", adminNote: "",
+  affiliateReferrerUid: "",
 };
 
 function tokenRequestBatch(requestId, overrides = {}, quotaOverrides = {}) {
@@ -154,6 +164,16 @@ try {
     await purchaseBatch().commit();
   });
   await check("Self-promote to administrator", false, () => updateDoc(userRef, { role: "admin" }));
+  await check("Change immutable affiliate owner", false, () => updateDoc(userRef, { referredByUid: "attacker-referrer" }));
+  await check("Change own affiliate code", false, () => updateDoc(userRef, { affiliateCode: "AFF11111111111111111111" }));
+  await check("Forge affiliate code directory", false, () => setDoc(doc(db, "affiliateCodes/AFF11111111111111111111"), { uid, active: true }));
+  await check("Forge affiliate relationship", false, () => setDoc(doc(db, `affiliateReferrals/${uid}`), { refereeUid: uid, referrerUid: "victim" }));
+  await check("Self-approve affiliate application", false, () => updateDoc(userRef, {
+    affiliateStatus: "approved", affiliateCode: "AFF11111111111111111111",
+  }));
+  await check("Bypass affiliate application Function", false, () => setDoc(doc(db, `affiliateApplications/${uid}`), {
+    uid, contact: "attacker@example.test", message: "approve me", status: "approved",
+  }));
   await check("Direct balance increase", false, () => updateDoc(userRef, { tokens: 1000000 }));
   await check("Read another user's profile", false, () => getDoc(doc(db, "users/victim")));
   await check("Read own slots through consolidated history query", true, async () => {
@@ -193,6 +213,9 @@ try {
   await check("Use cheaper global card price instead of room price", false, async () => {
     await seed({ "draws/room": { ...baseDraw, poolCardValues: { card: 100 } } });
     await purchaseBatch().commit();
+  });
+  await check("Attribute purchase to a forged referrer", false, async () => {
+    await purchaseBatch({ extraRecord: { affiliateReferrerUid: "victim" } }).commit();
   });
   await check("Submit inflated tokens with an unvalidated promotion code", false, () => tokenRequestBatch("inflated", {
     uid, username, email: user.email, amount: 1000000, hkdAmount: 500, exchangeRate: 2000, packageType: "preset",
@@ -291,12 +314,15 @@ try {
     await purchaseBatch().commit();
     await setDoc(doc(db, "drawRecords/duplicate"), { ...baseRecord, slotId: "1", targetCardName: "Card", targetCardImageUrl: "", createdAt: serverTimestamp() });
   });
-  await check("Valid paid package application", true, () => tokenRequestBatch("valid").commit());
-  await check("Valid proof finalization", true, async () => {
+  await check("Browser-created payment request without stored proof", false, () => tokenRequestBatch("valid").commit());
+  await check("Attribute deposit to a forged referrer", false, () => tokenRequestBatch("forged-affiliate", {
+    affiliateReferrerUid: "victim",
+  }).commit());
+  await check("Browser finalizes its own payment proof", false, async () => {
     await tokenRequestBatch("proof-finalize").commit();
     await updateDoc(doc(db, "tokenRequests/proof-finalize"), {
       status: "pending",
-      proofUrl: `https://firebasestorage.googleapis.com/v0/b/drawcard-26e01.firebasestorage.app/o/token-proofs%2F${uid}%2Fproof-finalize?alt=media&token=test`,
+      proofUrl: `https://firebasestorage.googleapis.com/v0/b/livedraw-7e3c2.firebasestorage.app/o/token-proofs%2F${uid}%2Fproof-finalize?alt=media&token=test`,
       uploadedAt: serverTimestamp(),
     });
   });
@@ -313,7 +339,7 @@ try {
     await tokenRequestBatch("pending-limit", {}, { pendingTokenRequestCount: 3 }).commit();
   });
   await check("Token request cooldown enforced", false, async () => {
-    const recent = new Date(Date.now() - 60 * 1000);
+    const recent = new Date(Date.now() - 30 * 1000);
     await seed({ [`users/${uid}`]: { ...baseUser, lastTokenRequestAt: recent } });
     await tokenRequestBatch("cooldown").commit();
   });
@@ -325,7 +351,9 @@ try {
       tokenRequestWindowCount: 6,
     }).commit();
   });
-  await check("Valid custom payment application", true, () => tokenRequestBatch("custom", { packageType: "custom", hkdAmount: 2000, amount: 2100, exchangeRate: 1.05 }).commit());
+  await check("Browser-created HK$100 custom payment request", false, () => tokenRequestBatch("custom-minimum", { packageType: "custom", hkdAmount: 100, amount: 100, exchangeRate: 1 }).commit());
+  await check("Custom payment below HK$100 is rejected", false, () => tokenRequestBatch("custom-too-low", { packageType: "custom", hkdAmount: 99, amount: 99, exchangeRate: 1 }).commit());
+  await check("Browser-created HK$500 custom payment request", false, () => tokenRequestBatch("custom-bonus", { packageType: "custom", hkdAmount: 500, amount: 525, exchangeRate: 1.05 }).commit());
   await check("Inflated application with receipt rejected", false, () => tokenRequestBatch("receipt-inflated", { amount: 1000000, exchangeRate: 2000 }).commit());
   await check("Code-only application awaits manual review", true, () => tokenRequestBatch("promo-only", {
     proofMode: "promo", promoCode: "BONUS-525", promoCodeId: "BONUS-525",
@@ -425,15 +453,17 @@ try {
       await batch.commit();
     });
   }
-  await check("Configured package price accepted", true, async () => {
+  await check("Browser-created configured-package payment request", false, async () => {
     await seed({ "settings/tokenPackages": { rateVersion: 2, packages: [{ hkd: 500, tokens: 600 }] } });
     await tokenRequestBatch("configured", { amount: 600, exchangeRate: 1.2 }).commit();
   });
   await check("Old default cannot override configured price", false, () => tokenRequestBatch("stale").commit());
-  await check("Legacy package rates remain compatible", true, async () => {
+  await check("Browser-created legacy-rate payment request", false, async () => {
     await seed({ "settings/tokenPackages": { packages: [{ hkd: 500, tokens: 1050 }] } });
     await tokenRequestBatch("legacy-rate").commit();
   });
+  // Payment requests are created only by submitTokenPaymentRequest after the proof is stored;
+  // its pricing is covered by functions/test.
   await check("Profile edits remain allowed", true, () => updateDoc(userRef, { displayName: "Audit Player", updatedAt: serverTimestamp() }));
   await check("Authenticated username directory enumeration", false, () => getDocs(collection(db, "usernames")));
   await signOut(auth);

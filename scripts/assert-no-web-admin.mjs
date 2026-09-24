@@ -1,22 +1,33 @@
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import path from "node:path";
 
-const forbidden = ["管理後台", "代幣審批", "付款設定", "直播結果派發"];
+// The admin workspace ships only from the separate admin Hosting site.
+// Fail the public build if any admin-only UI or endpoint leaks into dist/.
+const publicDir = "dist";
+const adminMarkers = [
+  "LiveDraw 管理後台",
+  "adminReviewTokenRequest",
+  "adminBatchWrite",
+  "adminUploadImage",
+  "adminEnsureDrawSlots",
+];
 
-async function filesUnder(directory) {
-  const entries = await readdir(directory, { withFileTypes: true });
+async function listFiles(dir) {
+  const entries = await readdir(dir, { withFileTypes: true });
   const nested = await Promise.all(entries.map((entry) => {
-    const path = join(directory, entry.name);
-    return entry.isDirectory() ? filesUnder(path) : [path];
+    const fullPath = path.join(dir, entry.name);
+    return entry.isDirectory() ? listFiles(fullPath) : [fullPath];
   }));
   return nested.flat();
 }
 
-const files = (await filesUnder("dist")).filter((path) => /\.(js|html|css)$/.test(path));
+const files = (await listFiles(publicDir)).filter((file) => /\.(js|html)$/.test(file));
 for (const file of files) {
-  const source = await readFile(file, "utf8");
-  const match = forbidden.find((label) => source.includes(label));
-  if (match) throw new Error(`公開網站 bundle 仍包含管理後台內容：${match} (${file})`);
+  const content = await readFile(file, "utf8");
+  const leaked = adminMarkers.find((marker) => content.includes(marker));
+  if (leaked) {
+    throw new Error(`公開網站建置包含管理後台代碼（${leaked}）：${file}`);
+  }
 }
 
-console.log("公開網站 bundle 已確認不包含管理後台入口或管理頁文字。");
+console.log("已確認公開網站建置不包含管理後台。");

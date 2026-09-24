@@ -25,7 +25,7 @@ const require = createRequire(import.meta.url);
 const firebaseToolsAuth = require("/usr/local/lib/node_modules/firebase-tools/lib/auth.js");
 const firebaseToolsApi = require("/usr/local/lib/node_modules/firebase-tools/lib/apiv2.js");
 
-const PROJECT_ID = "drawcard-26e01";
+const PROJECT_ID = "livedraw-7e3c2";
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBJEFwKf6hGSEv0gR-amTuKk0FJ7igNGE4",
   authDomain: `${PROJECT_ID}.firebaseapp.com`,

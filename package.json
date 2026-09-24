@@ -4,10 +4,12 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "dev:beta": "vite --mode beta",
-    "build": "vite build && node scripts/assert-no-web-admin.mjs",
-    "build:beta": "vite build --mode beta && node scripts/assert-no-web-admin.mjs",
+    "dev": "vite --mode beta",
+    "dev:admin": "VITE_ADMIN_SITE=true vite --mode beta",
+    "build": "vite build --mode beta && node scripts/assert-no-web-admin.mjs",
+    "build:admin": "VITE_ADMIN_SITE=true vite build --mode beta --outDir dist-admin",
+    "deploy:web": "npm run build && firebase deploy --config firebase.beta-hosting.json --project livedraw-7e3c2 --only hosting:livedraw-7e3c2",
+    "deploy:admin": "npm run build:admin && firebase deploy --config firebase.beta-hosting.json --project livedraw-7e3c2 --only hosting:livedraw-adminpage-7e3c2",
     "preview": "vite preview",
     "lint": "eslint ."
   },

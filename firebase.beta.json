@@ -1,6 +1,6 @@
 {
   "hosting": {
-    "site": "drawcard-26e01-beta",
+    "site": "livedraw-7e3c2",
     "public": "dist",
     "ignore": ["firebase.beta.json", "**/.*", "**/node_modules/**"],
     "headers": [
