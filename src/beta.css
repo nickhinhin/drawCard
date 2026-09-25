@@ -6203,3 +6203,106 @@
 .beta-mode .change-password-card {
   margin-top: 18px;
 }
+
+/* Live monitor error cards: what went wrong, what to do, and the raw details. */
+.beta-mode .monitor-error {
+  display: grid;
+  gap: 6px;
+}
+
+.beta-mode .monitor-error-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.beta-mode .monitor-error-head strong {
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .monitor-error-kind {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid #3a3a42;
+  border-radius: 999px;
+  color: #c8c8cd;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.beta-mode .monitor-error-kind.needs-fix {
+  border-color: var(--beta-red);
+  color: #ff6b81;
+}
+
+.beta-mode .monitor-error-message {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .monitor-error-hint {
+  margin: 0;
+  color: #b8b8c0;
+  font-size: 13px;
+}
+
+.beta-mode .monitor-error details summary {
+  cursor: pointer;
+  color: #e9e9eb;
+  font-size: 13px;
+}
+
+.beta-mode .monitor-error-details {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 8px 0;
+  font-size: 12px;
+}
+
+.beta-mode .monitor-error-details dt {
+  color: #8a8a93;
+}
+
+.beta-mode .monitor-error-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .monitor-error-stack {
+  max-height: 220px;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid #2a2a30;
+  border-radius: 3px;
+  background: #0b0b0f;
+  color: #d6d6db;
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .monitor-error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.beta-mode .monitor-error-actions a {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  text-decoration: none;
+}
+
+@media print {
+  .beta-mode .monitor-error-actions { display: none; }
+}
+
+/* Error lists show every card in full instead of scrolling inside a box. */
+.beta-mode .audit-findings:has(.monitor-error) {
+  max-height: none;
+  overflow: visible;
+}

@@ -3648,7 +3648,8 @@ function BetaPsaCarousel({ cards, rooms, onOpenRoom, onSelectCard }) {
                   <strong title={card.name}>{card.name}</strong>
                   <div className="beta-psa-price">
                     <del><TokenAmount value={card.tokenValue} /></del>
-                    <b><TokenAmount value={Math.max(1, Math.round(card.tokenValue / 10))} /></b>
+                    {/* The highlighted price is what one share costs in a 十分之一 round. */}
+                    <b><TokenAmount value={getCardTokenValue(card, "1/10")} /></b>
                   </div>
                 </button>
               ))}
@@ -6698,6 +6699,137 @@ function formatClock(value) {
   return Number.isNaN(time.getTime()) ? "--" : time.toLocaleTimeString("zh-HK", { hour12: false });
 }
 
+// Plain-language guess at what kind of problem an error is and what to do about it.
+const MONITOR_ERROR_KINDS = [
+  { test: /before initialization|is not defined|is not a function|Cannot read propert|Cannot set propert|undefined is not|null is not|TypeError|ReferenceError|SyntaxError/i,
+    label: "程式錯誤", hint: "網站程式出錯，需要修正程式。撳「複製錯誤資料」貼俾工程師。", fix: true },
+  { test: /ChunkLoadError|Loading chunk|dynamically imported module|Importing a module script failed/i,
+    label: "舊版網頁", hint: "玩家開緊舊版網頁（啱啱更新過）。叫玩家重新整理頁面就會好。" },
+  { test: /permission-denied|Missing or insufficient permissions|權限/i,
+    label: "權限被拒", hint: "Firestore 規則或者帳戶權限擋咗呢個操作。如果係正常玩家操作都被擋，就要修改規則。", fix: true },
+  { test: /unauthenticated|App Check|請先登入|HTTP 401/i,
+    label: "登入／驗證失效", hint: "登入過期或者 App Check 驗證失敗。多數叫玩家重新登入或重新整理就得；如果好多人同時出現，就要檢查 App Check 設定。" },
+  { test: /resource-exhausted|quota|Quota|HTTP 429|too-many-requests|嘗試次數過多/i,
+    label: "流量／配額上限", hint: "用量撞到上限（例如 SMS 或 API 配額）。去 Firebase console 檢查用量同配額。", fix: true },
+  { test: /deadline-exceeded|timeout|timed out|逾時/i,
+    label: "逾時", hint: "伺服器處理得太慢。如果持續出現，可能要加大 function 記憶體或者減少一次處理嘅資料量。" },
+  { test: /unavailable|network|Failed to fetch|offline|Load failed|NetworkError|網絡/i,
+    label: "網絡問題", hint: "多數係玩家網絡唔穩定，唔使改程式。如果同一時間好多人出現，就檢查 Firebase 狀態。" },
+  { test: /failed-precondition|already-exists|invalid-argument|not-found|已被|不足|已經/i,
+    label: "資料狀態", hint: "操作同資料狀態唔夾（例如號碼已被買、餘額不足）。通常屬正常情況；如果玩家覺得唔合理就要跟進。" },
+  { test: /HTTP 5\d\d|internal|Error:/i,
+    label: "伺服器錯誤", hint: "伺服器程式出錯。撳「查看完整日誌」睇詳細內容，或者複製錯誤資料俾工程師。", fix: true },
+];
+
+function formatMonitorTime(value) {
+  const time = new Date(value);
+  return Number.isNaN(time.getTime()) ? "--" : time.toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong", hour12: false });
+}
+
+function explainMonitorError(item) {
+  const text = `${item.code || ""} ${item.message || ""} ${item.detail || ""}`;
+  return MONITOR_ERROR_KINDS.find((kind) => kind.test.test(text))
+    || { label: "未分類", hint: "睇下面詳細資料；唔肯定就複製錯誤資料俾工程師。" };
+}
+
+function monitorLogsUrl(item, source) {
+  const query = source === "client"
+    ? `jsonPayload.clientErrorType="livedraw-client-error"\njsonPayload.message:"${String(item.message || "").slice(0, 60).replace(/"/g, "\\\"")}"`
+    : `resource.type="cloud_run_revision"\nresource.labels.service_name="${item.service}"\nseverity>=WARNING`;
+  const start = new Date(new Date(item.firstSeen || item.lastSeen).getTime() - 60000);
+  const end = new Date(new Date(item.lastSeen || item.firstSeen).getTime() + 60000);
+  const range = Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) ? "PT6H" : `${start.toISOString()}/${end.toISOString()}`;
+  return `https://console.cloud.google.com/logs/query;query=${encodeURIComponent(query)};timeRange=${encodeURIComponent(range)}?project=livedraw-7e3c2`;
+}
+
+function monitorErrorText(item, source) {
+  const kind = explainMonitorError(item);
+  const lines = source === "client"
+    ? [
+      `【玩家端錯誤】${item.message}`,
+      `類型：${kind.label}`,
+      `錯誤碼：${item.code || "（冇）"}`,
+      `次數：${item.count} 次 · ${item.users} 位用戶`,
+      `時間：${formatMonitorTime(item.firstSeen)} 至 ${formatMonitorTime(item.lastSeen)}`,
+      `位置：${(item.places || [item.where]).filter(Boolean).join("、") || "--"}`,
+      `頁面：${(item.pages || []).join("、") || "--"}`,
+      `裝置：${(item.devices || []).join("、") || "--"}`,
+      `網站：${(item.sites || []).join("、") || "--"}`,
+      `用戶 ID：${(item.userIds || []).join("、") || "--"}`,
+      item.stack ? `程式位置：\n${item.stack}` : "",
+    ]
+    : [
+      `【伺服器${item.severity === "WARNING" ? "警告" : "錯誤"}】${item.service}`,
+      `類型：${kind.label}`,
+      `次數：${item.count} 次`,
+      `時間：${formatMonitorTime(item.firstSeen)} 至 ${formatMonitorTime(item.lastSeen)}`,
+      `內容：\n${item.detail || item.message}`,
+    ];
+  return lines.filter(Boolean).join("\n");
+}
+
+function MonitorErrorCard({ item, source }) {
+  const [copied, setCopied] = useState(false);
+  const kind = explainMonitorError(item);
+  const isWarning = source === "server" && item.severity === "WARNING";
+  const title = source === "client" ? item.message : `${item.service} · ${isWarning ? "警告" : "錯誤"}`;
+
+  async function copyDetails() {
+    try {
+      await navigator.clipboard.writeText(monitorErrorText(item, source));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      window.prompt("複製以下錯誤資料：", monitorErrorText(item, source));
+    }
+  }
+
+  return (
+    <article className={`audit-finding monitor-error ${isWarning ? "medium" : "high"}`}>
+      <div className="monitor-error-head">
+        <span className={`monitor-error-kind${kind.fix ? " needs-fix" : ""}`}>{kind.label}</span>
+        <strong>{title}</strong>
+      </div>
+      {source === "server" && <p className="monitor-error-message">{item.message}</p>}
+      <p className="monitor-error-hint">{kind.hint}</p>
+      <small>
+        {item.count} 次{source === "client" ? ` · ${item.users} 位用戶` : ""} · 首次 {formatClock(item.firstSeen)} · 最後 {formatClock(item.lastSeen)}
+      </small>
+      <details>
+        <summary>詳細資料</summary>
+        <dl className="monitor-error-details">
+          {source === "client" ? (
+            <>
+              <dt>錯誤碼</dt><dd>{item.code || "（冇）"}</dd>
+              <dt>發生位置</dt><dd>{(item.places?.length ? item.places : [item.where]).filter(Boolean).join("、") || "--"}</dd>
+              <dt>頁面</dt><dd>{item.pages?.join("、") || "--"}</dd>
+              <dt>裝置</dt><dd>{item.devices?.join("、") || "--"}</dd>
+              <dt>網站</dt><dd>{item.sites?.map((site) => (site === "admin" ? "管理後台" : "玩家網站")).join("、") || "--"}</dd>
+              <dt>用戶 ID</dt><dd>{item.userIds?.join("、") || "--"}</dd>
+            </>
+          ) : (
+            <>
+              <dt>服務</dt><dd>{item.service}</dd>
+              <dt>嚴重程度</dt><dd>{item.severity}</dd>
+            </>
+          )}
+        </dl>
+        {(source === "client" ? item.stack : item.detail) && (
+          <pre className="monitor-error-stack">{source === "client" ? item.stack : item.detail}</pre>
+        )}
+      </details>
+      <div className="monitor-error-actions">
+        <button className="small-btn" type="button" onClick={copyDetails}>
+          <Copy size={14} />{copied ? "已複製" : "複製錯誤資料"}
+        </button>
+        <a className="small-btn" href={monitorLogsUrl(item, source)} target="_blank" rel="noreferrer">
+          <ExternalLink size={14} />查看完整日誌
+        </a>
+      </div>
+    </article>
+  );
+}
+
 // Real-time dashboard shown only while a monitor session is running.
 function LiveMonitorDashboard({ session, onStop, stopping }) {
   const sessionStartMs = toMillis(session.startedAt) || Date.now();
@@ -6866,18 +6998,11 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
               <p className="muted">更新時間：{formatClock(health.checkedAt)} · 玩家端錯誤 {health.clientErrorCount >= 1000 ? "1000+" : health.clientErrorCount} · 伺服器錯誤 {health.serverErrorCount} · 警告 {health.serverWarningCount >= 500 ? "500+" : health.serverWarningCount}</p>
               <h4>玩家端錯誤</h4>
               {health.clientErrors.length ? health.clientErrors.map((item) => (
-                <article className="audit-finding high" key={`${item.code}-${item.message}`}>
-                  <strong>{item.message}</strong>
-                  <small>{item.count} 次 · {item.users} 位用戶 · {item.code || "no code"} · {item.where} · 最後 {formatClock(item.lastSeen)}</small>
-                </article>
+                <MonitorErrorCard item={item} source="client" key={`${item.code}-${item.message}`} />
               )) : <p className="muted">冇玩家端錯誤。</p>}
               <h4>伺服器錯誤及警告</h4>
               {health.serverErrors.length ? health.serverErrors.map((item) => (
-                <article className={`audit-finding ${item.severity === "WARNING" ? "medium" : "high"}`} key={`${item.service}-${item.severity}-${item.message}`}>
-                  <strong>{item.service} · {item.severity}</strong>
-                  <p>{item.message}</p>
-                  <small>{item.count} 次 · 最後 {formatClock(item.lastSeen)}</small>
-                </article>
+                <MonitorErrorCard item={item} source="server" key={`${item.service}-${item.severity}-${item.message}`} />
               )) : <p className="muted">冇伺服器錯誤。</p>}
             </>
           ) : healthError ? <p className="error-note">{healthError}</p> : <InlineLoading label="正在讀取錯誤紀錄..." />}
@@ -6911,8 +7036,8 @@ function downloadMonitorReport(session) {
   add("配送", "配送申請", report.shippingRequests);
   add("錯誤", "玩家端錯誤", report.errors?.clientErrorCount ?? "未能讀取");
   add("錯誤", "伺服器錯誤", report.errors?.serverErrorCount ?? "未能讀取");
-  (report.errors?.clientErrors || []).forEach((item) => add("玩家端錯誤", item.message, `${item.count} 次 · ${item.users} 位用戶`));
-  (report.errors?.serverErrors || []).forEach((item) => add("伺服器錯誤", `${item.service} ${item.severity}`, `${item.count} 次 · ${item.message}`));
+  (report.errors?.clientErrors || []).forEach((item) => add("玩家端錯誤", item.message, monitorErrorText(item, "client")));
+  (report.errors?.serverErrors || []).forEach((item) => add("伺服器錯誤", `${item.service} ${item.severity}`, monitorErrorText(item, "server")));
   (report.audit?.findings || []).forEach((item) => add("可疑活動", `${AUDIT_SEVERITY_LABELS[item.severity]} · ${item.title}`, item.detail));
   const day = formatClock(session.startedAt).replace(/[^\d]/g, "");
   downloadTextFile(`live-monitor-report-${new Intl.DateTimeFormat("en-CA").format(new Date(toMillis(session.startedAt)))}-${day}.csv`, createCsvText(["部分", "項目", "數值"], rows));
@@ -6969,9 +7094,12 @@ function MonitorReportView({ session, onClose }) {
           <h4>錯誤</h4>
           {report.errors?.unavailable ? <p className="error-note">未能讀取錯誤紀錄。</p> : (
             <div className="audit-findings">
-              {[...(report.errors?.clientErrors || []).map((item) => ({ key: `c-${item.message}`, title: `玩家端 · ${item.message}`, detail: `${item.count} 次 · ${item.users} 位用戶` })),
-                ...(report.errors?.serverErrors || []).map((item) => ({ key: `s-${item.service}-${item.message}`, title: `${item.service} · ${item.severity}`, detail: `${item.count} 次 · ${item.message}` }))]
-                .map((item) => <article className="audit-finding high" key={item.key}><strong>{item.title}</strong><small>{item.detail}</small></article>)}
+              {(report.errors?.clientErrors || []).map((item) => (
+                <MonitorErrorCard item={item} source="client" key={`c-${item.code}-${item.message}`} />
+              ))}
+              {(report.errors?.serverErrors || []).map((item) => (
+                <MonitorErrorCard item={item} source="server" key={`s-${item.service}-${item.severity}-${item.message}`} />
+              ))}
               {!report.errors?.clientErrors?.length && !report.errors?.serverErrors?.length && <p className="muted">冇錯誤。</p>}
             </div>
           )}

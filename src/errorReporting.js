@@ -10,6 +10,12 @@ const IGNORED = [/ResizeObserver loop/i, /chrome-extension:\/\//i, /Script error
 const lastSent = new Map();
 let reportsSent = 0;
 
+// Path plus the room being viewed; other query values are left out.
+function currentPage() {
+  const room = new URLSearchParams(window.location.search).get("room");
+  return `${window.location.pathname}${room ? `?room=${room.slice(0, 60)}` : ""}`;
+}
+
 export function reportClientError(error, where = "") {
   try {
     const message = String(error?.message || error || "").slice(0, 300);
@@ -24,7 +30,8 @@ export function reportClientError(error, where = "") {
       message,
       code,
       where: String(where).slice(0, 80),
-      page: window.location.pathname,
+      page: currentPage(),
+      stack: String(error?.stack || "").slice(0, 1500),
       site: IS_ADMIN_SITE ? "admin" : "public",
       userAgent: navigator.userAgent,
     }).catch(() => {});

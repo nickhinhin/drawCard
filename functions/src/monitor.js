@@ -2,6 +2,21 @@
 export const CLIENT_ERROR_TYPE = "livedraw-client-error";
 
 const clean = (value, max) => String(value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+// Keeps line breaks (stack traces) but drops other control characters.
+// eslint-disable-next-line no-control-regex
+const cleanMultiline = (value, max) => String(value ?? "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim().slice(0, max);
+const CLIENT_ERROR_PREFIX = "client error: ";
+
+// Short device / browser label from a user agent, e.g. "iPhone · Safari".
+export function summarizeUserAgent(userAgent = "") {
+  const ua = String(userAgent);
+  const device = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android"
+    : /Windows/.test(ua) ? "Windows" : /Macintosh|Mac OS X/.test(ua) ? "Mac" : "其他裝置";
+  const browser = /FBAN|FBAV|Instagram|Line\//.test(ua) ? "App 內置瀏覽器" : /Edg\//.test(ua) ? "Edge"
+    : /CriOS|Chrome\//.test(ua) ? "Chrome" : /FxiOS|Firefox\//.test(ua) ? "Firefox"
+      : /Safari\//.test(ua) ? "Safari" : "其他瀏覽器";
+  return `${device} · ${browser}`;
+}
 
 // Keeps only safe, bounded fields from a browser error report.
 export function sanitizeClientError(data = {}, uid = "") {
@@ -14,6 +29,7 @@ export function sanitizeClientError(data = {}, uid = "") {
     site: data.site === "admin" ? "admin" : "public",
     appVersion: clean(data.appVersion, 40),
     userAgent: clean(data.userAgent, 200),
+    stack: cleanMultiline(data.stack, 1500),
     uid: clean(uid, 128),
   };
 }
@@ -40,22 +56,37 @@ export function groupClientErrors(entries) {
   const groups = new Map();
   for (const entry of entries) {
     const payload = entry.jsonPayload || {};
-    const key = `${payload.code}|${payload.message}`;
+    const message = String(payload.message || "").replace(CLIENT_ERROR_PREFIX, "");
+    const key = `${payload.code}|${message}`;
     if (!groups.has(key)) {
       groups.set(key, {
-        message: payload.message || "", code: payload.code || "", where: payload.where || "",
-        count: 0, users: new Set(), sites: new Set(), lastSeen: "", firstSeen: entry.timestamp,
+        message, code: payload.code || "", where: payload.where || "",
+        count: 0, users: new Set(), sites: new Set(), places: new Set(), pages: new Set(), devices: new Set(),
+        stack: "", lastSeen: "", firstSeen: entry.timestamp,
       });
     }
     const group = groups.get(key);
     group.count += 1;
     if (payload.uid) group.users.add(payload.uid);
     group.sites.add(payload.site || "public");
+    if (payload.where) group.places.add(payload.where);
+    if (payload.page) group.pages.add(payload.page);
+    if (payload.userAgent) group.devices.add(summarizeUserAgent(payload.userAgent));
+    // Entries arrive newest first, so the first stack seen is the latest one.
+    if (!group.stack && payload.stack) group.stack = payload.stack;
     if (!group.lastSeen || entry.timestamp > group.lastSeen) group.lastSeen = entry.timestamp;
     if (entry.timestamp < group.firstSeen) group.firstSeen = entry.timestamp;
   }
   return [...groups.values()]
-    .map((group) => ({ ...group, users: group.users.size, sites: [...group.sites] }))
+    .map(({ users, sites, places, pages, devices, ...group }) => ({
+      ...group,
+      users: users.size,
+      userIds: [...users].slice(0, 10),
+      sites: [...sites],
+      places: [...places].slice(0, 5),
+      pages: [...pages].slice(0, 5),
+      devices: [...devices].slice(0, 5),
+    }))
     .sort((left, right) => right.count - left.count);
 }
 
@@ -64,16 +95,23 @@ export function groupServerErrors(entries) {
   const groups = new Map();
   for (const entry of entries) {
     const service = entry.resource?.labels?.service_name || entry.resource?.labels?.function_name || "unknown";
-    const text = clean(
-      entry.textPayload || entry.jsonPayload?.message || entry.jsonPayload?.error
-        || JSON.stringify(entry.jsonPayload || entry.protoPayload?.status || {}),
-      240,
-    );
+    const request = entry.httpRequest;
+    // Request logs have no text: describe the failed call instead of showing "{}".
+    const raw = entry.textPayload || entry.jsonPayload?.message || entry.jsonPayload?.error
+      || (request ? `HTTP ${request.status} ${request.requestMethod || ""} ${String(request.requestUrl || "").replace(/^https?:\/\/[^/]+/, "").split("?")[0]}`
+        : JSON.stringify(entry.jsonPayload || entry.protoPayload?.status || {}));
+    const text = clean(raw, 240);
     const key = `${service}|${entry.severity}|${text.slice(0, 120)}`;
-    if (!groups.has(key)) groups.set(key, { service, severity: entry.severity, message: text, count: 0, lastSeen: "" });
+    if (!groups.has(key)) {
+      groups.set(key, {
+        service, severity: entry.severity, message: text, detail: cleanMultiline(raw, 2000),
+        count: 0, lastSeen: "", firstSeen: entry.timestamp,
+      });
+    }
     const group = groups.get(key);
     group.count += 1;
     if (!group.lastSeen || entry.timestamp > group.lastSeen) group.lastSeen = entry.timestamp;
+    if (entry.timestamp < group.firstSeen) group.firstSeen = entry.timestamp;
   }
   return [...groups.values()].sort((left, right) => right.count - left.count);
 }

@@ -37,6 +37,32 @@ test("client and server errors are grouped with counts", () => {
   assert.deepEqual([server[0].service, server[0].count], ["adminbatchwrite", 2]);
 });
 
+test("error groups keep the details needed for a hotfix", async () => {
+  const { summarizeUserAgent } = await import("../src/monitor.js");
+  const iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1";
+  assert.equal(summarizeUserAgent(iphone), "iPhone · Safari");
+  const report = sanitizeClientError({ message: "x", stack: "TypeError: x\n    at App (a.js:1:2)\u0007" }, "u1");
+  assert.equal(report.stack, "TypeError: x\n    at App (a.js:1:2)");
+  const [client] = groupClientErrors([
+    { timestamp: "2026-09-24T01:05:00Z", jsonPayload: { message: "client error: Cannot read x", uid: "u2", where: "purchase", page: "/?room=a", userAgent: iphone, stack: "latest" } },
+    { timestamp: "2026-09-24T01:00:00Z", jsonPayload: { message: "client error: Cannot read x", uid: "u1", where: "window.error", page: "/", stack: "older" } },
+  ]);
+  assert.equal(client.message, "Cannot read x");
+  assert.deepEqual(client.userIds, ["u2", "u1"]);
+  assert.deepEqual(client.places, ["purchase", "window.error"]);
+  assert.deepEqual(client.devices, ["iPhone · Safari"]);
+  assert.equal(client.stack, "latest");
+  assert.equal(client.firstSeen, "2026-09-24T01:00:00Z");
+  const [server] = groupServerErrors([
+    { timestamp: "t1", severity: "ERROR", resource: { labels: { service_name: "adminbatchwrite" } },
+      httpRequest: { status: 500, requestMethod: "POST", requestUrl: "https://x.run.app/adminBatchWrite?x=1" } },
+    { timestamp: "t2", severity: "ERROR", resource: { labels: { service_name: "purchase" } }, textPayload: "Error: boom\n    at run (index.js:9:1)" },
+  ]);
+  assert.equal(server.message, "HTTP 500 POST /adminBatchWrite");
+  const stackGroup = groupServerErrors([{ timestamp: "t2", severity: "ERROR", textPayload: "Error: boom\n    at run (index.js:9:1)" }])[0];
+  assert.equal(stackGroup.detail, "Error: boom\n    at run (index.js:9:1)");
+});
+
 test("monitor report summarises sales, token requests and wait times", async () => {
   const { buildMonitorReport } = await import("../src/monitor.js");
   const start = Date.parse("2026-09-24T12:00:00Z");
