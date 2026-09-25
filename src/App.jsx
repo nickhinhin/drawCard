@@ -280,6 +280,11 @@ function getCardModePrices(card) {
   };
 }
 
+function cardHasPrices(card, prices) {
+  return Number(card?.tokenValue) === prices.half
+    && ["half", "fifth", "tenth"].every((key) => Number(card?.modePrices?.[key]) === prices[key]);
+}
+
 function normalizeManualCardPrices(prices) {
   const normalized = Object.fromEntries(
     ["half", "fifth", "tenth"].map((key) => {
@@ -10031,7 +10036,9 @@ function CreateCardForm({ cards, profile }) {
         hellCard.conversionValue ?? hellCard.tokenValue ?? 0,
         rate,
       );
-      if (prices) pricesById.set(card.id, prices);
+      // Only cards whose price actually changes are rewritten, so saving one card
+      // does not rewrite (and re-audit) the whole library.
+      if (prices && !cardHasPrices(card, prices)) pricesById.set(card.id, prices);
     });
 
     const writes = [];

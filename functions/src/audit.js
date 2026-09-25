@@ -1,5 +1,9 @@
 import { logger } from "firebase-functions";
-import { onDocumentWrittenWithAuthContext } from "firebase-functions/v2/firestore";
+import {
+  onDocumentDeletedWithAuthContext,
+  onDocumentUpdatedWithAuthContext,
+  onDocumentWrittenWithAuthContext,
+} from "firebase-functions/v2/firestore";
 
 // Tamper-evident data-change log. Every write to the collections below — from
 // players, admin functions or the Firebase console — produces one structured
@@ -118,12 +122,16 @@ export const auditAffiliateCodes = auditTrigger("affiliateCodes/{codeId}");
 export const auditAffiliateReferrals = auditTrigger("affiliateReferrals/{referralId}");
 
 // Admin audit documents are written once by functions; any later edit or
-// deletion of them is itself suspicious and gets logged.
-export const auditAdminAuditLogs = onDocumentWrittenWithAuthContext(
-  { ...auditOptions, document: "adminAuditLogs/{auditId}" },
-  (event) => {
-    const entry = auditEntry(event);
-    if (entry.operation === "create") return;
+// deletion of them is itself suspicious and gets logged. Separate update and
+// delete triggers mean the many normal creates do not invoke a function at all.
+function adminAuditLogTrigger(trigger) {
+  return trigger({ ...auditOptions, document: "adminAuditLogs/{auditId}" }, (event) => {
+    // Delete events carry the removed snapshot itself rather than a before/after change.
+    const data = "before" in (event.data || {}) ? event.data : { before: event.data, after: { exists: false } };
+    const entry = auditEntry({ ...event, data });
     logger.write({ severity: "WARNING", message: `${entry.operation} ${entry.path}`, ...entry });
-  },
-);
+  });
+}
+
+export const auditAdminAuditLogUpdates = adminAuditLogTrigger(onDocumentUpdatedWithAuthContext);
+export const auditAdminAuditLogDeletes = adminAuditLogTrigger(onDocumentDeletedWithAuthContext);

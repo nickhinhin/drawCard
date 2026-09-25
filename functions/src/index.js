@@ -955,11 +955,15 @@ export const adminRecalculateCardPrices = onCall(adminCallableOptions, async (re
     const heavenValue = Number(card.conversionValue ?? card.tokenValue ?? 0);
     const hellValue = Number(hell.conversionValue ?? hell.tokenValue ?? 0);
     if (![heavenValue, hellValue].every(Number.isFinite)) return;
-    prices.set(item.id, {
+    const next = {
       half: roundPrice((heavenValue * 0.5 + hellValue * 0.5) * marginRate),
       fifth: roundPrice((heavenValue * 0.2 + hellValue * 0.8) * marginRate),
       tenth: roundPrice((heavenValue * 0.1 + hellValue * 0.9) * marginRate),
-    });
+    };
+    // Unchanged cards are skipped so a recalculation only writes (and audits) real price changes.
+    const unchanged = Number(card.tokenValue) === next.half
+      && ["half", "fifth", "tenth"].every((key) => Number(card.modePrices?.[key]) === next[key]);
+    if (!unchanged) prices.set(item.id, next);
   });
 
   const writes = [];
