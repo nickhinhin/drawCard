@@ -1291,6 +1291,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
   const [useSmsLogin, setUseSmsLogin] = useState(false);
   const [password, setPassword] = useState("");
   const [authMethod, setAuthMethod] = useState(isBeta ? "" : "phone");
+  const [phoneCountry, setPhoneCountry] = useState("+852");
   const [phoneNumber, setPhoneNumber] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [referralCode, setReferralCode] = useState(() => captureAffiliateCode());
@@ -1314,16 +1315,20 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
     [],
   );
 
+  // A fresh reCAPTCHA widget for every send: reusing a widget after a failed or
+  // abandoned check can make Firebase reject the next attempt with auth/internal-error.
   async function getRecaptchaVerifier() {
-    if (!recaptchaRef.current) {
-      recaptchaRef.current = new RecaptchaVerifier(auth, "phone-recaptcha", {
-        size: "invisible",
-      });
-      recaptchaWidgetIdRef.current = await recaptchaRef.current.render();
-    } else if (recaptchaWidgetIdRef.current !== null) {
-      window.grecaptcha?.reset(recaptchaWidgetIdRef.current);
+    try {
+      recaptchaRef.current?.clear();
+    } catch {
+      // The previous widget may already be gone; a new one is created below.
     }
-
+    const host = document.getElementById("phone-recaptcha");
+    host.replaceChildren();
+    const container = document.createElement("div");
+    host.appendChild(container);
+    recaptchaRef.current = new RecaptchaVerifier(auth, container, { size: "invisible" });
+    recaptchaWidgetIdRef.current = await recaptchaRef.current.render();
     return recaptchaRef.current;
   }
 
@@ -1340,13 +1345,15 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
         auth,
         rememberMe ? browserLocalPersistence : browserSessionPersistence,
       );
-      const normalizedPhone = normalizePhoneNumber(phoneNumber);
+      const normalizedPhone = normalizePhoneNumber(phoneCountry, phoneNumber);
       const verifier = await getRecaptchaVerifier();
       const result = await signInWithPhoneNumber(auth, normalizedPhone, verifier);
       setConfirmation(result);
     } catch (error) {
-      if (recaptchaWidgetIdRef.current !== null) {
-        window.grecaptcha?.reset(recaptchaWidgetIdRef.current);
+      // Wrong numbers and rate limits are expected; anything else is shown in the live monitor.
+      if (String(error?.code || "").startsWith("auth/")
+        && !["auth/invalid-phone-number", "auth/too-many-requests", "auth/missing-phone-number"].includes(error.code)) {
+        reportClientError(error, "phone:send-code");
       }
       setPhoneError(getPhoneAuthErrorMessage(error));
     } finally {
@@ -1369,7 +1376,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
         if (manualAffiliateCode) window.localStorage.setItem(PENDING_AFFILIATE_CODE_KEY, manualAffiliateCode);
         window.sessionStorage.setItem(PENDING_REGISTRATION_KEY, JSON.stringify({
           displayName: displayName.trim().slice(0, 80),
-          phoneNumber: normalizePhoneNumber(phoneNumber),
+          phoneNumber: normalizePhoneNumber(phoneCountry, phoneNumber),
           ageConfirmed: true,
         }));
       }
@@ -1389,7 +1396,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
         })({
           referralCode: captureAffiliateCode(),
           displayName: displayName.trim().slice(0, 80),
-          phoneNumber: credential.user.phoneNumber || normalizePhoneNumber(phoneNumber),
+          phoneNumber: credential.user.phoneNumber || normalizePhoneNumber(phoneCountry, phoneNumber),
           ageConfirmed: true,
         });
         window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
@@ -1412,7 +1419,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
     setPhoneBusy(true);
     try {
       await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
-      await signInWithEmailAndPassword(auth, phoneLoginEmail(normalizePhoneNumber(phoneNumber)), password);
+      await signInWithEmailAndPassword(auth, phoneLoginEmail(normalizePhoneNumber(phoneCountry, phoneNumber)), password);
       onClose();
     } catch (error) {
       setPhoneError(error?.code ? getPasswordAuthErrorMessage(error) : getPhoneAuthErrorMessage(error));
@@ -1523,10 +1530,12 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
 
             {isBeta && !isRegistration && !useSmsLogin && !confirmation ? (
               <form className="stack-form" onSubmit={signInWithPhonePassword}>
-                <label>
-                  手機號碼
-                  <input type="tel" inputMode="tel" autoComplete="tel" value={phoneNumber} onChange={(event) => setPhoneNumber(event.target.value)} placeholder="例如 +852 9123 4567" required />
-                </label>
+                <PhoneNumberField
+                  country={phoneCountry}
+                  onCountryChange={setPhoneCountry}
+                  value={phoneNumber}
+                  onChange={setPhoneNumber}
+                />
                 <label>
                   密碼
                   <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
@@ -1559,10 +1568,12 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
                     </label>
                   </>
                 )}
-                <label>
-                  手機號碼
-                  <input type="tel" inputMode="tel" autoComplete="tel" value={phoneNumber} onChange={(event) => setPhoneNumber(event.target.value)} placeholder="例如 +852 9123 4567" required />
-                </label>
+                <PhoneNumberField
+                  country={phoneCountry}
+                  onCountryChange={setPhoneCountry}
+                  value={phoneNumber}
+                  onChange={setPhoneNumber}
+                />
                 {isBeta && (
                   <div className="auth-options">
                     {isRegistration && (
@@ -12855,37 +12866,69 @@ function rangeNumbers(start, end) {
   return Array.from({ length: Math.max(0, last - first + 1) }, (_, index) => first + index);
 }
 
-function normalizePhoneNumber(value) {
-  const compact = String(value || "").replace(/[\s()-]/g, "");
-  const digits = compact.replace(/\D/g, "");
-  // Numbers typed with the country code but without "+" (e.g. 85291234567) keep it.
-  const hasCountryCode = /^852\d{8}$/.test(digits) || /^8860?9\d{8}$/.test(digits);
-  const normalized = (compact.startsWith("+") || hasCountryCode
-    ? `+${digits}`
-    : `+852${digits}`)
-    // Taiwan numbers are often typed with the local trunk 0 (+886 0912...).
-    .replace(/^\+8860(9\d{8})$/, "+886$1");
+// Phone login is limited to Hong Kong, Taiwan and Macau; players pick the code from a list.
+const PHONE_COUNTRIES = [
+  { code: "+852", label: "香港 +852", placeholder: "9123 4567", maxLength: 8 },
+  { code: "+886", label: "台灣 +886", placeholder: "912 345 678", maxLength: 10 },
+  { code: "+853", label: "澳門 +853", placeholder: "6123 4567", maxLength: 8 },
+];
 
-  if (!/^\+[1-9]\d{7,14}$/.test(normalized)) {
-    throw new Error("請輸入有效手機號碼，例如 +852 9123 4567。");
-  }
-  // SMS delivery is limited to Hong Kong and Taiwan in Firebase Auth.
-  if (!/^\+852\d{8}$/.test(normalized) && !/^\+8869\d{8}$/.test(normalized)) {
-    throw new Error("手機登入只支援香港（+852）及台灣（+886）號碼。台灣號碼請輸入 +886 9XX XXX XXX。");
-  }
+// Keeps digits only; a pasted number that still carries the country code has it removed.
+function localPhoneDigits(input, country) {
+  let digits = String(input || "").replace(/\D/g, "");
+  const countryDigits = country.code.slice(1);
+  if (digits.startsWith(countryDigits) && digits.length > countryDigits.length + 7) digits = digits.slice(countryDigits.length);
+  return digits.slice(0, country.maxLength);
+}
 
-  return normalized;
+function PhoneNumberField({ country, onCountryChange, value, onChange }) {
+  const selected = PHONE_COUNTRIES.find((item) => item.code === country) || PHONE_COUNTRIES[0];
+  return (
+    <div className="phone-number-field">
+      <span>手機號碼</span>
+      <div className="phone-number-inputs">
+        <select value={selected.code} onChange={(event) => onCountryChange(event.target.value)} aria-label="國家／地區號碼">
+          {PHONE_COUNTRIES.map((item) => <option key={item.code} value={item.code}>{item.label}</option>)}
+        </select>
+        <input
+          type="tel"
+          inputMode="numeric"
+          autoComplete="tel-national"
+          value={value}
+          onChange={(event) => onChange(localPhoneDigits(event.target.value, selected))}
+          placeholder={`例如 ${selected.placeholder}`}
+          aria-label="手機號碼"
+          required
+        />
+      </div>
+    </div>
+  );
+}
+
+function normalizePhoneNumber(country, value) {
+  let digits = String(value || "").replace(/\D/g, "");
+  if (country === "+852" && /^[4-9]\d{7}$/.test(digits)) return `+852${digits}`;
+  if (country === "+853" && /^6\d{7}$/.test(digits)) return `+853${digits}`;
+  if (country === "+886") {
+    // Taiwan mobiles are often typed with the local trunk 0 (0912...).
+    if (/^09\d{8}$/.test(digits)) digits = digits.slice(1);
+    if (/^9\d{8}$/.test(digits)) return `+886${digits}`;
+  }
+  const example = (PHONE_COUNTRIES.find((item) => item.code === country) || PHONE_COUNTRIES[0]).placeholder;
+  throw new Error(`請輸入有效手機號碼，例如 ${example}。`);
 }
 
 function getPhoneAuthErrorMessage(error) {
   const messages = {
-    "auth/invalid-phone-number": "手機號碼格式不正確，請連同國家／地區號碼輸入。",
+    "auth/invalid-phone-number": "手機號碼格式不正確，請檢查地區號碼同手機號碼。",
     "auth/invalid-verification-code": "驗證碼不正確，請重新輸入。",
     "auth/code-expired": "驗證碼已過期，請重新發送。",
     "auth/too-many-requests": "嘗試次數過多，請稍後再試。",
     "auth/quota-exceeded": "今日 SMS 驗證配額已用完，請使用 Google 登入或稍後再試。",
-    "auth/operation-not-allowed": "此手機號碼地區暫不支援 SMS 登入，只支援香港及台灣號碼。",
+    "auth/operation-not-allowed": "此手機號碼地區暫不支援 SMS 驗證，只支援香港、台灣及澳門號碼。",
     "auth/captcha-check-failed": "安全驗證失敗，請重新整理後再試。",
+    "auth/internal-error": "未能完成安全驗證，請重新整理頁面再試。如果用緊 App 內置瀏覽器，請改用 Safari 或 Chrome 開啟。",
+    "auth/network-request-failed": "網絡連線有問題，請檢查網絡後再試。",
     "auth/missing-phone-number": "請輸入手機號碼。",
   };
 
