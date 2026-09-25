@@ -88,7 +88,8 @@ import {
 import { httpsCallable } from "firebase/functions";
 import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
 import { reportClientError } from "./errorReporting.js";
-import { auth, db, functions, googleProvider } from "./firebase";
+import { getToken as getAppCheckToken } from "firebase/app-check";
+import { appCheck, auth, db, functions, googleProvider } from "./firebase";
 
 const PENDING_AFFILIATE_CODE_KEY = "livedraw-pending-affiliate-code";
 const PENDING_REGISTRATION_KEY = "livedraw-pending-registration";
@@ -507,6 +508,7 @@ function App() {
   const [profileInitializationError, setProfileInitializationError] = useState("");
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [appCheckBlocked, setAppCheckBlocked] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
   const [authDialogOpen, setAuthDialogOpen] = useState(false);
   const googleSignInPendingRef = useRef(false);
@@ -547,6 +549,16 @@ function App() {
       window.clearTimeout(authTimer);
       stopAuth();
     };
+  }, []);
+
+  // If the browser fails the App Check (reCAPTCHA) security check, every data request is
+  // refused; tell the player how to recover instead of leaving an endless loading spinner.
+  useEffect(() => {
+    if (!appCheck) return;
+    getAppCheckToken(appCheck).catch((error) => {
+      console.error("App Check failed.", error);
+      setAppCheckBlocked(true);
+    });
   }, []);
 
   useEffect(() => {
@@ -885,6 +897,7 @@ function App() {
       </header>
 
       <main id="top" className={isBeta ? "main-grid beta-main-grid" : "main-grid"}>
+        {appCheckBlocked && <AppCheckBlockedNotice />}
         {!signedIn ? (
           isBeta ? (
             <section className="workspace beta-public-workspace">
@@ -2161,6 +2174,27 @@ function PickSection({ children, count, isOpen, label, onToggle }) {
 
 function isActivePickRecord(record, room) {
   return !record.cardId && isRoomPurchasable(room);
+}
+
+function AppCheckBlockedNotice() {
+  return (
+    <section className="panel app-check-blocked" role="alert">
+      <Shield size={28} />
+      <div>
+        <h2>未能通過瀏覽器安全檢查</h2>
+        <p>系統暫時未能確認你嘅瀏覽器，所以載入唔到直播資料。請試吓：</p>
+        <ol>
+          <li>重新整理頁面。</li>
+          <li>如果你喺 Instagram、Facebook、WhatsApp 等 App 入面開連結，請撳右上角選單，改用 Safari 或 Chrome 開啟。</li>
+          <li>暫時關閉 VPN、廣告封鎖或者私隱保護擴充功能。</li>
+          <li>仍然唔得，請聯絡客服。</li>
+        </ol>
+        <button className="primary-btn" type="button" onClick={() => window.location.reload()}>
+          <RefreshCcw size={16} />重新整理
+        </button>
+      </div>
+    </section>
+  );
 }
 
 function FileUpload({ id, label, file, onChange, required = false, disabled = false }) {

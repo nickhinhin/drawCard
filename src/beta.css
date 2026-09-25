@@ -6306,3 +6306,35 @@
   max-height: none;
   overflow: visible;
 }
+
+/* Shown when the browser fails the App Check security check. */
+.beta-mode .app-check-blocked {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  grid-column: 1 / -1;
+  margin-bottom: 18px;
+  border: 1px solid var(--beta-red);
+}
+
+.beta-mode .app-check-blocked > svg {
+  flex: none;
+  color: var(--beta-red);
+}
+
+.beta-mode .app-check-blocked h2 {
+  margin: 0 0 6px;
+  font-size: 1.1rem;
+}
+
+.beta-mode .app-check-blocked p,
+.beta-mode .app-check-blocked ol {
+  margin: 0 0 10px;
+  color: #d8d8de;
+  font-size: 14px;
+}
+
+.beta-mode .app-check-blocked ol {
+  padding-left: 20px;
+  line-height: 1.7;
+}
