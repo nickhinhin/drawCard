@@ -15,8 +15,10 @@ setGlobalOptions({ serviceAccount: "livedraw-functions@livedraw-7e3c2.iam.gservi
 if (!getApps().length) initializeApp();
 
 const db = getFirestore();
-// App Check is always enforced in production; only the local emulator (no App Check tokens) skips it.
-const ENFORCE_APP_CHECK = process.env.FUNCTIONS_EMULATOR !== "true";
+// App Check is switched off (25/9/2026): browsers with a low reCAPTCHA score were locked
+// out for 24 h. Callables rely on Firebase Auth, assertAdmin, server-side validation and
+// rate limits. Set this back to `process.env.FUNCTIONS_EMULATOR !== "true"` to re-enable.
+const ENFORCE_APP_CHECK = false;
 const userCallableOptions = {
   region: "asia-east2",
   enforceAppCheck: ENFORCE_APP_CHECK,

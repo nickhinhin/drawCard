@@ -35,7 +35,10 @@ export const app = initializeApp(firebaseConfig);
 // Firebase emulators. import.meta.env.DEV is false in production builds, so this
 // branch (and the emulator hosts) is removed from the deployed bundle.
 const useEmulators = import.meta.env.DEV && import.meta.env.VITE_USE_EMULATORS === "true";
-const appCheckSiteKey = useEmulators ? "" : import.meta.env.VITE_FIREBASE_APP_CHECK_SITE_KEY;
+// App Check is switched off (25/9/2026): browsers with a low reCAPTCHA score were locked
+// out for 24 h. Set APP_CHECK_ENABLED back to true (and re-enforce in the console) to restore it.
+const APP_CHECK_ENABLED = false;
+const appCheckSiteKey = useEmulators || !APP_CHECK_ENABLED ? "" : import.meta.env.VITE_FIREBASE_APP_CHECK_SITE_KEY;
 export const appCheck = appCheckSiteKey
   ? initializeAppCheck(app, {
     provider: new ReCaptchaEnterpriseProvider(appCheckSiteKey),
