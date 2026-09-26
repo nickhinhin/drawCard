@@ -2258,6 +2258,10 @@ function DrawCard({ profile }) {
   const [purchaseStep, setPurchaseStep] = useState(1);
   const [completedRoundView, setCompletedRoundView] = useState(false);
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
+  // Phones show the chat only as an overlay (see the 760px breakpoint in beta.css).
+  const isPhoneLayout = useMediaQuery("(max-width: 760px)");
+  const pageVisible = usePageVisible();
+  const chatVisible = pageVisible && (!isPhoneLayout || mobileChatOpen);
   const pendingRoomRoundRef = useRef("");
 
   // Only live, scheduled and draft rooms are watched; archived rooms load on demand.
@@ -2921,7 +2925,7 @@ function DrawCard({ profile }) {
               <X size={20} />
             </button>
             {profile?.uid ? (
-              <ChatRoom drawId={selectedRoom.id} profile={profile} />
+              <ChatRoom drawId={selectedRoom.id} profile={profile} active={chatVisible} />
             ) : (
               <section className="panel chat-panel guest-chat-panel">
               <div className="section-heading compact beta-live-chat-heading">
@@ -4579,7 +4583,33 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
   );
 });
 
-function ChatRoom({ drawId, profile }) {
+// True while the page is in the foreground (players often switch to the stream app).
+function usePageVisible() {
+  const [visible, setVisible] = useState(() => document.visibilityState !== "hidden");
+  useEffect(() => {
+    const update = () => setVisible(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", update);
+    return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+  return visible;
+}
+
+function useMediaQuery(queryText) {
+  const [matches, setMatches] = useState(() => window.matchMedia?.(queryText).matches ?? false);
+  useEffect(() => {
+    const media = window.matchMedia?.(queryText);
+    if (!media) return undefined;
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [queryText]);
+  return matches;
+}
+
+// `active` is false while the chat cannot be seen; the live listener then stops so
+// hidden chats do not pay one read per message per viewer.
+function ChatRoom({ drawId, profile, active = true }) {
   const isBeta = IS_BETA;
   const chatLogRef = useRef(null);
   const [messages, setMessages] = useState([]);
@@ -4593,6 +4623,10 @@ function ChatRoom({ drawId, profile }) {
     setMessages([]);
     setText("");
     setMessagesLoading(true);
+  }, [drawId]);
+
+  useEffect(() => {
+    if (!active) return undefined;
     const messagesQuery = query(
       collection(db, "draws", drawId, "messages"),
       orderBy("createdAt", "asc"),
@@ -4607,7 +4641,7 @@ function ChatRoom({ drawId, profile }) {
     });
 
     return stopMessages;
-  }, [drawId]);
+  }, [drawId, active]);
 
   useEffect(() => {
     const lastChatAt = profile?.lastChatAt;

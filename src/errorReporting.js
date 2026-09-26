@@ -1,6 +1,6 @@
 import { httpsCallable } from "firebase/functions";
 import { IS_ADMIN_SITE } from "./appVariant.js";
-import { functions } from "./firebase.js";
+import { functions, recoverFromCorruptLocalCache } from "./firebase.js";
 
 // Sends user-visible errors and uncaught exceptions to the admin live monitor.
 // Each message is sent at most once a minute and a page sends at most 30 reports.
@@ -41,6 +41,12 @@ export function reportClientError(error, where = "") {
 }
 
 export function installGlobalErrorReporting() {
-  window.addEventListener("error", (event) => reportClientError(event.error || event.message, "window.error"));
-  window.addEventListener("unhandledrejection", (event) => reportClientError(event.reason, "unhandledrejection"));
+  window.addEventListener("error", (event) => {
+    reportClientError(event.error || event.message, "window.error");
+    recoverFromCorruptLocalCache(event.error?.message || event.message);
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    reportClientError(event.reason, "unhandledrejection");
+    recoverFromCorruptLocalCache(event.reason?.message || event.reason);
+  });
 }

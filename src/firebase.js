@@ -4,6 +4,7 @@ import { connectAuthEmulator, getAuth, GoogleAuthProvider } from "firebase/auth"
 import {
   connectFirestoreEmulator,
   initializeFirestore,
+  memoryLocalCache,
   persistentLocalCache,
   persistentMultipleTabManager,
 } from "firebase/firestore";
@@ -47,12 +48,53 @@ export const appCheck = appCheckSiteKey
   : null;
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
+// The offline cache lives in IndexedDB. If that database is corrupted (a crashed
+// browser, low storage), Firestore throws internal assertions and the page breaks.
+// recoverFromCorruptLocalCache() then switches this browser to an in-memory cache
+// for a day, deletes the damaged database and reloads once.
+const MEMORY_CACHE_UNTIL_KEY = "livedraw-firestore-memory-cache-until";
+const CACHE_RECOVERED_KEY = "livedraw-firestore-cache-recovered";
+const CORRUPT_CACHE_PATTERN = /FIRESTORE .*INTERNAL ASSERTION FAILED|IndexedDB/i;
+
+function memoryCacheRequested() {
+  try {
+    return Number(localStorage.getItem(MEMORY_CACHE_UNTIL_KEY) || 0) > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+const memoryCacheMode = memoryCacheRequested();
+
 // Keep confirmed Firestore data across reloads so repeat visits can render immediately.
 export const db = initializeFirestore(app, {
-  localCache: persistentLocalCache({
-    tabManager: persistentMultipleTabManager(),
-  }),
+  localCache: memoryCacheMode
+    ? memoryLocalCache()
+    : persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
 });
+
+// In memory mode the damaged database is not open here, so it can be removed.
+if (memoryCacheMode) {
+  indexedDB.databases?.()
+    .then((databases) => databases
+      .filter((item) => String(item.name || "").startsWith("firestore/"))
+      .forEach((item) => indexedDB.deleteDatabase(item.name)))
+    .catch(() => {});
+}
+
+export function recoverFromCorruptLocalCache(message) {
+  if (memoryCacheMode || !CORRUPT_CACHE_PATTERN.test(String(message || ""))) return false;
+  try {
+    // One automatic reload per tab session, so a different fault cannot loop.
+    if (sessionStorage.getItem(CACHE_RECOVERED_KEY)) return false;
+    sessionStorage.setItem(CACHE_RECOVERED_KEY, "1");
+    localStorage.setItem(MEMORY_CACHE_UNTIL_KEY, String(Date.now() + 24 * 60 * 60 * 1000));
+  } catch {
+    return false;
+  }
+  window.setTimeout(() => window.location.reload(), 300);
+  return true;
+}
 export const functions = getFunctions(app, "asia-east2");
 
 if (useEmulators) {
