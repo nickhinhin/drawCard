@@ -181,6 +181,8 @@ const CARD_THUMB_COMPRESSION = {
 };
 
 const LIVE_SNAPSHOT_OPTIONS = { includeMetadataChanges: true };
+// A guest's room / card / round / number kept while they log in (see rememberGuestSelection).
+const PENDING_SELECTION_KEY = "livedraw-pending-selection";
 
 // Show useful cached data immediately, but keep loading when the cache is empty until the server confirms it.
 function isSnapshotReady(snapshot) {
@@ -434,6 +436,11 @@ const TOKEN_PACKAGE_RATE_VERSION = 2;
 const MIN_CUSTOM_PAYMENT_HKD = 100;
 const CUSTOM_PAYMENT_BONUS_THRESHOLD_HKD = 500;
 const DEFAULT_HOMEPAGE_BANNER_URL = "/default-live-banner.webp";
+const DEFAULT_ANNOUNCEMENTS = [
+  { label: "最新", text: "二份之一賽道限量開放。" },
+  { label: "活動", text: "首次申請代幣滿指定金額送免費抽選。" },
+  { label: "公告", text: "系統維護時間請留意最新消息。" },
+];
 const MAX_BANNER_SLIDES = 8;
 const BANNER_INTERVAL_OPTIONS = [3, 5, 7, 10, 15];
 const DEFAULT_BANNER_INTERVAL_SECONDS = 5;
@@ -470,6 +477,13 @@ const BETA_BANNER_SECTION = {
   label: "Banner 設定",
   eyebrow: "Homepage banner",
   icon: ImagePlus,
+};
+
+const BETA_ANNOUNCEMENTS_SECTION = {
+  id: "announcements",
+  label: "公告設定",
+  eyebrow: "Announcements",
+  icon: Bell,
 };
 
 const BETA_DUMMY_PAYMENT_SETTINGS = {
@@ -511,6 +525,7 @@ function App() {
   const [appCheckBlocked, setAppCheckBlocked] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
   const [authDialogOpen, setAuthDialogOpen] = useState(false);
+  const [authNotice, setAuthNotice] = useState("");
   const googleSignInPendingRef = useRef(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("draw");
@@ -549,6 +564,16 @@ function App() {
       window.clearTimeout(authTimer);
       stopAuth();
     };
+  }, []);
+
+  // Guests who try to pick a number (or pay) are sent straight to login / register.
+  useEffect(() => {
+    function openLogin(event) {
+      setAuthNotice(String(event.detail?.notice || ""));
+      setAuthDialogOpen(true);
+    }
+    window.addEventListener("beta-open-login", openLogin);
+    return () => window.removeEventListener("beta-open-login", openLogin);
   }, []);
 
   // If the browser fails the App Check (reCAPTCHA) security check, every data request is
@@ -976,7 +1001,8 @@ function App() {
         <AuthDialog
           authError={authError}
           isBeta={isBeta}
-          onClose={() => setAuthDialogOpen(false)}
+          notice={authNotice}
+          onClose={() => { setAuthDialogOpen(false); setAuthNotice(""); }}
           onGoogleLogin={handleLogin}
           signingIn={signingIn}
         />
@@ -1345,7 +1371,7 @@ function WelcomePanel({ authError, onGoogleLogin, onPhoneLogin, signingIn }) {
   );
 }
 
-function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signingIn }) {
+function AuthDialog({ authError, isBeta = false, notice = "", onClose, onGoogleLogin, signingIn }) {
   const [accountAction, setAccountAction] = useState(isBeta ? "" : "login");
   // Phone users sign in with a password. SMS is only for registration and "forgot password".
   const [useSmsLogin, setUseSmsLogin] = useState(false);
@@ -1540,6 +1566,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
           <>
 
             <h2 id="auth-dialog-title">歡迎來到 LiveDraw</h2>
+            {notice && <p className="auth-dialog-notice">{notice}</p>}
             <p className="muted">請先選擇登入現有帳戶，或建立新帳戶。</p>
             <div className="auth-entry-grid">
               <button className="auth-choice-card primary" type="button" onClick={() => setAccountAction("login")}>
@@ -2316,6 +2343,7 @@ function DrawCard({ profile }) {
   const [selectedSlotNumber, setSelectedSlotNumber] = useState(null);
   const [selectedRound, setSelectedRound] = useState("");
   const [purchaseStep, setPurchaseStep] = useState(1);
+  const [cardReminder, setCardReminder] = useState(false);
   const [completedRoundView, setCompletedRoundView] = useState(false);
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
   // Phones show the chat only as an overlay (see the 760px breakpoint in beta.css).
@@ -2453,7 +2481,10 @@ function DrawCard({ profile }) {
   const viewingArchivedBetaRoom = Boolean(isBeta && selectedRoom?.status === "completed");
   const selectedRoomDefaultRound = getDefaultRoomRound(selectedRoom);
 
-  const roundOptions = useMemo(() => getRoomRoundOptions(selectedRoom), [selectedRoom]);
+  // Keyed on the round ids, not the room object: every live room update creates a new
+  // object, and a new array here would reset the player's card / number selection.
+  const roundOptionsKey = getRoomRoundOptions(selectedRoom).join("|");
+  const roundOptions = useMemo(() => (roundOptionsKey ? roundOptionsKey.split("|") : []), [roundOptionsKey]);
   const availableRoomDates = useMemo(
     () => rooms
       .filter((room) => room.status === "live" || room.status === "scheduled")
@@ -2505,16 +2536,52 @@ function DrawCard({ profile }) {
     [profile?.uid, slots],
   );
 
+  // After a guest logs in, bring back the room / card / round / number they had picked.
+  const pendingNumberRef = useRef(null);
+  function takeGuestSelection() {
+    if (!profile?.uid || !selectedRoomId) return null;
+    let pending = null;
+    try {
+      pending = JSON.parse(sessionStorage.getItem(PENDING_SELECTION_KEY) || "null");
+    } catch {
+      return null;
+    }
+    if (!pending || pending.roomId !== selectedRoomId || !roundOptions.includes(pending.round)) return null;
+    sessionStorage.removeItem(PENDING_SELECTION_KEY);
+    return Date.now() - pending.savedAt > 30 * 60 * 1000 ? null : pending;
+  }
+  function applyGuestSelection(pending) {
+    setSelectedCardId(pending.cardId || "");
+    setSelectedRound(pending.round);
+    setPurchaseStep(pending.cardId ? 2 : 1);
+    pendingNumberRef.current = pending.number || null;
+  }
+
   useEffect(() => {
+    const restored = takeGuestSelection();
+    if (restored) {
+      applyGuestSelection(restored);
+      return;
+    }
     const pendingRound = pendingRoomRoundRef.current;
     pendingRoomRoundRef.current = "";
     setSelectedCardId("");
     setSelectedSlotNumber(null);
     setSelectedRound(roundOptions.includes(pendingRound) ? pendingRound : selectedRoomDefaultRound);
     setPurchaseStep(1);
+    setCardReminder(false);
     setCompletedRoundView(false);
     setMobileChatOpen(false);
+    // takeGuestSelection only reads these same values; profile is handled by the effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roundOptions, selectedRoomDefaultRound, selectedRoomId]);
+
+  // The profile can arrive after the room has loaded.
+  useEffect(() => {
+    const restored = takeGuestSelection();
+    if (restored) applyGuestSelection(restored);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile?.uid]);
 
   useEffect(() => {
     if (!mobileChatOpen) return undefined;
@@ -2526,12 +2593,27 @@ function DrawCard({ profile }) {
   }, [mobileChatOpen]);
 
   useEffect(() => {
+    // A restored guest pick survives the card / round change that restoring causes.
+    if (pendingNumberRef.current && selectedCardId) {
+      setSelectedSlotNumber(pendingNumberRef.current);
+      pendingNumberRef.current = null;
+      return;
+    }
     setSelectedSlotNumber(null);
   }, [activeRoundId, selectedCardId]);
 
   useEffect(() => {
-    if (!selectedRoom?.id || !activeRoundId || !profile?.uid) {
+    if (!selectedRoom?.id || !activeRoundId) {
       setSlots([]);
+      setSlotsLoading(false);
+      return undefined;
+    }
+    // Guests cannot read slot ownership, so they see plain numbers; tapping one asks them to log in.
+    if (!profile?.uid) {
+      const roundSize = Math.max(1, Math.min(100, Number(selectedRoom.cardCount) || 30));
+      setSlots(Array.from({ length: roundSize }, (_item, index) => ({
+        id: `guest-${index + 1}`, number: index + 1, status: "available", guestPreview: true,
+      })));
       setSlotsLoading(false);
       return undefined;
     }
@@ -2568,7 +2650,7 @@ function DrawCard({ profile }) {
     );
 
     return stopSlots;
-  }, [activeRoundId, profile?.uid, selectedRoom?.id]);
+  }, [activeRoundId, profile?.uid, selectedRoom?.id, selectedRoom?.cardCount]);
 
   useEffect(() => {
     if (!selectedSlotNumber) return;
@@ -2589,7 +2671,8 @@ function DrawCard({ profile }) {
       return;
     }
     if (!profile?.uid) {
-      alert("請先登入／註冊，再付款鎖定號碼。");
+      rememberGuestSelection(selectedSlotNumber);
+      requestLogin("請先登入或註冊，再付款鎖定號碼。");
       return;
     }
     if (!selectedTargetCard) {
@@ -2738,8 +2821,20 @@ function DrawCard({ profile }) {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  // A guest's card / round / number survive the switch to the signed-in page.
+  function rememberGuestSelection(number = null) {
+    try {
+      sessionStorage.setItem(PENDING_SELECTION_KEY, JSON.stringify({
+        roomId: selectedRoom?.id || "", cardId: selectedCardId, round: selectedRound, number, savedAt: Date.now(),
+      }));
+    } catch {
+      // Private browsing: the player simply picks again after logging in.
+    }
+  }
+
   function goToNumberStep() {
     if (!selectedTargetCard) return;
+    setCardReminder(false);
     setPurchaseStep(2);
     window.requestAnimationFrame(() => {
       document.getElementById("number-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -2747,6 +2842,15 @@ function DrawCard({ profile }) {
   }
 
   function openNumberOccupancy() {
+    if (!selectedTargetCard) {
+      setCardReminder(false);
+      window.requestAnimationFrame(() => setCardReminder(true));
+      window.requestAnimationFrame(() => {
+        document.getElementById("card-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+      return;
+    }
+    setCardReminder(false);
     setPurchaseStep(2);
     window.requestAnimationFrame(() => {
       document.getElementById("number-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -2788,6 +2892,7 @@ function DrawCard({ profile }) {
 
     setSelectedCardId("");
     setPurchaseStep(1);
+    setCardReminder(false);
     window.requestAnimationFrame(() => {
       document.getElementById("card-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -2948,7 +3053,8 @@ function DrawCard({ profile }) {
             cardCategories={cardCategories}
             selectedCardId={selectedCardId}
             selectedCard={selectedTargetCard}
-            onSelectCard={setSelectedCardId}
+            reminder={cardReminder}
+            onSelectCard={(cardId) => { setSelectedCardId(cardId); setCardReminder(false); }}
             onContinue={goToNumberStep}
           />
         ) : (
@@ -2964,7 +3070,14 @@ function DrawCard({ profile }) {
             buyingNumber={buyingNumber}
             onBack={goToCardStep}
             onRoundChange={setSelectedRound}
-            onSelectNumber={setSelectedSlotNumber}
+            onSelectNumber={(number) => {
+              if (!profile?.uid) {
+                rememberGuestSelection(number);
+                requestLogin("請先登入或註冊，即可選擇號碼。");
+                return;
+              }
+              setSelectedSlotNumber(number);
+            }}
             onBuy={() => openPurchaseConfirmation(selectedSlot)}
           />
         )}
@@ -3101,25 +3214,34 @@ function BetaRecentRecords({ profile }) {
   );
 }
 
+// The public ticker reads the same homepage document as the admin editor.
+function AnnouncementsBar() {
+  const announcements = useSiteAnnouncements();
+  if (!announcements.length) return null;
+  return (
+    <div className="beta-announcements" aria-label="最新公告">
+      <div className="beta-announcements-track">
+        {[false, true].map((duplicate) => (
+          <div
+            aria-hidden={duplicate || undefined}
+            className="beta-announcements-group"
+            key={duplicate ? "duplicate" : "primary"}
+          >
+            <strong>最新公告</strong>
+            {announcements.map((item, index) => (
+              <span key={`${index}-${item.label}-${item.text}`}><b>{item.label}</b> {item.text}</span>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function BetaSingleHallIntro({ cards, rooms, onOpenRoom, onSelectCard }) {
   return (
     <section className="panel beta-single-hall-intro">
-      <div className="beta-announcements" aria-label="最新公告">
-        <div className="beta-announcements-track">
-          {[false, true].map((duplicate) => (
-            <div
-              aria-hidden={duplicate || undefined}
-              className="beta-announcements-group"
-              key={duplicate ? "duplicate" : "primary"}
-            >
-              <strong>最新公告</strong>
-              <span><b>最新</b> 二份之一賽道限量開放。</span>
-              <span><b>活動</b> 首次申請代幣滿指定金額送免費抽選。</span>
-              <span><b>公告</b> 系統維護時間請留意最新消息。</span>
-            </div>
-          ))}
-        </div>
-      </div>
+      <AnnouncementsBar />
       <HomepageBanner />
       <BetaPsaCarousel cards={cards} rooms={rooms} onOpenRoom={onOpenRoom} onSelectCard={onSelectCard} />
     </section>
@@ -3177,7 +3299,7 @@ function HomepageBanner() {
               width="1600"
               height="529"
               loading={eager ? "eager" : "lazy"}
-              fetchPriority={slideIndex === 0 ? "high" : "low"}
+              {...{ fetchpriority: slideIndex === 0 ? "high" : "low" }}
               decoding="async"
               alt={count > 1 ? `LiveDraw TCG 直播預告 ${slideIndex + 1}／${count}` : "LiveDraw TCG 直播預告"}
               aria-hidden={slideIndex !== current}
@@ -3826,24 +3948,7 @@ function RoomList({ rooms, cards = [], error, loading, onOpenRoom, profile }) {
 
   return (
     <section className={isBeta ? "panel beta-room-list-panel" : "panel"}>
-      {isBeta && (
-        <div className="beta-announcements" aria-label="最新公告">
-          <div className="beta-announcements-track">
-            {[false, true].map((duplicate) => (
-              <div
-                aria-hidden={duplicate || undefined}
-                className="beta-announcements-group"
-                key={duplicate ? "duplicate" : "primary"}
-              >
-                <strong>最新公告</strong>
-                <span><b>最新</b> 二份之一賽道限量開放。</span>
-                <span><b>活動</b> 首次申請代幣滿指定金額送免費抽選。</span>
-                <span><b>公告</b> 系統維護時間請留意最新消息。</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {isBeta && <AnnouncementsBar />}
       <HomepageBanner />
       {isBeta && <BetaPsaCarousel cards={cards} rooms={rooms} onOpenRoom={onOpenRoom} />}
       {isBeta && (
@@ -3950,6 +4055,7 @@ const CardPoolPreview = memo(function CardPoolPreview({
   loading,
   selectedCardId,
   selectedCard,
+  reminder = false,
   onSelectCard,
   onContinue,
 }) {
@@ -3958,6 +4064,7 @@ const CardPoolPreview = memo(function CardPoolPreview({
   const [cardSearch, setCardSearch] = useState("");
   const [visibleLimit, setVisibleLimit] = useState(PLAYER_CARD_BATCH_SIZE);
   const cardGridRef = useRef(null);
+  const loadMoreRef = useRef(null);
   const categories = useMemo(
     () => getCardCategories(cards, cardCategories),
     [cardCategories, cards],
@@ -3990,8 +4097,20 @@ const CardPoolPreview = memo(function CardPoolPreview({
     cardGridRef.current?.scrollTo({ left: 0, top: 0, behavior: "smooth" });
   }, [cardSearch, categoryFilter, priceSort]);
 
+  // Reveal the next batch when the visitor reaches the end of the scrollable pool.
+  useEffect(() => {
+    if (visibleLimit >= filteredCards.length || !loadMoreRef.current) return undefined;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) {
+        setVisibleLimit((current) => Math.min(current + PLAYER_CARD_BATCH_SIZE, filteredCards.length));
+      }
+    }, { root: cardGridRef.current, rootMargin: "0px 0px 180px 0px" });
+    observer.observe(loadMoreRef.current);
+    return () => observer.disconnect();
+  }, [filteredCards.length, visibleLimit]);
+
   return (
-    <section id="card-selection" className="panel card-pool-preview">
+    <section id="card-selection" className={`panel card-pool-preview${reminder ? " card-pool-reminder" : ""}`}>
       <div>
         <p className="eyebrow">第一步</p>
         <h2>選擇卡牌（保底隨機PSA10卡）</h2>
@@ -4051,6 +4170,7 @@ const CardPoolPreview = memo(function CardPoolPreview({
               確定 · 選擇號碼
             </button>
           </div>
+          {reminder && <p className="card-required-reminder" role="alert">請先揀卡牌，再選擇天堂地獄號碼。</p>}
           <div className="pool-card-grid" ref={cardGridRef}>
             {visibleCards.map((card) => (
               <button
@@ -4076,18 +4196,10 @@ const CardPoolPreview = memo(function CardPoolPreview({
                 <TokenAmount value={card.tokenValue} />
               </button>
             ))}
+            {visibleCards.length < filteredCards.length && <div className="card-load-sentinel" ref={loadMoreRef} aria-hidden="true" />}
           </div>
           {!filteredCards.length && (
             <p className="form-note">沒有符合搜尋條件的卡牌。</p>
-          )}
-          {visibleCards.length < filteredCards.length && (
-            <button
-              className="small-btn player-card-load-more"
-              type="button"
-              onClick={() => setVisibleLimit((current) => current + PLAYER_CARD_BATCH_SIZE)}
-            >
-              顯示更多（尚有 {filteredCards.length - visibleCards.length} 張）
-            </button>
           )}
         </>
       ) : draw.poolText ? (
@@ -4289,6 +4401,8 @@ function NumberGrid({
           ? `${formatRoundLabel(activeRoundId)}已過場，只可以查看紀錄，不能再鎖定號碼。`
           : buyingBlocked
           ? `${formatRoundLabel(activeRoundId)}已停止購買，只可以查看紀錄，不能再鎖定號碼。`
+          : slots.some((slot) => slot.guestPreview)
+          ? `已選 ${selectedCard.name}，${formatRoundLabel(activeRoundId)}共 ${draw.cardCount} 個號碼。登入後即可查看已被選走的號碼及選擇號碼。`
           : `已選 ${selectedCard.name}，${formatRoundLabel(activeRoundId)}共 ${draw.cardCount} 個號碼，已被選走的號碼無法重選。`}
       </p>}
       {!selectedCard && (
@@ -4650,6 +4764,10 @@ const CHAT_BLOCKED_PATTERN = new RegExp(String.raw`https?://|www\.|[a-z0-9-]+\.(
 function isBlockedChatText(value) {
   // Full-width letters and digits (ｗｈａｔｓａｐｐ, ９１２３) are folded before checking.
   return CHAT_BLOCKED_PATTERN.test(String(value || "").normalize("NFKC").toLowerCase());
+}
+
+function requestLogin(notice) {
+  window.dispatchEvent(new CustomEvent("beta-open-login", { detail: { notice } }));
 }
 
 // True while the page is in the foreground (players often switch to the stream app).
@@ -7469,6 +7587,7 @@ function LiveDrawAdminPanel({ profile }) {
         { id: "monitor", label: "直播監察", eyebrow: "Live monitor", icon: Bell },
         { id: "live", label: "直播管理", eyebrow: "Live", icon: Gavel },
         BETA_BANNER_SECTION,
+        BETA_ANNOUNCEMENTS_SECTION,
         ...ADMIN_SECTIONS.filter((section) => !["rooms", "create-room"].includes(section.id)),
         { id: "affiliate", label: "Affiliate", eyebrow: "Affiliate program", icon: UserRoundPlus },
         { id: "support", label: "客服訊息", eyebrow: "Support inbox", icon: Headphones },
@@ -7696,6 +7815,11 @@ function LiveDrawAdminPanel({ profile }) {
       {isBeta && activeAdminSection === "banner" && (
         <div className="admin-section narrow-admin-section">
           <HomepageBannerManager profile={profile} />
+        </div>
+      )}
+      {isBeta && activeAdminSection === "announcements" && (
+        <div className="admin-section narrow-admin-section">
+          <AnnouncementsManager profile={profile} />
         </div>
       )}
       {activeAdminSection === "packages" && (
@@ -9471,6 +9595,76 @@ function PromoCodeManager({ profile }) {
         )) : <p className="muted">暫時未設定推廣活動邀請碼。</p>}
       </div>
       <p className="form-note">邀請碼一經用戶提交即會保留使用紀錄；停用後未審批申請亦不可批准，直至重新啟用。</p>
+    </section>
+  );
+}
+
+// Admins can edit, reorder, add, and remove each ticker message independently.
+function AnnouncementsManager({ profile }) {
+  const published = useSiteAnnouncements();
+  const [draft, setDraft] = useState(published);
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!dirty) setDraft(published);
+  }, [dirty, published]);
+
+  function change(next) {
+    setDraft(next);
+    setDirty(true);
+  }
+
+  function move(index, direction) {
+    const next = [...draft];
+    const destination = index + direction;
+    if (destination < 0 || destination >= next.length) return;
+    [next[index], next[destination]] = [next[destination], next[index]];
+    change(next);
+  }
+
+  async function save() {
+    const announcements = draft.map((item) => ({
+      label: String(item.label || "").trim().slice(0, 12),
+      text: String(item.text || "").trim().slice(0, 160),
+    }));
+    if (announcements.some((item) => !item.label || !item.text)) {
+      alert("每則公告都要填寫標籤和內容。");
+      return;
+    }
+    setSaving(true);
+    try {
+      await adminSetDoc(doc(db, "publicSiteSettings", "homepage"), {
+        announcements,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile.uid,
+      }, { merge: true });
+      setDirty(false);
+    } catch (error) {
+      showSafeError(error, "未能儲存公告。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="panel announcements-manager">
+      <div className="section-heading compact"><Bell size={21} /><div><h2>最新公告</h2><p className="muted">設定後即時顯示於玩家網站；刪除全部可隱藏公告列。</p></div></div>
+      <div className="announcement-editor-list">
+        {draft.map((item, index) => (
+          <div className="announcement-editor-row" key={index}>
+            <input aria-label={`第 ${index + 1} 則公告標籤`} maxLength={12} placeholder="標籤" value={item.label} onChange={(event) => change(draft.map((entry, position) => position === index ? { ...entry, label: event.target.value } : entry))} />
+            <input aria-label={`第 ${index + 1} 則公告內容`} maxLength={160} placeholder="公告內容" value={item.text} onChange={(event) => change(draft.map((entry, position) => position === index ? { ...entry, text: event.target.value } : entry))} />
+            <button className="small-btn" type="button" aria-label={`上移第 ${index + 1} 則公告`} disabled={index === 0} onClick={() => move(index, -1)}><ArrowUp size={16} /></button>
+            <button className="small-btn" type="button" aria-label={`下移第 ${index + 1} 則公告`} disabled={index === draft.length - 1} onClick={() => move(index, 1)}><ArrowDown size={16} /></button>
+            <button className="small-btn" type="button" aria-label={`刪除第 ${index + 1} 則公告`} onClick={() => change(draft.filter((_, position) => position !== index))}><Trash2 size={16} /></button>
+          </div>
+        ))}
+      </div>
+      <div className="announcement-editor-actions">
+        <button className="small-btn" type="button" disabled={draft.length >= 8} onClick={() => change([...draft, { label: "公告", text: "" }])}><Plus size={16} />新增公告</button>
+        <button className="primary-btn" type="button" disabled={!dirty || saving} onClick={save}>{saving ? "儲存中..." : "儲存公告"}</button>
+      </div>
     </section>
   );
 }
@@ -12539,6 +12733,21 @@ function useHomepageBanner() {
   }, []);
 
   return banner;
+}
+
+// A missing field keeps the original notices until an admin publishes a list.
+function useSiteAnnouncements() {
+  const [announcements, setAnnouncements] = useState(DEFAULT_ANNOUNCEMENTS);
+  useEffect(() => onSnapshot(doc(db, "publicSiteSettings", "homepage"), (snapshot) => {
+    const saved = snapshot.data()?.announcements;
+    setAnnouncements(Array.isArray(saved)
+      ? saved.slice(0, 8).map((item) => ({
+        label: String(item?.label || "").trim(),
+        text: String(item?.text || "").trim(),
+      })).filter((item) => item.label && item.text)
+      : DEFAULT_ANNOUNCEMENTS);
+  }, (error) => console.error("Announcement listener failed.", error)), []);
+  return announcements;
 }
 
 function useTokenPackages(enabled = true) {

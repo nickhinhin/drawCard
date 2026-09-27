@@ -5642,6 +5642,84 @@
   }
 }
 
+/* The player pool scrolls down on phones, while the next batch appears automatically. */
+.beta-mode .card-load-sentinel {
+  grid-column: 1 / -1;
+  height: 1px;
+}
+
+.beta-mode .card-required-reminder {
+  grid-column: 1 / -1;
+  padding: 9px 12px;
+  border: 1px solid var(--beta-red);
+  border-radius: 4px;
+  background: #31131a;
+  color: #fff !important;
+  font-weight: 800;
+}
+
+.beta-mode .card-pool-reminder {
+  animation: card-selection-nudge 380ms ease-in-out 2;
+}
+
+@keyframes card-selection-nudge {
+  25%, 75% { transform: translateX(-5px); }
+  50% { transform: translateX(5px); }
+}
+
+.beta-mode .announcement-editor-list {
+  display: grid;
+  gap: 10px;
+}
+
+.beta-mode .announcement-editor-row {
+  display: grid;
+  grid-template-columns: minmax(80px, 110px) minmax(0, 1fr) repeat(3, 38px);
+  gap: 7px;
+}
+
+.beta-mode .announcement-editor-row input {
+  min-width: 0;
+}
+
+.beta-mode .announcement-editor-row .small-btn {
+  justify-content: center;
+  padding: 0;
+}
+
+.beta-mode .announcement-editor-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+@media (max-width: 760px) {
+  .beta-mode .pool-card-grid {
+    grid-auto-flow: row;
+    grid-auto-columns: auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-height: min(64vh, 620px);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    padding: 0 4px 8px 0;
+    scroll-snap-type: none;
+  }
+
+  .beta-mode .announcement-editor-row {
+    grid-template-columns: repeat(3, 38px) minmax(0, 1fr);
+  }
+
+  .beta-mode .announcement-editor-row input:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .beta-mode .announcement-editor-row input:nth-child(2) {
+    grid-column: 1 / -1;
+  }
+}
+
 /* Keep the card CTA visible while browsing a long card pool. */
 .beta-mode .draw-layout.purchase-step-1 .card-pool-preview {
   padding-bottom: 104px;
@@ -6447,4 +6525,15 @@
 .beta-mode .duplicate-proof-warning {
   color: #ff8a9b;
   font-weight: 800;
+}
+
+/* Why the login dialog opened (e.g. a guest tapped a number). */
+.beta-mode .auth-dialog-notice {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--beta-red);
+  border-radius: 3px;
+  background: rgba(227, 24, 55, 0.12);
+  color: #fff;
+  font-weight: 700;
 }
