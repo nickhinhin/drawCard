@@ -2693,7 +2693,7 @@ function DrawCard({ profile }) {
           drawId: purchase.roomId,
           drawTitle: purchase.roomTitle,
           roomSlug: purchase.roomSlug,
-          roomLink: makeRoomLink(purchase.roomId),
+          roomLink: publicRoomLink(purchase.roomId),
           round: purchase.roundId,
           roundSort: getRoundSortValue(purchase.roundId),
           number: purchase.slot.number,
@@ -7625,7 +7625,7 @@ function LiveDrawAdminPanel({ profile }) {
   }
 
   async function copyRoomLink(draw) {
-    await navigator.clipboard.writeText(makeRoomLink(draw.id));
+    await navigator.clipboard.writeText(publicRoomLink(draw.id));
   }
 
   return (
@@ -8637,7 +8637,7 @@ function SingleLiveManagement({ cards, draws, loading = false, profile }) {
             {archivedLives.map((draw) => (
               <article key={draw.id}>
                 <div><strong>{draw.title || "過往直播"}</strong><span>{getRoomRoundCount(draw)} 場 · {formatDate(draw.archivedAt || draw.updatedAt || draw.createdAt)}</span></div>
-                <a className="small-btn" href={makeRoomLink(draw.id)} target="_blank" rel="noreferrer">前台查看</a>
+                <a className="small-btn" href={publicRoomLink(draw.id)} target="_blank" rel="noreferrer">前台查看</a>
               </article>
             ))}
           </div>
@@ -8796,7 +8796,7 @@ export function FutureLiveScheduleManager({ draw, draws, profile }) {
           ? Object.fromEntries(poolCards.filter((card) => card.id).map((card) => [card.id, Number(card.tokenValue || 0)]))
           : draw.poolCardValues || {},
         thumbnailUrl: "",
-        roomLink: makeRoomLink(newDrawRef.id),
+        roomLink: publicRoomLink(newDrawRef.id),
         previousLiveId: draw.id,
         createdBy: profile.uid,
         createdAt: serverTimestamp(),
@@ -8922,7 +8922,7 @@ export function FutureLiveScheduleManager({ draw, draws, profile }) {
                 <span>{formatFutureLiveDate(item.scheduledDate)} · 獨立直播 · 預購已開放</span>
               </div>
               <div className="future-live-admin-actions">
-                <a className="small-btn" href={makeRoomLink(item.id)} target="_blank" rel="noreferrer">前台查看</a>
+                <a className="small-btn" href={publicRoomLink(item.id)} target="_blank" rel="noreferrer">前台查看</a>
                 <button className="primary-btn" type="button" onClick={() => startFutureLive(item)} disabled={saving}>
                   <Zap size={15} />開始直播
                 </button>
@@ -9047,7 +9047,7 @@ function AddBroadcastForm({ cards, currentLive }) {
         poolCardIds: poolCards.map((card) => card.id).filter(Boolean),
         poolCardValues: Object.fromEntries(poolCards.filter((card) => card.id).map((card) => [card.id, Number(card.tokenValue || 0)])),
         thumbnailUrl: "",
-        roomLink: makeRoomLink(newDrawRef.id),
+        roomLink: publicRoomLink(newDrawRef.id),
         previousLiveId: currentLive?.id || "",
         },
       });
@@ -9181,7 +9181,7 @@ function RoomManagementList({ cards, draws, loading = false, onCompleteDraw, onC
                   <span>目前 <b>{formatRoundLabel(toRoundId(getRoomCurrentRound(draw)))}</b></span>
                   <span><b>{getRoomShareMode(draw)}</b> 玩法</span>
                 </div>
-                <span className="room-link-text">{makeRoomLink(draw.id)}</span>
+                <span className="room-link-text">{publicRoomLink(draw.id)}</span>
               </div>
             </div>
             <div className="record-actions">
@@ -12035,7 +12035,7 @@ function CreateDrawForm({ cards, previousDraws = [] }) {
         thumbnailMode: thumbnailUrl?.startsWith("data:image/")
           ? "compressed-data-url"
           : "external-url",
-        roomLink: makeRoomLink(drawRef.id),
+        roomLink: publicRoomLink(drawRef.id),
         },
       });
       await httpsCallable(functions, "adminEnsureDrawSlots")({
@@ -13062,6 +13062,16 @@ function mergePurchaseRecords(records, slotRecords, roomsById) {
   return [...records, ...fallbackSlots].sort(
     (left, right) => toMillis(right.createdAt) - toMillis(left.createdAt),
   );
+}
+
+// Links that people share or open from the admin site always use the public domain.
+const PUBLIC_SITE_ORIGIN = "https://livedrawcard.com";
+
+function publicRoomLink(roomKey) {
+  const cleanSlug = String(roomKey || "").trim();
+  const isLocal = /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname);
+  const baseUrl = `${isLocal ? window.location.origin : PUBLIC_SITE_ORIGIN}/`;
+  return cleanSlug ? `${baseUrl}?room=${encodeURIComponent(cleanSlug)}` : baseUrl;
 }
 
 function makeRoomLink(roomKey) {
