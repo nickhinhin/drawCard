@@ -2841,6 +2841,30 @@ function DrawCard({ profile }) {
     });
   }
 
+  // Tapping a free number in the side panel: with a card chosen, jump to step 2 with that
+  // number selected; without one, remind the player to choose a card first.
+  function pickNumberFromOccupancy(number) {
+    if (!selectedTargetCard) {
+      setCardReminder(false);
+      window.requestAnimationFrame(() => setCardReminder(true));
+      window.requestAnimationFrame(() => {
+        document.getElementById("card-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+      return;
+    }
+    setCardReminder(false);
+    setPurchaseStep(2);
+    if (!profile?.uid) {
+      rememberGuestSelection(number);
+      requestLogin("請先登入或註冊，即可選擇號碼。");
+      return;
+    }
+    setSelectedSlotNumber(number);
+    window.requestAnimationFrame(() => {
+      document.getElementById("number-selection")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
   function openNumberOccupancy() {
     if (!selectedTargetCard) {
       setCardReminder(false);
@@ -3041,6 +3065,7 @@ function DrawCard({ profile }) {
             activeRoundId={activeRoundId}
             draw={selectedRoom}
             loading={slotsLoading}
+            onPickNumber={isRoomPurchasable(selectedRoom) && !isRoundBuyingBlocked(selectedRoom, activeRoundId) ? pickNumberFromOccupancy : undefined}
             profile={profile}
             slots={slots}
           />
@@ -3578,7 +3603,7 @@ function BetaStickyControls({ actionBarVisible = false, onOpenChat, onOpenNumber
 }
 
 // Keeps the current round's number usage visible beside the card list on desktop.
-function DesktopNumberOccupancy({ activeRoundId, draw, loading, profile, slots }) {
+function DesktopNumberOccupancy({ activeRoundId, draw, loading, onPickNumber, profile, slots }) {
   const occupiedCount = slots.filter((slot) => slot.status !== "available").length;
 
   return (
@@ -3602,9 +3627,11 @@ function DesktopNumberOccupancy({ activeRoundId, draw, loading, profile, slots }
             <button
               aria-label={`號碼 ${slot.number}，${ownerLabel}${resultSide ? `，${getResultSideLabel(resultSide)}` : ""}`}
               className={[mine ? "mine" : occupied ? "occupied" : "", resultSide ? `result-${resultSide}` : ""].filter(Boolean).join(" ")}
-              disabled
+              // Free numbers can be picked from here; taken numbers and results stay read-only.
+              disabled={!onPickNumber || occupied || Boolean(resultSide)}
               key={slot.id}
               type="button"
+              onClick={() => onPickNumber?.(slot.number)}
             >
               {resultSide
                 ? <strong className={`number-slot-outcome ${resultSide}`}><i aria-hidden="true" />{getResultSideLabel(resultSide)}</strong>

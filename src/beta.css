@@ -6537,3 +6537,15 @@
   color: #fff;
   font-weight: 700;
 }
+
+/* Free numbers in the side panel can be picked directly. */
+.beta-mode .desktop-number-grid button:not(:disabled) {
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.beta-mode .desktop-number-grid button:not(:disabled):hover,
+.beta-mode .desktop-number-grid button:not(:disabled):focus-visible {
+  border-color: var(--beta-red);
+  background: rgba(239, 20, 57, 0.12);
+}
