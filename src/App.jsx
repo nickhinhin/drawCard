@@ -4643,6 +4643,15 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
   );
 });
 
+// Anti-scam: chat may not carry links, phone numbers or contact / payment details.
+// Keep in sync with the same pattern in firestore.rules (the rules enforce it).
+const CHAT_BLOCKED_PATTERN = new RegExp(String.raw`https?://|www\.|[a-z0-9-]+\.(com|net|org|hk|tw|mo|cn|io|me|ly|gg|co|app|link|shop|xyz|top|cc|info|biz)\b|wa\.me|t\.me|bit\.ly|tinyurl|whats\s*app|wts\s*app|wtsapp|telegram|電報|\btg\b|\big\b|instagram|\bline\s*id\b|wechat|微信|discord|私聊|私訊|私信|\bpm\s*我|inbox\s*我|加我|私下交易|私人交易|轉數快|\bfps\b|payme|八達通|\+?\d{4}[\s-]?\d{4}|09\d{2}[\s-]?\d{3}[\s-]?\d{3}`, "i");
+
+function isBlockedChatText(value) {
+  // Full-width letters and digits (ｗｈａｔｓａｐｐ, ９１２３) are folded before checking.
+  return CHAT_BLOCKED_PATTERN.test(String(value || "").normalize("NFKC").toLowerCase());
+}
+
 // True while the page is in the foreground (players often switch to the stream app).
 function usePageVisible() {
   const [visible, setVisible] = useState(() => document.visibilityState !== "hidden");
@@ -4736,6 +4745,10 @@ function ChatRoom({ drawId, profile, active = true }) {
     event.preventDefault();
     const cleanText = text.trim();
     if (!cleanText || sending || cooldownMs > 0) return;
+    if (isBlockedChatText(cleanText)) {
+      alert("為保障玩家安全，聊天室不可發送連結、電話號碼或其他聯絡／付款方式。如需協助，請使用「聯絡客服」。");
+      return;
+    }
 
     setSending(true);
     try {

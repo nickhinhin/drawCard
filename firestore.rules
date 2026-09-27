@@ -590,6 +590,9 @@ service cloud.firestore {
         && request.resource.data.text is string
         && request.resource.data.text.size() > 0
         && request.resource.data.text.size() <= 500
+        // No links, phone numbers or other contact / payment details in chat (anti-scam).
+        // Keep in sync with CHAT_BLOCKED_PATTERN in src/App.jsx.
+        && !request.resource.data.text.lower().matches("[\\s\\S]*(https?://|www\\.|[a-z0-9-]+\\.(com|net|org|hk|tw|mo|cn|io|me|ly|gg|co|app|link|shop|xyz|top|cc|info|biz)\\b|wa\\.me|t\\.me|bit\\.ly|tinyurl|whats\\s*app|wts\\s*app|wtsapp|telegram|電報|\\btg\\b|\\big\\b|instagram|\\bline\\s*id\\b|wechat|微信|discord|私聊|私訊|私信|\\bpm\\s*我|inbox\\s*我|加我|私下交易|私人交易|轉數快|\\bfps\\b|payme|八達通|\\+?\\d{4}[\\s-]?\\d{4}|09\\d{2}[\\s-]?\\d{3}[\\s-]?\\d{3})[\\s\\S]*")
         && request.resource.data.createdAt == request.time;
     }
 

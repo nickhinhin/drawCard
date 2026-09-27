@@ -149,6 +149,19 @@ try {
 } catch {
   results.push("PASS  21 chat messages in one batch: rejected");
 }
+// Anti-scam: links, phone numbers and contact / payment handles are refused by the rules.
+for (const scamText of ["平價卡 WhatsApp 9123 4567", "睇 https://fake-shop.hk", "加我 IG 私下交易", "FPS 過數俾我"]) {
+  const scamBatch = writeBatch(db);
+  const scamMessage = doc(collection(db, "draws", drawId, "messages"));
+  scamBatch.update(doc(db, "users", uid), { lastChatAt: serverTimestamp(), lastChatMessageId: scamMessage.id, updatedAt: serverTimestamp() });
+  scamBatch.set(scamMessage, { ...chatMessage(), text: scamText });
+  try {
+    await scamBatch.commit();
+    results.push(`FAIL  scam chat message "${scamText}": ACCEPTED`);
+  } catch {
+    results.push(`PASS  scam chat message "${scamText}": rejected`);
+  }
+}
 const singleBatch = writeBatch(db);
 const singleMessage = doc(collection(db, "draws", drawId, "messages"));
 singleBatch.update(doc(db, "users", uid), { lastChatAt: serverTimestamp(), lastChatMessageId: singleMessage.id, updatedAt: serverTimestamp() });
