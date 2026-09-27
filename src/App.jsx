@@ -118,11 +118,11 @@ function hasPhonePassword(user) {
 function getPasswordAuthErrorMessage(error) {
   const code = String(error?.code || "");
   if (["auth/invalid-credential", "auth/wrong-password", "auth/user-not-found", "auth/invalid-email"].includes(code)) {
-    return "手機號碼或密碼不正確。如果未設定密碼或者忘記密碼，請撳「忘記密碼？」用 SMS 驗證碼重設。";
+    return "手機號碼或密碼不正確。如未設定密碼或忘記密碼，請按「忘記密碼？」以 SMS 驗證碼重設。";
   }
-  if (code === "auth/too-many-requests") return "嘗試次數過多，請稍後再試，或撳「忘記密碼？」重設密碼。";
+  if (code === "auth/too-many-requests") return "嘗試次數過多，請稍後再試，或按「忘記密碼？」重設密碼。";
   if (code === "auth/password-does-not-meet-requirements" || code === "auth/weak-password") {
-    return "密碼最少 8 個字，並要包括英文字母同數字。";
+    return "密碼最少 8 個字元，並須包含英文字母及數字。";
   }
   if (code === "auth/requires-recent-login") return "為保安理由，請登出後用 SMS 驗證碼重新登入，再設定密碼。";
   return getSafeErrorMessage(error, "密碼登入失敗，請再試一次。");
@@ -714,7 +714,7 @@ function App() {
       timedOut = true;
       googleSignInPendingRef.current = false;
       setSigningIn(false);
-      setAuthError("Google 登入未完成。請再撳一次登入，或者改用跳轉登入。");
+      setAuthError("Google 登入未完成。請再按一次登入，或改用跳轉登入。");
     }, 60000);
     try {
       googleProvider.setCustomParameters({ prompt: "select_account" });
@@ -1019,7 +1019,7 @@ function AdminSite({
           {signingIn ? "登入中..." : "使用 Google 登入"}
         </button>
         <button className="ghost-btn admin-redirect-login" type="button" onClick={onRedirectLogin}>
-          登入視窗冇彈出？改用跳轉登入
+          登入視窗沒有彈出？改用跳轉登入
         </button>
       </section>
     );
@@ -1168,8 +1168,8 @@ const FOOTER_PAGES = {
     title: "聯絡客服",
     eyebrow: "SUPPORT",
     body: [
-      "留低電郵同查詢內容，客服會以電郵回覆你。涉及代幣或配送嘅查詢，請寫埋房間名稱、場次、號碼或申請時間，方便核對。",
-      "LiveDraw 只會用網站顯示嘅 FPS 收款，客服唔會私訊叫你轉帳，亦唔會問你拎驗證碼或密碼。",
+      "請留下電郵及查詢內容，客服將以電郵回覆。如查詢涉及代幣或配送，請一併提供房間名稱、場次、號碼或申請時間，以便核對。",
+      "LiveDraw 只會使用網站所顯示的 FPS 收款；客服不會私訊要求你轉帳，亦不會索取驗證碼或密碼。",
     ],
   },
 };
@@ -1267,21 +1267,21 @@ function SupportContactForm() {
     return (
       <div className="support-form-done" role="status">
         <Check size={22} />
-        <p>已收到你嘅查詢，客服會盡快以電郵（{form.email}）回覆你。</p>
+        <p>已收到你的查詢，客服將盡快以電郵（{form.email}）回覆。</p>
       </div>
     );
   }
 
   return (
     <form className="stack-form support-form" onSubmit={submit}>
-      <label>電郵（必填，用嚟回覆你）<input type="email" autoComplete="email" value={form.email} onChange={update("email")} maxLength={254} required /></label>
+      <label>電郵（必填，用作回覆）<input type="email" autoComplete="email" value={form.email} onChange={update("email")} maxLength={254} required /></label>
       <label>稱呼（選填）<input value={form.name} onChange={update("name")} maxLength={60} /></label>
       <label>查詢類別
         <select value={form.category} onChange={update("category")}>
           {SUPPORT_CATEGORY_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
         </select>
       </label>
-      <label>查詢內容<textarea rows={5} value={form.message} onChange={update("message")} minLength={5} maxLength={2000} placeholder="請描述你嘅問題" required /></label>
+      <label>查詢內容<textarea rows={5} value={form.message} onChange={update("message")} minLength={5} maxLength={2000} placeholder="請描述你的問題" required /></label>
       {/* Hidden from people; bots that fill every field are ignored by the server. */}
       <input className="support-form-trap" tabIndex={-1} autoComplete="off" aria-hidden="true" value={form.website} onChange={update("website")} />
       {error && <p className="error-note">{error}</p>}
@@ -1445,7 +1445,7 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
       if (isPasswordReset && getAdditionalUserInfo(credential)?.isNewUser) {
         await credential.user.delete().catch(() => signOut(auth));
         setConfirmation(null);
-        throw new Error("呢個手機號碼未註冊，請返回選擇「註冊」。");
+        throw new Error("此手機號碼尚未註冊，請返回選擇「註冊」。");
       }
       if (isBeta && isRegistration) {
         const username = normalizeUsername(displayName);
@@ -1582,9 +1582,9 @@ function AuthDialog({ authError, isBeta = false, onClose, onGoogleLogin, signing
               {confirmation
                 ? "輸入已發送到你手機的 6 位數字驗證碼。"
                 : isBeta && !isRegistration && !useSmsLogin
-                  ? "輸入手機號碼同密碼登入。"
+                  ? "輸入手機號碼及密碼登入。"
                   : isPasswordReset
-                    ? "輸入已註冊嘅手機號碼，驗證之後需要設定新密碼。未設定過密碼嘅舊帳戶都用呢度設定。"
+                    ? "輸入已註冊的手機號碼，驗證後需設定新密碼。未曾設定密碼的舊帳戶亦可在此設定。"
                     : isBeta ? "輸入手機號碼以接收一次性驗證碼。" : "使用手機號碼接收一次性驗證碼，或使用 Google 帳戶繼續。"}
             </p>
 
@@ -1755,11 +1755,11 @@ function PhonePasswordGate({ authUser, resetting, onDone, onLogout }) {
     event.preventDefault();
     setError("");
     if (!PHONE_PASSWORD_PATTERN.test(password)) {
-      setError("密碼最少 8 個字，並要包括英文字母同數字。");
+      setError("密碼最少 8 個字元，並須包含英文字母及數字。");
       return;
     }
     if (password !== confirmPassword) {
-      setError("兩次輸入嘅密碼唔一樣。");
+      setError("兩次輸入的密碼不一致。");
       return;
     }
     setBusy(true);
@@ -1788,8 +1788,8 @@ function PhonePasswordGate({ authUser, resetting, onDone, onLogout }) {
           <h1>{resetting ? "重設密碼" : "設定登入密碼"}</h1>
           <p className="muted">
             {resetting
-              ? "你用咗 SMS 驗證碼登入，請設定新密碼先可以繼續。之後請用手機號碼同密碼登入。"
-              : "設定密碼之後，下次只需要輸入手機號碼同密碼就可以登入，唔使再收驗證碼。"}
+              ? "你已使用 SMS 驗證碼登入，請先設定新密碼方可繼續。之後請以手機號碼及密碼登入。"
+              : "設定密碼後，下次只需輸入手機號碼及密碼即可登入，無須再接收驗證碼。"}
           </p>
         </div>
       </div>
@@ -1797,7 +1797,7 @@ function PhonePasswordGate({ authUser, resetting, onDone, onLogout }) {
         <p className="muted">手機號碼：{authUser.phoneNumber}</p>
         <label>
           新密碼
-          <input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} maxLength={64} placeholder="最少 8 個字，包括英文字母同數字" required />
+          <input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} maxLength={64} placeholder="最少 8 個字元，須包含英文字母及數字" required />
         </label>
         <label>
           再輸入一次新密碼
@@ -1828,11 +1828,11 @@ function ChangePhonePasswordForm({ authUser }) {
     setError("");
     setMessage("");
     if (!PHONE_PASSWORD_PATTERN.test(password)) {
-      setError("新密碼最少 8 個字，並要包括英文字母同數字。");
+      setError("新密碼最少 8 個字元，並須包含英文字母及數字。");
       return;
     }
     if (password !== confirmPassword) {
-      setError("兩次輸入嘅新密碼唔一樣。");
+      setError("兩次輸入的新密碼不一致。");
       return;
     }
     setBusy(true);
@@ -1857,11 +1857,11 @@ function ChangePhonePasswordForm({ authUser }) {
     <section className="affiliate-link-card change-password-card">
       <div>
         <strong>更改登入密碼</strong>
-        <small>忘記現有密碼？登出後喺登入畫面撳「忘記密碼」，用 SMS 驗證碼重設。</small>
+        <small>忘記現有密碼？請登出後在登入畫面按「忘記密碼」，以 SMS 驗證碼重設。</small>
       </div>
       <form className="affiliate-application-form" onSubmit={changePassword}>
         <label>現有密碼<input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
-        <label>新密碼<input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} maxLength={64} placeholder="最少 8 個字，包括英文字母同數字" required /></label>
+        <label>新密碼<input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={8} maxLength={64} placeholder="最少 8 個字元，須包含英文字母及數字" required /></label>
         <label>再輸入一次新密碼<input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} minLength={8} maxLength={64} required /></label>
         {error && <p className="error-note">{error}</p>}
         {message && <p className="sf-pickup-selected"><Check size={15} />{message}</p>}
@@ -1949,7 +1949,7 @@ function AffiliateLinkCard({ profile, compact = false }) {
           </button>
         </div>
       ) : status === "pending" ? (
-        <p className="affiliate-status pending"><Clock3 size={16} />申請審批中，批准後會喺呢度顯示專屬連結。</p>
+        <p className="affiliate-status pending"><Clock3 size={16} />申請審批中，獲批准後將在此顯示專屬連結。</p>
       ) : (
         <form className="affiliate-application-form" onSubmit={submitApplication}>
           {status === "rejected" && (
@@ -2253,12 +2253,12 @@ function AppCheckBlockedNotice() {
       <Shield size={28} />
       <div>
         <h2>未能通過瀏覽器安全檢查</h2>
-        <p>系統暫時未能確認你嘅瀏覽器，所以載入唔到直播資料。請試吓：</p>
+        <p>系統暫時未能確認你的瀏覽器，因此無法載入直播資料。請嘗試以下方法：</p>
         <ol>
           <li>重新整理頁面。</li>
-          <li>如果你喺 Instagram、Facebook、WhatsApp 等 App 入面開連結，請撳右上角選單，改用 Safari 或 Chrome 開啟。</li>
-          <li>暫時關閉 VPN、廣告封鎖或者私隱保護擴充功能。</li>
-          <li>仍然唔得，請聯絡客服。</li>
+          <li>如你在 Instagram、Facebook、WhatsApp 等 App 內開啟連結，請按右上角選單，改用 Safari 或 Chrome 開啟。</li>
+          <li>暫時關閉 VPN、廣告封鎖或私隱保護擴充功能。</li>
+          <li>如問題持續，請聯絡客服。</li>
         </ol>
         <button className="primary-btn" type="button" onClick={() => window.location.reload()}>
           <RefreshCcw size={16} />重新整理
@@ -3684,7 +3684,7 @@ function BlindBoxPurchaseModal({ purchase, stage, onCancel, onConfirm }) {
 
             <h2 id="blind-box-title">盲盒生成完成</h2>
             <p><strong>#{purchase.slot.number}</strong> 已成功加入你的抽卡紀錄。</p>
-            <button className="primary-btn" type="button" onClick={onCancel}>返回揀卡</button>
+            <button className="primary-btn" type="button" onClick={onCancel}>返回選卡</button>
           </div>
         )}
       </section>
@@ -3916,7 +3916,7 @@ function RoomList({ rooms, cards = [], error, loading, onOpenRoom, profile }) {
           {!visibleRooms.length && (
             <div className="empty-state compact-empty room-filter-empty">
               <Gavel size={28} />
-              <p className="muted">呢個分類暫時未有房間。</p>
+              <p className="muted">此分類暫時未有房間。</p>
             </div>
           )}
         </div>
@@ -4180,7 +4180,7 @@ function RoomRoundOverview({
               <span>按圖放大查看</span>
             </a>
           ) : (
-            <p>呢一場已完結，賽果相片整理中。</p>
+            <p>此場已完結，賽果相片整理中。</p>
           )}
         </section>
       )}
@@ -4245,7 +4245,7 @@ function NumberGrid({
           <p className="number-outcome-description">{roundOutcomeDescription}</p>
         </div>
         <button className="small-btn number-step-back" type="button" onClick={onBack}>
-          <ChevronLeft size={17} />上一步 · 重新揀牌
+          <ChevronLeft size={17} />上一步 · 重新選卡
         </button>
       </div>
       {!isBeta && <aside className="round-stage-list" aria-label="場次列表">
@@ -4905,7 +4905,7 @@ function VipProgramPanel({ deposit, profile, rewards = [], tiers }) {
         }
         if (savedReward.cardId || savedReward.vipRewardStatus === "claimed") return;
         if (savedReward.vipRewardStatus !== "claimable" || !savedReward.targetCardId) {
-          throw new Error("呢份 VIP 獎勵暫時未能領取。");
+          throw new Error("此 VIP 獎勵暫時未能領取。");
         }
         transaction.update(rewardRef, {
           vipRewardStatus: "claimed",
@@ -5180,7 +5180,7 @@ function TokenRequest({ profile }) {
         throw new Error("邀請碼未啟用、已停用或代幣數目不正確。");
       }
       if (redemptionSnapshot.exists()) {
-        throw new Error("你已經使用過呢個邀請碼，每位用戶只可以使用一次。");
+        throw new Error("你已使用過此邀請碼，每位用戶只可使用一次。");
       }
       const verifiedPromo = promoSnapshot.data();
       const profileWindowStartedAt = toMillis(profile.tokenRequestWindowStartedAt);
@@ -5519,7 +5519,7 @@ function RequestList({ requests, loading = false, adminMode = false, onApprove, 
               {request.promoCode && <span>活動碼：{request.promoCode}</span>}
               {adminMode && request.paymentReference && <span>參考編號：{request.paymentReference}</span>}
               {adminMode && request.duplicateProofRequestIds?.length > 0 && (
-                <span className="duplicate-proof-warning">⚠️ 付款截圖同另外 {request.duplicateProofRequestIds.length} 張申請完全相同，請喺銀行核實係咪重複使用。</span>
+                <span className="duplicate-proof-warning">⚠️ 付款截圖與另外 {request.duplicateProofRequestIds.length} 張申請完全相同，請在銀行核實是否重複使用。</span>
               )}
             </div>
           </div>
@@ -6758,7 +6758,7 @@ function SupportInbox() {
         <Headphones size={22} />
         <div>
           <h2>客服訊息</h2>
-          <p className="muted">玩家喺「聯絡客服」留低嘅查詢。撳電郵地址直接回覆，處理完標記「已處理」。</p>
+          <p className="muted">玩家在「聯絡客服」提交的查詢。按電郵地址可直接回覆，處理後請標記為「已處理」。</p>
         </div>
       </div>
       <div className="collection-tabs admin-status-tabs">
@@ -6794,7 +6794,7 @@ function SupportInbox() {
             </article>
           ))}
         </div>
-      ) : <p className="muted">{view === "open" ? "冇未處理嘅客服訊息。" : "暫時未有已處理訊息。"}</p>}
+      ) : <p className="muted">{view === "open" ? "沒有未處理的客服訊息。" : "暫時未有已處理訊息。"}</p>}
     </section>
   );
 }
@@ -6860,7 +6860,7 @@ function AuditLogExporter() {
         <Shield size={22} />
         <div>
           <h2>審計紀錄</h2>
-          <p className="muted">揀日期範圍後一鍵分析期間內所有資料改動（代幣、購買、申請、設定等），列出可疑活動並可列印報告。原始紀錄存放於鎖定的日誌儲存區，任何人都不能修改、刪除或下載。</p>
+          <p className="muted">選擇日期範圍後，一鍵分析期間內所有資料改動（代幣、購買、申請、設定等），列出可疑活動並可列印報告。原始紀錄存放於鎖定的日誌儲存區，任何人都不能修改、刪除或下載。</p>
         </div>
       </div>
       <form className="affiliate-report-form" onSubmit={(event) => { event.preventDefault(); analyzeRange(); }}>
@@ -6882,8 +6882,8 @@ function AuditLogExporter() {
               </div>
             ))}
           </div>
-          {analysis.source === "default-30-days" && <p className="form-note">鎖定儲存區未建立，只分析咗最近 30 日內嘅紀錄。</p>}
-          {analysis.truncated && <p className="form-note">紀錄太多，只分析咗首 50,000 條，請縮短日期範圍。</p>}
+          {analysis.source === "default-30-days" && <p className="form-note">鎖定儲存區尚未建立，只分析了最近 30 日內的紀錄。</p>}
+          {analysis.truncated && <p className="form-note">紀錄過多，只分析了首 50,000 條，請縮短日期範圍。</p>}
           {analysis.findings.length ? (
             <>
               <button className="small-btn audit-print-hide" type="button" onClick={printReport}>
@@ -6901,7 +6901,7 @@ function AuditLogExporter() {
             </>
           ) : (
             <>
-              <p className="sf-pickup-selected"><Check size={15} />呢段期間冇發現可疑活動。</p>
+              <p className="sf-pickup-selected"><Check size={15} />此期間未發現可疑活動。</p>
               <button className="small-btn audit-print-hide" type="button" onClick={printReport}>
                 <FileText size={15} />列印報告
               </button>
@@ -6932,23 +6932,23 @@ function formatClock(value) {
 // Plain-language guess at what kind of problem an error is and what to do about it.
 const MONITOR_ERROR_KINDS = [
   { test: /before initialization|is not defined|is not a function|Cannot read propert|Cannot set propert|undefined is not|null is not|TypeError|ReferenceError|SyntaxError/i,
-    label: "程式錯誤", hint: "網站程式出錯，需要修正程式。撳「複製錯誤資料」貼俾工程師。", fix: true },
+    label: "程式錯誤", hint: "網站程式出錯，需要修正程式。請按「複製錯誤資料」並交給工程師。", fix: true },
   { test: /ChunkLoadError|Loading chunk|dynamically imported module|Importing a module script failed/i,
-    label: "舊版網頁", hint: "玩家開緊舊版網頁（啱啱更新過）。叫玩家重新整理頁面就會好。" },
+    label: "舊版網頁", hint: "玩家正在使用舊版網頁（網站剛更新）。請玩家重新整理頁面即可。" },
   { test: /permission-denied|Missing or insufficient permissions|權限/i,
-    label: "權限被拒", hint: "Firestore 規則或者帳戶權限擋咗呢個操作。如果係正常玩家操作都被擋，就要修改規則。", fix: true },
+    label: "權限被拒", hint: "Firestore 規則或帳戶權限阻止了此操作。如正常玩家操作亦被阻止，便需要修改規則。", fix: true },
   { test: /unauthenticated|App Check|請先登入|HTTP 401/i,
-    label: "登入／驗證失效", hint: "登入過期或者 App Check 驗證失敗。多數叫玩家重新登入或重新整理就得；如果好多人同時出現，就要檢查 App Check 設定。" },
+    label: "登入／驗證失效", hint: "登入已過期或驗證失敗。一般請玩家重新登入或重新整理即可；如大量玩家同時出現，請檢查相關設定。" },
   { test: /resource-exhausted|quota|Quota|HTTP 429|too-many-requests|嘗試次數過多/i,
-    label: "流量／配額上限", hint: "用量撞到上限（例如 SMS 或 API 配額）。去 Firebase console 檢查用量同配額。", fix: true },
+    label: "流量／配額上限", hint: "用量已達上限（例如 SMS 或 API 配額）。請到 Firebase console 檢查用量及配額。", fix: true },
   { test: /deadline-exceeded|timeout|timed out|逾時/i,
-    label: "逾時", hint: "伺服器處理得太慢。如果持續出現，可能要加大 function 記憶體或者減少一次處理嘅資料量。" },
+    label: "逾時", hint: "伺服器處理時間過長。如持續出現，可能需要增加 function 記憶體或減少每次處理的資料量。" },
   { test: /unavailable|network|Failed to fetch|offline|Load failed|NetworkError|網絡/i,
-    label: "網絡問題", hint: "多數係玩家網絡唔穩定，唔使改程式。如果同一時間好多人出現，就檢查 Firebase 狀態。" },
+    label: "網絡問題", hint: "多數是玩家網絡不穩定，無須修改程式。如同一時間大量玩家出現，請檢查 Firebase 狀態。" },
   { test: /failed-precondition|already-exists|invalid-argument|not-found|已被|不足|已經/i,
-    label: "資料狀態", hint: "操作同資料狀態唔夾（例如號碼已被買、餘額不足）。通常屬正常情況；如果玩家覺得唔合理就要跟進。" },
+    label: "資料狀態", hint: "操作與資料狀態不符（例如號碼已被購買、餘額不足）。通常屬正常情況；如玩家認為不合理，請跟進。" },
   { test: /HTTP 5\d\d|internal|Error:/i,
-    label: "伺服器錯誤", hint: "伺服器程式出錯。撳「查看完整日誌」睇詳細內容，或者複製錯誤資料俾工程師。", fix: true },
+    label: "伺服器錯誤", hint: "伺服器程式出錯。請按「查看完整日誌」查看詳情，或複製錯誤資料交給工程師。", fix: true },
 ];
 
 function formatMonitorTime(value) {
@@ -6959,7 +6959,7 @@ function formatMonitorTime(value) {
 function explainMonitorError(item) {
   const text = `${item.code || ""} ${item.message || ""} ${item.detail || ""}`;
   return MONITOR_ERROR_KINDS.find((kind) => kind.test.test(text))
-    || { label: "未分類", hint: "睇下面詳細資料；唔肯定就複製錯誤資料俾工程師。" };
+    || { label: "未分類", hint: "請查看下方詳細資料；如不確定，請複製錯誤資料交給工程師。" };
 }
 
 function monitorLogsUrl(item, source) {
@@ -6978,7 +6978,7 @@ function monitorErrorText(item, source) {
     ? [
       `【玩家端錯誤】${item.message}`,
       `類型：${kind.label}`,
-      `錯誤碼：${item.code || "（冇）"}`,
+      `錯誤碼：${item.code || "（無）"}`,
       `次數：${item.count} 次 · ${item.users} 位用戶`,
       `時間：${formatMonitorTime(item.firstSeen)} 至 ${formatMonitorTime(item.lastSeen)}`,
       `位置：${(item.places || [item.where]).filter(Boolean).join("、") || "--"}`,
@@ -7030,7 +7030,7 @@ function MonitorErrorCard({ item, source }) {
         <dl className="monitor-error-details">
           {source === "client" ? (
             <>
-              <dt>錯誤碼</dt><dd>{item.code || "（冇）"}</dd>
+              <dt>錯誤碼</dt><dd>{item.code || "（無）"}</dd>
               <dt>發生位置</dt><dd>{(item.places?.length ? item.places : [item.where]).filter(Boolean).join("、") || "--"}</dd>
               <dt>頁面</dt><dd>{item.pages?.join("、") || "--"}</dd>
               <dt>裝置</dt><dd>{item.devices?.join("、") || "--"}</dd>
@@ -7155,11 +7155,11 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const buyingStopped = Boolean(liveRoom && isRoundBuyingBlocked(liveRoom, currentRoundId));
 
   const alerts = [];
-  if (!liveRoom) alerts.push({ level: "medium", text: "而家冇直播中嘅房間。" });
+  if (!liveRoom) alerts.push({ level: "medium", text: "目前沒有直播中的房間。" });
   if (buyingStopped) alerts.push({ level: "medium", text: `直播中，但${formatRoundLabel(currentRoundId)}已停止購買。` });
-  if (roundFill >= 0.9 && roundFill < 1) alerts.push({ level: "low", text: `${formatRoundLabel(currentRoundId)}就快賣晒（${soldSlots.length}/${roundSize}）。` });
-  if (roundFill >= 1) alerts.push({ level: "low", text: `${formatRoundLabel(currentRoundId)}已經賣晒，可以準備開卡或者開下一場。` });
-  if (oldestPendingWait >= MONITOR_PENDING_ALERT_MS) alerts.push({ level: "high", text: `有代幣申請已經等咗 ${formatAgo(oldestPendingWait)}，玩家可能等緊入代幣先買到。` });
+  if (roundFill >= 0.9 && roundFill < 1) alerts.push({ level: "low", text: `${formatRoundLabel(currentRoundId)}即將售罄（${soldSlots.length}/${roundSize}）。` });
+  if (roundFill >= 1) alerts.push({ level: "low", text: `${formatRoundLabel(currentRoundId)}已售罄，可準備開卡或開始下一場。` });
+  if (oldestPendingWait >= MONITOR_PENDING_ALERT_MS) alerts.push({ level: "high", text: `有代幣申請已等候 ${formatAgo(oldestPendingWait)}，玩家可能正等待代幣入帳才能購買。` });
   if (health?.clientErrorCount) alerts.push({ level: "high", text: `監察期間有 ${health.clientErrorCount} 個玩家端錯誤。` });
   if (health?.serverErrorCount) alerts.push({ level: "high", text: `監察期間有 ${health.serverErrorCount} 個伺服器錯誤。` });
   if (healthError) alerts.push({ level: "medium", text: healthError });
@@ -7172,8 +7172,8 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
           <div>
             <h2>直播監察</h2>
             <p className="muted">
-              {liveRoom ? `${liveRoom.title || "直播"} · ${formatRoundLabel(currentRoundId)} · ${buyingStopped ? "已停止購買" : "開放購買中"}` : "而家冇直播中嘅房間"}
-              {" · "}監察咗 {formatAgo(now - sessionStartMs)}（由 {formatClock(new Date(sessionStartMs))} 開始）
+              {liveRoom ? `${liveRoom.title || "直播"} · ${formatRoundLabel(currentRoundId)} · ${buyingStopped ? "已停止購買" : "開放購買中"}` : "目前沒有直播中的房間"}
+              {" · "}已監察 {formatAgo(now - sessionStartMs)}（由 {formatClock(new Date(sessionStartMs))} 開始）
             </p>
           </div>
           <button className="primary-btn monitor-stop" type="button" disabled={stopping} onClick={onStop}>
@@ -7229,11 +7229,11 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
               <h4>玩家端錯誤</h4>
               {health.clientErrors.length ? health.clientErrors.map((item) => (
                 <MonitorErrorCard item={item} source="client" key={`${item.code}-${item.message}`} />
-              )) : <p className="muted">冇玩家端錯誤。</p>}
+              )) : <p className="muted">沒有玩家端錯誤。</p>}
               <h4>伺服器錯誤及警告</h4>
               {health.serverErrors.length ? health.serverErrors.map((item) => (
                 <MonitorErrorCard item={item} source="server" key={`${item.service}-${item.severity}-${item.message}`} />
-              )) : <p className="muted">冇伺服器錯誤。</p>}
+              )) : <p className="muted">沒有伺服器錯誤。</p>}
             </>
           ) : healthError ? <p className="error-note">{healthError}</p> : <InlineLoading label="正在讀取錯誤紀錄..." />}
         </section>
@@ -7307,12 +7307,12 @@ function MonitorReportView({ session, onClose }) {
           <h4>每場銷售</h4>
           <div className="monitor-feed">
             {(report.sales?.byRound || []).map((round) => <p key={`${round.room}-${round.round}`}>{round.room} {formatRoundLabel(round.round)} · {round.count} 次 · ⚡{formatTokenNumber(round.tokens)}</p>)}
-            {!report.sales?.byRound?.length && <p className="muted">冇購買。</p>}
+            {!report.sales?.byRound?.length && <p className="muted">沒有購買紀錄。</p>}
           </div>
           <h4>最高消費</h4>
           <div className="monitor-feed">
             {(report.sales?.topBuyers || []).map((buyer) => <p key={buyer.name}>{buyer.name} · {buyer.count} 次 · ⚡{formatTokenNumber(buyer.tokens)}</p>)}
-            {!report.sales?.topBuyers?.length && <p className="muted">冇購買。</p>}
+            {!report.sales?.topBuyers?.length && <p className="muted">沒有購買紀錄。</p>}
           </div>
           <h4>代幣申請</h4>
           <div className="monitor-feed">
@@ -7330,7 +7330,7 @@ function MonitorReportView({ session, onClose }) {
               {(report.errors?.serverErrors || []).map((item) => (
                 <MonitorErrorCard item={item} source="server" key={`s-${item.service}-${item.severity}-${item.message}`} />
               ))}
-              {!report.errors?.clientErrors?.length && !report.errors?.serverErrors?.length && <p className="muted">冇錯誤。</p>}
+              {!report.errors?.clientErrors?.length && !report.errors?.serverErrors?.length && <p className="muted">沒有錯誤。</p>}
             </div>
           )}
           <h4>可疑活動</h4>
@@ -7342,7 +7342,7 @@ function MonitorReportView({ session, onClose }) {
                   <p>{item.detail}</p>
                 </article>
               ))}
-              {!report.audit?.findings?.length && <p className="muted">冇發現可疑活動。</p>}
+              {!report.audit?.findings?.length && <p className="muted">未發現可疑活動。</p>}
             </div>
           )}
         </div>
@@ -7401,7 +7401,7 @@ function LiveMonitor() {
           <Bell size={22} />
           <div>
             <h2>直播監察</h2>
-            <p className="muted">直播開始時撳「開始監察」，期間會即時顯示銷售、待處理申請同錯誤；完場撳「停止」就會產生報告。</p>
+            <p className="muted">直播開始時按「開始監察」，期間會即時顯示銷售、待處理申請及錯誤；直播結束後按「停止」即會產生報告。</p>
           </div>
         </div>
         <button className="primary-btn" type="button" disabled={busy} onClick={startMonitor}>
@@ -7580,14 +7580,14 @@ function LiveDrawAdminPanel({ profile }) {
     const paymentReference = isPromo ? "" : window.prompt("銀行／轉數快交易參考編號（選填，可留空）：", "");
     if (paymentReference === null) return;
     if (request.duplicateProofRequestIds?.length
-      && !window.confirm("⚠️ 呢張付款截圖同其他申請用嘅截圖完全一樣。確定已經喺銀行核實係另一筆入帳？")) return;
+      && !window.confirm("⚠️ 此付款截圖與其他申請所用的截圖完全相同。確定已在銀行核實為另一筆入帳？")) return;
 
     const payload = { requestId: request.id, decision: "approved", verifiedHkdAmount, paymentReference };
     try {
       await reviewTokenRequest(payload);
     } catch (error) {
       if (error?.details?.duplicateReference) {
-        if (!window.confirm(`${error.message}\n\n確定唔係同一筆付款，仍然批准？`)) return;
+        if (!window.confirm(`${error.message}\n\n確定並非同一筆付款，仍然批准？`)) return;
         try {
           await reviewTokenRequest({ ...payload, allowDuplicateReference: true });
         } catch (retryError) {
@@ -8031,7 +8031,7 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
         <ListChecks size={22} />
         <div>
           <h2>按場次分配抽卡結果</h2>
-          <p className="muted">一次標記所有已售號碼嘅天堂／地獄結果，預覽完整表格後先正式確認。</p>
+          <p className="muted">一次標記所有已售號碼的天堂／地獄結果，預覽完整表格後再正式確認。</p>
         </div>
       </div>
       {legacySyncMessage && <p className="form-note">{legacySyncMessage}</p>}
@@ -8039,7 +8039,7 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
         <>
           <div className="batch-result-toolbar">
             <label>
-              <span>揀場次</span>
+              <span>選擇場次</span>
               <select value={selectedSessionKey} onChange={(event) => setSelectedSessionKey(event.target.value)}>
                 {sessions.map((session) => (
                   <option key={session.key} value={session.key}>{session.drawTitle} · {formatRoundLabel(session.roundId)}</option>
@@ -8093,7 +8093,7 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
             預覽完整結果表
           </button>
         </>
-      ) : <p className="muted">暫時未有可分配嘅購買場次。</p>}
+      ) : <p className="muted">暫時未有可分配的購買場次。</p>}
       {previewOpen && (
         <AdminRoundResultConfirmModal
           drawTitle={selectedSession.drawTitle}
@@ -8423,7 +8423,7 @@ function UserRecordAuditModal({ records, user, onClose }) {
             slotSnapshot = await getDoc(doc(db, "draws", record.drawId, "slots", String(record.slotId)));
           }
           if (!slotSnapshot.exists()) {
-            return [record.id, { status: "warning", message: "搵唔到對應房間號碼紀錄" }];
+            return [record.id, { status: "warning", message: "找不到對應的房間號碼紀錄" }];
           }
 
           const slot = slotSnapshot.data();
@@ -8466,7 +8466,7 @@ function UserRecordAuditModal({ records, user, onClose }) {
         <div className="user-audit-summary">
           <span><small>累計入金</small><strong>{accountSummary ? `HK$${formatTokenNumber(accountSummary.totalDeposits || 0)}` : "載入中..."}</strong></span>
           <span><small>抽卡投入</small><strong><TokenAmount value={totalSpend} /></strong></span>
-          <span><small>派彩／攞出</small><strong><TokenAmount value={totalPayout} /></strong></span>
+          <span><small>派彩／派出</small><strong><TokenAmount value={totalPayout} /></strong></span>
           <span className={grossProfit >= 0 ? "user-profit" : "user-loss"}>
             <small>平台毛利</small>
             <strong>{grossProfit >= 0 ? "賺 " : "蝕 "}<TokenAmount value={Math.abs(grossProfit)} /></strong>
@@ -8568,7 +8568,7 @@ function UserRecordAuditModal({ records, user, onClose }) {
               );
             })}
           </div>
-        ) : <p className="empty-state compact-empty">搵唔到呢位玩家嘅紀錄。</p>}
+        ) : <p className="empty-state compact-empty">找不到此玩家的紀錄。</p>}
         </section>
         {selectedProof && (
           <div className="proof-preview-backdrop" role="presentation" onMouseDown={() => setSelectedProof(null)}>
@@ -8743,11 +8743,11 @@ export function FutureLiveScheduleManager({ draw, draws, profile }) {
     const cleanTitle = title.trim();
     const date = buildLocalDateTime(liveDate, liveHour, liveMinute);
     if (!cleanTitle || !date) {
-      alert("請輸入直播名稱同日期時間。");
+      alert("請輸入直播名稱及日期時間。");
       return;
     }
     if (date.getTime() <= Date.now()) {
-      alert("未來直播時間必須遲過而家。");
+      alert("未來直播時間必須晚於現在。");
       return;
     }
 
@@ -8816,12 +8816,12 @@ export function FutureLiveScheduleManager({ draw, draws, profile }) {
   }
 
   async function removeFutureLive(item) {
-    if (!window.confirm(`確認取消「${item.title}」？只有未有預購記錄嘅直播先可以取消。`)) return;
+    if (!window.confirm(`確認取消「${item.title}」？只有未有預購記錄的直播才可取消。`)) return;
     setSaving(true);
     try {
       const purchases = await getDocs(query(collection(db, "drawRecords"), where("drawId", "==", item.id)));
       if (!purchases.empty) {
-        alert("呢個未來直播已經有預購記錄，唔可以取消。請先處理相關訂單。");
+        alert("此未來直播已有預購記錄，不可取消。請先處理相關訂單。");
         return;
       }
       await adminUpdateDoc(doc(db, "draws", item.id), {
@@ -8993,7 +8993,7 @@ function AddBroadcastForm({ cards, currentLive }) {
       return;
     }
     if (firstRoundDate.getTime() <= Date.now()) {
-      alert("首場時間必須遲過而家。");
+      alert("首場時間必須晚於現在。");
       return;
     }
     if (!selectedCardIds.length) {
@@ -9551,7 +9551,7 @@ function HomepageBannerManager({ profile }) {
         <div>
           <h2>首頁 Banner 輪播</h2>
           <p className="muted">
-            最多 {MAX_BANNER_SLIDES} 張，會按以下次序自動輪播，改動即時顯示俾所有訪客；建議使用約 1600 × 540 的橫向圖片。
+            最多 {MAX_BANNER_SLIDES} 張，會按以下次序自動輪播，改動會即時向所有訪客顯示；建議使用約 1600 × 540 的橫向圖片。
           </p>
         </div>
       </div>
@@ -9579,7 +9579,7 @@ function HomepageBannerManager({ profile }) {
       ) : (
         <div className="homepage-banner-preview">
           <img src={DEFAULT_HOMEPAGE_BANNER_URL} alt="預設首頁 Banner" />
-          <p className="form-note">而家顯示緊預設 Banner。加入圖片後會改為顯示你上載嘅 Banner。</p>
+          <p className="form-note">目前顯示預設 Banner。加入圖片後將改為顯示你上載的 Banner。</p>
         </div>
       )}
 
@@ -9925,7 +9925,7 @@ function AdminRoomRecordsPanel({ cards, records, profile, loading = false }) {
 
           <h2>{isBeta ? "直播購買紀錄 / 分配抽卡結果" : "房間購買紀錄 / 分配抽卡結果"}</h2>
           <p className="muted">
-            {isBeta ? "按場次查看購買資料並分配實際抽中卡牌。" : "用房間同場次篩選後，直接查看購買資料並分配實際抽中卡牌。"}
+            {isBeta ? "按場次查看購買資料並分配實際抽中卡牌。" : "按房間及場次篩選後，直接查看購買資料並分配實際抽中卡牌。"}
           </p>
         </div>
       </div>
@@ -10108,7 +10108,7 @@ function AdminBlindBoxConfirmModal({ assignment, saving, onCancel, onConfirm }) 
         </div>
 
         <h2 id="admin-blind-box-title">確認生成盲盒</h2>
-        <p className="blind-box-copy">請核對派發結果。確認後，玩家會在「我的紀錄」及「我的卡牌」看到呢張卡。</p>
+        <p className="blind-box-copy">請核對派發結果。確認後，玩家將在「我的紀錄」及「我的卡牌」看到此卡。</p>
         <div className="blind-box-order admin-blind-box-order">
           <div><span>玩家</span><strong>{record.username || "未命名玩家"}</strong></div>
           <div><span>房間／場次</span><strong>{record.drawTitle || "未命名房間"} · {formatRoundLabel(record.round)}</strong></div>
@@ -10520,7 +10520,7 @@ function CreateCardForm({ cards, profile }) {
     if (!modePrices) {
       alert(manualPricing
         ? "請輸入有效的 1/2、1/5、1/10 自訂售價。"
-        : "請先設定地獄對應卡，系統先可以自動計算三種玩法價錢。");
+        : "請先設定地獄對應卡，系統才可自動計算三種玩法的價錢。");
       return;
     }
     if (!newCard.allowedShareModes.length) {
@@ -11579,7 +11579,7 @@ function LiveRoundSettingsList({ allDraws, cards, currentLive, profile, schedule
 
   async function archiveBroadcast(broadcast) {
     if (broadcast.status === "live") {
-      alert("直播中嘅場次唔可以封存，請先將另一場設為直播中。");
+      alert("直播中的場次不可封存，請先將另一場設為直播中。");
       return;
     }
     if (!window.confirm(`確認封存「${broadcast.title || "LiveDraw 直播"}」？場次、號碼、購買記錄及賽果會保留。`)) return;
@@ -11593,7 +11593,7 @@ function LiveRoundSettingsList({ allDraws, cards, currentLive, profile, schedule
         const drawSnapshot = await transaction.get(drawRef);
         if (!drawSnapshot.exists() || drawSnapshot.data().status === "completed") return;
         if (drawSnapshot.data().status === "live") {
-          throw new Error("直播中嘅場次唔可以封存，請先將另一場設為直播中。");
+          throw new Error("直播中的場次不可封存，請先將另一場設為直播中。");
         }
 
         transaction.update(drawRef, {
@@ -13134,14 +13134,14 @@ function normalizePhoneNumber(country, value) {
 
 function getPhoneAuthErrorMessage(error) {
   const messages = {
-    "auth/invalid-phone-number": "手機號碼格式不正確，請檢查地區號碼同手機號碼。",
+    "auth/invalid-phone-number": "手機號碼格式不正確，請檢查地區號碼及手機號碼。",
     "auth/invalid-verification-code": "驗證碼不正確，請重新輸入。",
     "auth/code-expired": "驗證碼已過期，請重新發送。",
     "auth/too-many-requests": "嘗試次數過多，請稍後再試。",
     "auth/quota-exceeded": "今日 SMS 驗證配額已用完，請使用 Google 登入或稍後再試。",
     "auth/operation-not-allowed": "此手機號碼地區暫不支援 SMS 驗證，只支援香港、台灣及澳門號碼。",
     "auth/captcha-check-failed": "安全驗證失敗，請重新整理後再試。",
-    "auth/internal-error": "未能完成安全驗證，請重新整理頁面再試。如果用緊 App 內置瀏覽器，請改用 Safari 或 Chrome 開啟。",
+    "auth/internal-error": "未能完成安全驗證，請重新整理頁面後再試。如正在使用 App 內置瀏覽器，請改用 Safari 或 Chrome 開啟。",
     "auth/network-request-failed": "網絡連線有問題，請檢查網絡後再試。",
     "auth/missing-phone-number": "請輸入手機號碼。",
   };

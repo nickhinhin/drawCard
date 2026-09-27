@@ -1574,7 +1574,7 @@ export const adminMonitorSession = onCall({ ...adminCallableOptions, timeoutSeco
   // Claim the stop first so a double press cannot build two reports.
   const snapshot = await db.runTransaction(async (transaction) => {
     const current = await transaction.get(sessionRef);
-    if (!current.exists || current.data().status !== "active") throw new HttpsError("failed-precondition", "呢個監察已經停止。");
+    if (!current.exists || current.data().status !== "active") throw new HttpsError("failed-precondition", "此監察已經停止。");
     transaction.update(sessionRef, { status: "stopping" });
     return current;
   });

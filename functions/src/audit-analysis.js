@@ -85,7 +85,7 @@ export function analyzeAuditEntries(entries, thresholds = AUDIT_THRESHOLDS) {
 
     // 1. Changes that did not come from the website or our Cloud Functions.
     if (SENSITIVE_COLLECTIONS.has(collection) && !isPlayer(entry) && !isServer(entry)) {
-      findings.push(finding("high", "direct-edit", "唔經網站或伺服器嘅直接修改", entry,
+      findings.push(finding("high", "direct-edit", "未經網站或伺服器的直接修改", entry,
         `${entry.operation} ${entry.path}，改動欄位：${Object.keys(entry.changes || {}).join(", ") || "-"}`));
     }
 
@@ -94,7 +94,7 @@ export function analyzeAuditEntries(entries, thresholds = AUDIT_THRESHOLDS) {
       const gain = Number(after(entry, "tokens")) - Number(before(entry, "tokens"));
       if (gain > 0 && !changed(entry, "lastTokenGrantRequestId") && !changed(entry, "lastConversionRecordId")) {
         findings.push(finding("high", "unexplained-tokens", "代幣無故增加", entry,
-          `代幣 ${before(entry, "tokens")} → ${after(entry, "tokens")}（+${gain}），冇對應批准入數或卡牌兌換`));
+          `代幣 ${before(entry, "tokens")} → ${after(entry, "tokens")}（+${gain}），沒有對應的批准入數或卡牌兌換`));
       }
     }
 
@@ -103,7 +103,7 @@ export function analyzeAuditEntries(entries, thresholds = AUDIT_THRESHOLDS) {
       const owner = context(entry, "uid");
       const reviewer = context(entry, "reviewedBy");
       if (owner && reviewer && owner === reviewer) {
-        findings.push(finding("high", "self-approval", "自己批准自己", entry, `申請人同批准人都係 ${owner}`));
+        findings.push(finding("high", "self-approval", "自己批准自己", entry, `申請人及批准人均為 ${owner}`));
       }
     }
 
