@@ -6362,3 +6362,89 @@
   color: #fff;
   font: inherit;
 }
+
+/* Contact form and admin support inbox. */
+.beta-mode .support-form {
+  margin-top: 14px;
+}
+
+.beta-mode .support-form select,
+.beta-mode .support-form textarea {
+  border: 1px solid #3a3a42;
+  border-radius: 3px;
+  background: #0b0b0f;
+  color: #fff;
+  font: inherit;
+}
+
+.beta-mode .support-form select {
+  min-height: 44px;
+  padding: 0 10px;
+}
+
+.beta-mode .support-form textarea {
+  padding: 10px;
+  resize: vertical;
+}
+
+.beta-mode .support-form-trap {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.beta-mode .support-form-done {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid #2f6b3f;
+  border-radius: 3px;
+  color: #c8f0d2;
+}
+
+.beta-mode .support-inbox {
+  display: grid;
+  gap: 10px;
+}
+
+.beta-mode .support-message {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid #2a2a30;
+  border-radius: 3px;
+  background: #111116;
+}
+
+.beta-mode .support-message-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.beta-mode .support-message-head small {
+  margin-left: auto;
+  color: var(--beta-muted);
+}
+
+.beta-mode .support-message a {
+  color: #ff8a9b;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .support-message-text {
+  margin: 0;
+  color: #e9e9eb;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .duplicate-proof-warning {
+  color: #ff8a9b;
+  font-weight: 800;
+}

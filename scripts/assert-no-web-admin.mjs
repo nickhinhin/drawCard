@@ -13,6 +13,7 @@ const adminMarkers = [
   "adminLiveHealth",
   "adminAuditAnalyze",
   "adminMonitorSession",
+  "adminUpdateSupportMessage",
 ];
 
 async function listFiles(dir) {

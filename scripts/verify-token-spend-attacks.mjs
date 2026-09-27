@@ -214,6 +214,8 @@ for (const [label, action] of [
   ["player lists monitor reports", () => getDocs(collection(db, "monitorSessions"))],
   ["player forges a monitor report", () => setDoc(doc(db, "monitorSessions", "fake"), { status: "completed" })],
   ["player edits a monitor report", () => updateDoc(doc(db, "monitorSessions", "s1"), { status: "active" })],
+  ["player lists support messages (other players' emails)", () => getDocs(collection(db, "supportMessages"))],
+  ["player writes a support message directly", () => setDoc(doc(db, "supportMessages", "fake"), { email: "a@b.co", message: "hi" })],
   ["player reads admin audit logs", () => getDocs(collection(db, "adminAuditLogs"))],
   ["player writes admin audit logs", () => setDoc(doc(db, "adminAuditLogs", "fake"), { action: "x" })],
   ["player reads affiliate applications", () => getDocs(collection(db, "affiliateApplications"))],

@@ -1168,8 +1168,8 @@ const FOOTER_PAGES = {
     title: "聯絡客服",
     eyebrow: "SUPPORT",
     body: [
-      "查詢時請準備帳戶顯示名稱、房間名稱、場次、號碼及相關申請時間，以便客服核對。",
-      "請使用平台官方客服渠道聯絡，切勿向非官方帳戶提供驗證碼、付款資料或配送地址。",
+      "留低電郵同查詢內容，客服會以電郵回覆你。涉及代幣或配送嘅查詢，請寫埋房間名稱、場次、號碼或申請時間，方便核對。",
+      "LiveDraw 只會用網站顯示嘅 FPS 收款，客服唔會私訊叫你轉帳，亦唔會問你拎驗證碼或密碼。",
     ],
   },
 };
@@ -1220,6 +1220,7 @@ function BetaFooter({ onNavigate }) {
             <div className="footer-page-copy">
               {page.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
+            {activePage === "support" && <SupportContactForm />}
             {activePage === "process" && (
               <button className="primary-btn" type="button" onClick={() => { onNavigate("draw"); setActivePage(""); window.scrollTo({ top: 0, behavior: "smooth" }); }}>
                 開始選擇房間
@@ -1229,6 +1230,65 @@ function BetaFooter({ onNavigate }) {
         </div>
       )}
     </>
+  );
+}
+
+const SUPPORT_CATEGORY_OPTIONS = [
+  { value: "tokens", label: "代幣／付款" },
+  { value: "draw", label: "抽卡／賽果" },
+  { value: "shipping", label: "配送" },
+  { value: "account", label: "帳戶／登入" },
+  { value: "other", label: "其他" },
+];
+
+function SupportContactForm() {
+  const signedInEmail = displayEmail(auth.currentUser?.email);
+  const [form, setForm] = useState({ email: signedInEmail, name: "", category: "tokens", message: "", website: "" });
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState("");
+  const update = (key) => (event) => setForm((current) => ({ ...current, [key]: event.target.value }));
+
+  async function submit(event) {
+    event.preventDefault();
+    setError("");
+    setSending(true);
+    try {
+      await httpsCallable(functions, "submitSupportMessage")({ ...form, page: window.location.pathname + window.location.search.slice(0, 60) });
+      setSent(true);
+    } catch (submitError) {
+      setError(getSafeErrorMessage(submitError, "未能送出，請稍後再試。"));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  if (sent) {
+    return (
+      <div className="support-form-done" role="status">
+        <Check size={22} />
+        <p>已收到你嘅查詢，客服會盡快以電郵（{form.email}）回覆你。</p>
+      </div>
+    );
+  }
+
+  return (
+    <form className="stack-form support-form" onSubmit={submit}>
+      <label>電郵（必填，用嚟回覆你）<input type="email" autoComplete="email" value={form.email} onChange={update("email")} maxLength={254} required /></label>
+      <label>稱呼（選填）<input value={form.name} onChange={update("name")} maxLength={60} /></label>
+      <label>查詢類別
+        <select value={form.category} onChange={update("category")}>
+          {SUPPORT_CATEGORY_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+        </select>
+      </label>
+      <label>查詢內容<textarea rows={5} value={form.message} onChange={update("message")} minLength={5} maxLength={2000} placeholder="請描述你嘅問題" required /></label>
+      {/* Hidden from people; bots that fill every field are ignored by the server. */}
+      <input className="support-form-trap" tabIndex={-1} autoComplete="off" aria-hidden="true" value={form.website} onChange={update("website")} />
+      {error && <p className="error-note">{error}</p>}
+      <button className="primary-btn" type="submit" disabled={sending}>
+        <Send size={16} />{sending ? "送出中..." : "送出查詢"}
+      </button>
+    </form>
   );
 }
 
@@ -5457,6 +5517,10 @@ function RequestList({ requests, loading = false, adminMode = false, onApprove, 
               <span>{formatDate(request.createdAt)}</span>
               {Number(request.hkdAmount) > 0 && <span>付款金額：HK${formatTokenNumber(request.hkdAmount)}</span>}
               {request.promoCode && <span>活動碼：{request.promoCode}</span>}
+              {adminMode && request.paymentReference && <span>參考編號：{request.paymentReference}</span>}
+              {adminMode && request.duplicateProofRequestIds?.length > 0 && (
+                <span className="duplicate-proof-warning">⚠️ 付款截圖同另外 {request.duplicateProofRequestIds.length} 張申請完全相同，請喺銀行核實係咪重複使用。</span>
+              )}
             </div>
           </div>
           <div className="record-actions">
@@ -6653,6 +6717,88 @@ function AffiliateManager() {
   );
 }
 
+// Admin view of contact-form messages; replies go out by email.
+function SupportInbox() {
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState("open");
+  const [busyId, setBusyId] = useState("");
+
+  useEffect(() => {
+    const inboxQuery = query(collection(db, "supportMessages"), orderBy("createdAt", "desc"), limit(300));
+    return onSnapshot(inboxQuery, (snapshot) => {
+      setMessages(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      setLoading(false);
+    }, (error) => {
+      showSafeError(error, "未能載入客服訊息。");
+      setLoading(false);
+    });
+  }, []);
+
+  async function setStatus(message, status) {
+    const adminNote = status === "resolved" ? window.prompt("處理備註（選填）：", message.adminNote || "") : message.adminNote;
+    if (adminNote === null) return;
+    setBusyId(message.id);
+    try {
+      await httpsCallable(functions, "adminUpdateSupportMessage")({ id: message.id, status, adminNote });
+    } catch (error) {
+      showSafeError(error, "未能更新狀態。");
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  const categoryLabel = (value) => SUPPORT_CATEGORY_OPTIONS.find((item) => item.value === value)?.label || "其他";
+  const visible = messages.filter((item) => (view === "open" ? item.status !== "resolved" : item.status === "resolved"));
+  const openCount = messages.filter((item) => item.status !== "resolved").length;
+
+  return (
+    <section className="panel">
+      <div className="section-heading compact">
+        <Headphones size={22} />
+        <div>
+          <h2>客服訊息</h2>
+          <p className="muted">玩家喺「聯絡客服」留低嘅查詢。撳電郵地址直接回覆，處理完標記「已處理」。</p>
+        </div>
+      </div>
+      <div className="collection-tabs admin-status-tabs">
+        <button className={view === "open" ? "active" : ""} type="button" onClick={() => setView("open")}>未處理 {openCount}</button>
+        <button className={view === "resolved" ? "active" : ""} type="button" onClick={() => setView("resolved")}>已處理 {messages.length - openCount}</button>
+      </div>
+      {loading ? <InlineLoading label="正在載入客服訊息..." /> : visible.length ? (
+        <div className="support-inbox">
+          {visible.map((item) => (
+            <article className="support-message" key={item.id}>
+              <div className="support-message-head">
+                <span className="status-badge pending">{categoryLabel(item.category)}</span>
+                <strong>{item.name || item.username || "未提供稱呼"}</strong>
+                <small>{formatDate(item.createdAt)}</small>
+              </div>
+              <a href={`mailto:${item.email}?subject=${encodeURIComponent("LiveDraw 客服回覆")}`}>{item.email}</a>
+              <p className="support-message-text">{item.message}</p>
+              <small className="muted">
+                {item.username ? `會員：${item.username}` : "未登入訪客"}{item.page ? ` · 頁面：${item.page}` : ""}
+                {item.adminNote ? ` · 備註：${item.adminNote}` : ""}
+              </small>
+              <div className="support-message-actions">
+                {item.status === "resolved" ? (
+                  <button className="small-btn" type="button" disabled={busyId === item.id} onClick={() => setStatus(item, "open")}>
+                    <RefreshCcw size={14} />重新打開
+                  </button>
+                ) : (
+                  <button className="small-btn" type="button" disabled={busyId === item.id} onClick={() => setStatus(item, "resolved")}>
+                    <Check size={14} />標記已處理
+                  </button>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : <p className="muted">{view === "open" ? "冇未處理嘅客服訊息。" : "暫時未有已處理訊息。"}</p>}
+    </section>
+  );
+}
+
 const AUDIT_SEVERITY_LABELS = { critical: "嚴重", high: "高", medium: "中", low: "低" };
 
 function toDateInputValue(date) {
@@ -7303,6 +7449,7 @@ function LiveDrawAdminPanel({ profile }) {
     records: true,
   });
   const [pendingShippingCount, setPendingShippingCount] = useState(0);
+  const [openSupportCount, setOpenSupportCount] = useState(0);
   const vipTiers = useVipProgram();
   const adminSections = isBeta
     ? [
@@ -7311,6 +7458,7 @@ function LiveDrawAdminPanel({ profile }) {
         BETA_BANNER_SECTION,
         ...ADMIN_SECTIONS.filter((section) => !["rooms", "create-room"].includes(section.id)),
         { id: "affiliate", label: "Affiliate", eyebrow: "Affiliate program", icon: UserRoundPlus },
+        { id: "support", label: "客服訊息", eyebrow: "Support inbox", icon: Headphones },
         { id: "audit", label: "審計紀錄", eyebrow: "Audit trail", icon: Shield },
         BETA_PAYMENT_SECTION,
       ]
@@ -7387,6 +7535,14 @@ function LiveDrawAdminPanel({ profile }) {
     });
   }, []);
 
+  useEffect(() => {
+    if (!isBeta) return undefined;
+    const openSupportQuery = query(collection(db, "supportMessages"), where("status", "==", "open"));
+    return onSnapshot(openSupportQuery, (snapshot) => setOpenSupportCount(snapshot.size), (error) => {
+      console.error("Admin support badge listener failed.", error);
+    });
+  }, [isBeta]);
+
   // Purchase and delivery history is the largest dataset, so defer it until needed.
   useEffect(() => {
     if (activeAdminSection !== "records" && activeAdminSection !== "shipping") return undefined;
@@ -7420,9 +7576,25 @@ function LiveDrawAdminPanel({ profile }) {
       return;
     }
 
+    // Optional: the bank / FPS transaction reference, so the same payment cannot be credited twice.
+    const paymentReference = isPromo ? "" : window.prompt("銀行／轉數快交易參考編號（選填，可留空）：", "");
+    if (paymentReference === null) return;
+    if (request.duplicateProofRequestIds?.length
+      && !window.confirm("⚠️ 呢張付款截圖同其他申請用嘅截圖完全一樣。確定已經喺銀行核實係另一筆入帳？")) return;
+
+    const payload = { requestId: request.id, decision: "approved", verifiedHkdAmount, paymentReference };
     try {
-      await reviewTokenRequest({ requestId: request.id, decision: "approved", verifiedHkdAmount });
+      await reviewTokenRequest(payload);
     } catch (error) {
+      if (error?.details?.duplicateReference) {
+        if (!window.confirm(`${error.message}\n\n確定唔係同一筆付款，仍然批准？`)) return;
+        try {
+          await reviewTokenRequest({ ...payload, allowDuplicateReference: true });
+        } catch (retryError) {
+          showSafeError(retryError, "未能批准申請，請稍後再試。");
+        }
+        return;
+      }
       showSafeError(error, "未能批准申請，請稍後再試。");
     }
   }
@@ -7481,6 +7653,9 @@ function LiveDrawAdminPanel({ profile }) {
                 {section.id === "shipping" && pendingShippingCount > 0 && (
                   <b className="admin-notification-badge">{pendingShippingCount}</b>
                 )}
+                {section.id === "support" && openSupportCount > 0 && (
+                  <b className="admin-notification-badge">{openSupportCount}</b>
+                )}
               </button>
             );
           })}
@@ -7528,6 +7703,11 @@ function LiveDrawAdminPanel({ profile }) {
       {isBeta && activeAdminSection === "audit" && (
         <div className="admin-section narrow-admin-section">
           <AuditLogExporter />
+        </div>
+      )}
+      {isBeta && activeAdminSection === "support" && (
+        <div className="admin-section narrow-admin-section">
+          <SupportInbox />
         </div>
       )}
       {isBeta && activeAdminSection === "affiliate" && (

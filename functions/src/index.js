@@ -767,6 +767,17 @@ export const adminReviewTokenRequest = onCall(adminCallableOptions, async (reque
   const adminNote = String(request.data?.adminNote || "").trim().slice(0, 500);
   const verifiedHkdAmount = Math.max(0, Number(request.data?.verifiedHkdAmount) || 0);
   const requestRef = db.collection("tokenRequests").doc(requestId);
+  // Optional bank / FPS transaction reference typed by the admin; the same payment
+  // must not be credited twice unless the admin explicitly confirms it.
+  const paymentReference = decision === "approved" ? normalizePaymentReference(request.data?.paymentReference) : "";
+  if (paymentReference && request.data?.allowDuplicateReference !== true) {
+    const used = await db.collection("tokenRequests").where("paymentReference", "==", paymentReference).limit(5).get();
+    const others = used.docs.filter((item) => item.id !== requestId && item.data().status === "approved");
+    if (others.length) {
+      const names = others.map((item) => item.data().username || item.id).join("、");
+      throw new HttpsError("already-exists", `參考編號 ${paymentReference} 已用於另一張已批准申請（${names}）。`, { duplicateReference: true });
+    }
+  }
 
   await db.runTransaction(async (transaction) => {
     const requestSnapshot = await transaction.get(requestRef);
@@ -817,6 +828,7 @@ export const adminReviewTokenRequest = onCall(adminCallableOptions, async (reque
     const requestUpdate = {
       status: decision, adminNote, reviewedAt: FieldValue.serverTimestamp(), reviewedBy: actor.uid,
       verifiedHkdAmount: decision === "approved" ? verifiedHkdAmount : 0,
+      paymentReference,
       promoReviewed: decision === "approved" && tokenRequest.proofMode === "promo",
     };
     transaction.update(requestRef, requestUpdate);
@@ -1167,6 +1179,10 @@ function millis(value) {
   return typeof value?.toMillis === "function" ? value.toMillis() : 0;
 }
 
+function normalizePaymentReference(value) {
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 64);
+}
+
 function boundedText(value, maxLength) {
   return String(value || "").trim().slice(0, maxLength);
 }
@@ -1227,6 +1243,11 @@ export const submitTokenPaymentRequest = onCall(tokenProofCallableOptions, async
   if (!initialUser.exists) throw new HttpsError("failed-precondition", "找不到會員帳戶，請重新登入。");
   assertQuota(initialUser.data());
 
+  // Flag screenshots that were already used for another request (identical file).
+  const proofSha256 = createHash("sha256").update(buffer).digest("hex");
+  const sameProof = await db.collection("tokenRequests").where("proofSha256", "==", proofSha256).limit(5).get();
+  const duplicateProofRequestIds = sameProof.docs.map((item) => item.id);
+
   const requestRef = db.collection("tokenRequests").doc();
   const path = `token-proofs/${uid}/${requestRef.id}`;
   const file = getStorage().bucket().file(path);
@@ -1267,6 +1288,8 @@ export const submitTokenPaymentRequest = onCall(tokenProofCallableOptions, async
         fpsName,
         proofMode: "storage",
         proofPath: path,
+        proofSha256,
+        duplicateProofRequestIds,
         proofFileName: boundedText(request.data?.proofFileName, 80) || "proof",
         proofUrl,
         status: "pending",
@@ -1407,6 +1430,63 @@ export const reportClientError = onCall({
   const report = sanitizeClientError(request.data, uid);
   // logger.error would replace the message with a server stack trace; write it explicitly.
   logger.write({ severity: "ERROR", ...report, message: `client error: ${report.message}` });
+  return { ok: true };
+});
+
+// Contact form: anyone (signed in or not) can leave a message with an email for a reply.
+const SUPPORT_CATEGORIES = new Set(["tokens", "shipping", "account", "draw", "other"]);
+const EMAIL_PATTERN = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
+const allowSupportMessage = createRateLimiter(3, 10 * 60 * 1000);
+const allowAnySupportMessage = createRateLimiter(60, 60 * 1000);
+
+export const submitSupportMessage = onCall({
+  region: "asia-east2", enforceAppCheck: ENFORCE_APP_CHECK, timeoutSeconds: 10, memory: "256MiB", maxInstances: 2,
+}, async (request) => {
+  // Hidden form field that people never fill in; bots usually do.
+  if (String(request.data?.website || "")) return { ok: true };
+  const email = String(request.data?.email || "").trim().toLowerCase();
+  const message = String(request.data?.message || "").trim();
+  const category = SUPPORT_CATEGORIES.has(request.data?.category) ? request.data.category : "other";
+  if (!EMAIL_PATTERN.test(email) || email.length > 254) throw new HttpsError("invalid-argument", "請輸入有效電郵地址。");
+  if (message.length < 5 || message.length > 2000) throw new HttpsError("invalid-argument", "查詢內容最少 5 字、最多 2,000 字。");
+  const uid = request.auth?.uid || "";
+  const forwarded = String(request.rawRequest?.headers?.["x-forwarded-for"] || "").split(",").map((part) => part.trim()).filter(Boolean);
+  if (!allowAnySupportMessage("all") || !allowSupportMessage(uid || forwarded.at(-1) || "anonymous")) {
+    throw new HttpsError("resource-exhausted", "提交次數太多，請 10 分鐘後再試。");
+  }
+  const user = uid ? (await db.collection("users").doc(uid).get()).data() || {} : {};
+  const ref = await db.collection("supportMessages").add({
+    email,
+    name: boundedText(request.data?.name, 60),
+    category,
+    message,
+    uid,
+    username: String(user.username || ""),
+    page: boundedText(request.data?.page, 120),
+    userAgent: boundedText(request.rawRequest?.headers?.["user-agent"], 200),
+    status: "open",
+    adminNote: "",
+    createdAt: FieldValue.serverTimestamp(),
+  });
+  return { ok: true, id: ref.id };
+});
+
+export const adminUpdateSupportMessage = onCall(adminCallableOptions, async (request) => {
+  const actor = assertAdmin(request);
+  const id = assertIdentifier(request.data?.id, "訊息 ID");
+  const status = request.data?.status === "resolved" ? "resolved" : "open";
+  const ref = db.collection("supportMessages").doc(id);
+  const snapshot = await ref.get();
+  if (!snapshot.exists) throw new HttpsError("not-found", "找不到客服訊息。");
+  const update = {
+    status,
+    adminNote: boundedText(request.data?.adminNote ?? snapshot.data().adminNote, 500),
+    resolvedAt: status === "resolved" ? FieldValue.serverTimestamp() : null,
+    resolvedBy: status === "resolved" ? actor.uid : "",
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  await ref.update(update);
+  await db.collection("adminAuditLogs").add(auditRecord(actor, `support:${status}`, "supportMessages", id, { status: snapshot.data().status }, { status, adminNote: update.adminNote }, request));
   return { ok: true };
 });
 

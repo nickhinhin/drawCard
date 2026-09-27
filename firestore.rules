@@ -913,6 +913,12 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // Contact-form messages: written only by submitSupportMessage, read by admins.
+    match /supportMessages/{messageId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
     match /adminAuditLogs/{auditId} {
       allow read: if isAdmin();
       allow create, update, delete: if false;
