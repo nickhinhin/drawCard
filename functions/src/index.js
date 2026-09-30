@@ -6,6 +6,7 @@ import { logger } from "firebase-functions";
 import { setGlobalOptions } from "firebase-functions/v2";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { analyzeAuditEntries } from "./audit-analysis.js";
+import { analyticsDayRange, summarizeAdminDay } from "./admin-analytics.js";
 import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeClientError } from "./monitor.js";
 
 // Least-privilege runtime identity: Firestore, this project's bucket, App Check and logging only.
@@ -610,6 +611,73 @@ export const adminGet = onCall(adminCallableOptions, async (request) => {
   return { exists: snapshot.exists, item: snapshot.exists ? { id: snapshot.id, ...serialize(snapshot.data()) } : null };
 });
 
+// Read-only, server-authorized analytics. Summary totals use every record in the
+// selected Hong Kong day; detail lists are paged to keep responses small.
+export const adminAnalytics = onCall(adminCallableOptions, async (request) => {
+  assertAdmin(request);
+  const mode = String(request.data?.mode || "summary");
+  const day = String(request.data?.day || "");
+  const range = analyticsDayRange(day);
+  if (!range) throw new HttpsError("invalid-argument", "請選擇有效日期。");
+  const start = Timestamp.fromDate(range.start);
+  const end = Timestamp.fromDate(range.end);
+  if (mode === "summary") {
+    const [users, newUsers, records, reviews] = await Promise.all([
+      db.collection("users").count().get(),
+      db.collection("users").where("createdAt", ">=", start).where("createdAt", "<", end).count().get(),
+      db.collection("drawRecords").where("createdAt", ">=", start).where("createdAt", "<", end)
+        .select("uid", "tokenCost", "cardId", "cardValue", "cardConversionValue").get(),
+      db.collection("tokenRequests").where("reviewedAt", ">=", start).where("reviewedAt", "<", end)
+        .select("status", "proofMode", "verifiedHkdAmount").get(),
+    ]);
+    return {
+      day,
+      calculatedAt: new Date().toISOString(),
+      ...summarizeAdminDay(
+        records.docs.map((item) => item.data()),
+        reviews.docs.map((item) => item.data()),
+        newUsers.data().count,
+        users.data().count,
+      ),
+    };
+  }
+  const cursor = String(request.data?.cursor || "").trim();
+  if (cursor && (cursor.length > 180 || cursor.includes("/"))) {
+    throw new HttpsError("invalid-argument", "分頁位置不正確。");
+  }
+  let source;
+  let query;
+  if (mode === "users") {
+    source = db.collection("users");
+    query = source.orderBy(FieldPath.documentId(), "asc");
+  } else if (mode === "purchases" || mode === "payments") {
+    source = db.collection(mode === "purchases" ? "drawRecords" : "tokenRequests");
+    const field = mode === "purchases" ? "createdAt" : "reviewedAt";
+    query = source.where(field, ">=", start).where(field, "<", end).orderBy(field, "desc");
+  } else {
+    throw new HttpsError("invalid-argument", "報表類型不正確。");
+  }
+  if (cursor) {
+    const cursorDoc = await source.doc(cursor).get();
+    if (!cursorDoc.exists) throw new HttpsError("invalid-argument", "分頁位置已失效，請重新載入。");
+    query = query.startAfter(cursorDoc);
+  }
+  const page = await query.limit(51).get();
+  const docs = page.docs.slice(0, 50);
+  const fields = mode === "users"
+    ? ["username", "displayName", "email", "phoneNumber", "createdAt", "tokens", "totalDeposits", "vipLevel"]
+    : mode === "purchases"
+      ? ["uid", "username", "createdAt", "drawTitle", "round", "number", "tokenCost", "cardId", "cardName", "cardValue", "cardConversionValue"]
+      : ["uid", "username", "reviewedAt", "status", "proofMode", "verifiedHkdAmount", "amount", "paymentReference"];
+  return {
+    items: docs.map((doc) => ({
+      id: doc.id,
+      ...Object.fromEntries(fields.map((field) => [field, serialize(doc.get(field) ?? null)])),
+    })),
+    nextCursor: page.size > 50 ? docs.at(-1)?.id || "" : "",
+  };
+});
+
 export const adminWrite = onCall(adminCallableOptions, async (request) => {
   const actor = assertAdmin(request);
   const collectionName = assertIdentifier(request.data?.collection, "資料類型");
@@ -1137,6 +1205,34 @@ export const adminDeleteDraw = onCall(adminCallableOptions, async (request) => {
   ));
   await drawRef.delete();
   return { ok: true, deletedChildren: refs.length };
+});
+
+// Cancels an unused scheduled broadcast without removing its audit history.
+export const adminCancelScheduledDraw = onCall(adminCallableOptions, async (request) => {
+  const actor = assertAdmin(request);
+  const drawId = assertIdentifier(request.data?.drawId, "直播 ID");
+  const drawRef = db.collection("draws").doc(drawId);
+  await db.runTransaction(async (transaction) => {
+    const draw = await transaction.get(drawRef);
+    if (!draw.exists || draw.data().status !== "scheduled") {
+      throw new HttpsError("failed-precondition", "此場已不是直播預告，請重新整理後再試。");
+    }
+    const purchases = await transaction.get(db.collection("drawRecords").where("drawId", "==", drawId).limit(1));
+    if (!purchases.empty) {
+      throw new HttpsError("failed-precondition", "此場已有購買紀錄，不能取消。請先處理相關訂單。");
+    }
+    transaction.update(drawRef, {
+      status: "cancelled",
+      preorderOpen: false,
+      cancelledAt: FieldValue.serverTimestamp(),
+      cancelledBy: actor.uid,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    transaction.set(db.collection("adminAuditLogs").doc(), auditRecord(
+      actor, "draw:cancel-scheduled", "draws", drawId, draw.data(), { status: "cancelled" }, request,
+    ));
+  });
+  return { ok: true };
 });
 
 export const adminUploadImage = onCall({ ...adminCallableOptions, memory: "512MiB" }, async (request) => {

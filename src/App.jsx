@@ -3,6 +3,7 @@ import {
   BadgeDollarSign,
   Bell,
   Boxes,
+  CalendarDays,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -204,6 +205,7 @@ const statusLabels = {
 };
 
 const ROUND_BUY_LOCKED_LABEL = "本場已停止購買";
+const SUPPORT_WHATSAPP_URL = "https://wa.me/85254208951";
 const collectionStatuses = ["pending", "shipping", "shipped"];
 const betaCollectionStatuses = ["pending", "shipping", "shipped", "converted"];
 const CONVERSION_RATE = 0.8;
@@ -454,6 +456,7 @@ const DEFAULT_VIP_TIERS = [
 ];
 
 const ADMIN_SECTIONS = [
+  { id: "analytics", label: "數據分析", eyebrow: "Analytics", icon: BadgeDollarSign },
   { id: "rooms", label: "房間管理", eyebrow: "Rooms", icon: Gavel },
   { id: "create-room", label: "建立房間", eyebrow: "New draw", icon: Plus },
   { id: "cards", label: "卡牌庫", eyebrow: "Card library", icon: ImagePlus },
@@ -1190,28 +1193,11 @@ const FOOTER_PAGES = {
       "配送進度及順豐運單號會顯示在「我的卡牌」。",
     ],
   },
-  support: {
-    title: "聯絡客服",
-    eyebrow: "SUPPORT",
-    body: [
-      "請留下電郵及查詢內容，客服將以電郵回覆。如查詢涉及代幣或配送，請一併提供房間名稱、場次、號碼或申請時間，以便核對。",
-      "LiveDraw 只會使用網站所顯示的 FPS 收款；客服不會私訊要求你轉帳，亦不會索取驗證碼或密碼。",
-    ],
-  },
 };
 
 function BetaFooter({ onNavigate }) {
   const [activePage, setActivePage] = useState("");
   const page = FOOTER_PAGES[activePage];
-
-  useEffect(() => {
-    function openSupport() {
-      setActivePage("support");
-    }
-
-    window.addEventListener("beta-open-support", openSupport);
-    return () => window.removeEventListener("beta-open-support", openSupport);
-  }, []);
 
   return (
     <>
@@ -1232,7 +1218,7 @@ function BetaFooter({ onNavigate }) {
             <h2>買家指南</h2>
             <button type="button" onClick={() => setActivePage("process")}>抽盲盒流程</button>
             <button type="button" onClick={() => setActivePage("faq")}>常見問題</button>
-            <button type="button" onClick={() => setActivePage("support")}>聯絡客服</button>
+            <a href={SUPPORT_WHATSAPP_URL} target="_blank" rel="noopener noreferrer">聯絡客服</a>
           </div>
         </div>
         <p className="beta-copyright">© 2026 LiveDraw TCG. All rights reserved.</p>
@@ -1246,7 +1232,6 @@ function BetaFooter({ onNavigate }) {
             <div className="footer-page-copy">
               {page.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
-            {activePage === "support" && <SupportContactForm />}
             {activePage === "process" && (
               <button className="primary-btn" type="button" onClick={() => { onNavigate("draw"); setActivePage(""); window.scrollTo({ top: 0, behavior: "smooth" }); }}>
                 開始選擇房間
@@ -1256,65 +1241,6 @@ function BetaFooter({ onNavigate }) {
         </div>
       )}
     </>
-  );
-}
-
-const SUPPORT_CATEGORY_OPTIONS = [
-  { value: "tokens", label: "代幣／付款" },
-  { value: "draw", label: "抽卡／賽果" },
-  { value: "shipping", label: "配送" },
-  { value: "account", label: "帳戶／登入" },
-  { value: "other", label: "其他" },
-];
-
-function SupportContactForm() {
-  const signedInEmail = displayEmail(auth.currentUser?.email);
-  const [form, setForm] = useState({ email: signedInEmail, name: "", category: "tokens", message: "", website: "" });
-  const [sending, setSending] = useState(false);
-  const [sent, setSent] = useState(false);
-  const [error, setError] = useState("");
-  const update = (key) => (event) => setForm((current) => ({ ...current, [key]: event.target.value }));
-
-  async function submit(event) {
-    event.preventDefault();
-    setError("");
-    setSending(true);
-    try {
-      await httpsCallable(functions, "submitSupportMessage")({ ...form, page: window.location.pathname + window.location.search.slice(0, 60) });
-      setSent(true);
-    } catch (submitError) {
-      setError(getSafeErrorMessage(submitError, "未能送出，請稍後再試。"));
-    } finally {
-      setSending(false);
-    }
-  }
-
-  if (sent) {
-    return (
-      <div className="support-form-done" role="status">
-        <Check size={22} />
-        <p>已收到你的查詢，客服將盡快以電郵（{form.email}）回覆。</p>
-      </div>
-    );
-  }
-
-  return (
-    <form className="stack-form support-form" onSubmit={submit}>
-      <label>電郵（必填，用作回覆）<input type="email" autoComplete="email" value={form.email} onChange={update("email")} maxLength={254} required /></label>
-      <label>稱呼（選填）<input value={form.name} onChange={update("name")} maxLength={60} /></label>
-      <label>查詢類別
-        <select value={form.category} onChange={update("category")}>
-          {SUPPORT_CATEGORY_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-        </select>
-      </label>
-      <label>查詢內容<textarea rows={5} value={form.message} onChange={update("message")} minLength={5} maxLength={2000} placeholder="請描述你的問題" required /></label>
-      {/* Hidden from people; bots that fill every field are ignored by the server. */}
-      <input className="support-form-trap" tabIndex={-1} autoComplete="off" aria-hidden="true" value={form.website} onChange={update("website")} />
-      {error && <p className="error-note">{error}</p>}
-      <button className="primary-btn" type="submit" disabled={sending}>
-        <Send size={16} />{sending ? "送出中..." : "送出查詢"}
-      </button>
-    </form>
   );
 }
 
@@ -2487,19 +2413,17 @@ function DrawCard({ profile }) {
   const roundOptions = useMemo(() => (roundOptionsKey ? roundOptionsKey.split("|") : []), [roundOptionsKey]);
   const availableRoomDates = useMemo(
     () => rooms
-      .filter((room) => room.status === "live" || room.status === "scheduled")
-      .map((room) => {
+      .filter((room) => room.status === "live" || room.status === "scheduled"
+        || room.id === currentBetaLive?.id || room.id === selectedRoomId)
+      .flatMap((room) => {
         const rounds = getRoomRoundOptions(room);
-        const firstRoundId = rounds[0];
-        const firstDateGroup = getRoundsByDate(room, [firstRoundId])[0];
-        return {
-          ...firstDateGroup,
-          rounds,
+        return getRoundsByDate(room, rounds).map((group) => ({
+          ...group,
           room,
           roomId: room.id,
-          firstRoundId,
-          schedule: getRoundSchedule(room, firstRoundId),
-        };
+          firstRoundId: group.rounds[0],
+          schedule: getRoundSchedule(room, group.rounds[0]),
+        }));
       })
       .sort((left, right) => {
         if (left.room.status === "live" && right.room.status !== "live") return -1;
@@ -2508,7 +2432,7 @@ function DrawCard({ profile }) {
         const rightTime = right.schedule instanceof Date ? right.schedule.getTime() : Number.MAX_SAFE_INTEGER;
         return leftTime - rightTime;
       }),
-    [rooms],
+    [currentBetaLive?.id, rooms, selectedRoomId],
   );
   const activeRoundId = useMemo(
     () => selectedRound || getDefaultRoomRound(selectedRoom),
@@ -3577,17 +3501,17 @@ function BetaStickyControls({ actionBarVisible = false, onOpenChat, onOpenNumber
   return (
     <>
       <nav className={`beta-desktop-sticky-controls${actionBarVisible ? " action-bar-visible" : ""}`} aria-label="桌面直播快捷功能">
-        <button className="support" type="button" onClick={() => window.dispatchEvent(new CustomEvent("beta-open-support"))}>
+        <a className="support" href={SUPPORT_WHATSAPP_URL} target="_blank" rel="noopener noreferrer">
           <Headphones size={17} /><span>聯絡客服</span>
-        </button>
+        </a>
         <button className="records" type="button" onClick={openRecords}>
           <ListChecks size={17} /><span>我的紀錄</span>
         </button>
       </nav>
       <nav className={`beta-mobile-sticky-controls${actionBarVisible ? " action-bar-visible" : ""}`} aria-label="直播快捷功能">
-      <button className="support" type="button" onClick={() => window.dispatchEvent(new CustomEvent("beta-open-support"))}>
+      <a className="support" href={SUPPORT_WHATSAPP_URL} target="_blank" rel="noopener noreferrer">
         <Headphones size={15} /><span>聯絡客服</span>
-      </button>
+      </a>
       <button className="numbers" type="button" onClick={onOpenNumbers}>
         <Hash size={15} /><span>號碼使用情況</span>
       </button>
@@ -5177,10 +5101,13 @@ function TokenRequest({ profile }) {
   const [customHkd, setCustomHkd] = useState("");
   const [proof, setProof] = useState(null);
   const [promoCode, setPromoCode] = useState("");
-  const [requestMethod, setRequestMethod] = useState("");
+  const [requestMethod, setRequestMethod] = useState("payment");
   const [fpsIdentifier, setFpsIdentifier] = useState("");
   const [fpsName, setFpsName] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [paymentModalOpen, setPaymentModalOpen] = useState(false);
+  const confirmAmountButtonRef = useRef(null);
+  const paymentCloseButtonRef = useRef(null);
   const [requests, setRequests] = useState([]);
   const [vipRewards, setVipRewards] = useState([]);
   const [requestsLoading, setRequestsLoading] = useState(true);
@@ -5243,6 +5170,43 @@ function TokenRequest({ profile }) {
       setVipRewards([]);
     });
   }, [profile.uid]);
+
+  // Open the payment step only after a valid amount has been confirmed.
+  function confirmPaymentAmount() {
+    if (!Number.isSafeInteger(hkdAmount) || hkdAmount < MIN_CUSTOM_PAYMENT_HKD || hkdAmount > 1000000 || tokenAmount < 1 || tokenAmount > 1000000) {
+      alert(`請選擇套餐，或輸入最少 HK$${MIN_CUSTOM_PAYMENT_HKD} 的自訂金額。`);
+      return;
+    }
+    setPaymentModalOpen(true);
+  }
+
+  // Keep the payment dialog dismissible by keyboard while it is idle.
+  useEffect(() => {
+    if (!paymentModalOpen || submitting) return undefined;
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setPaymentModalOpen(false);
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [paymentModalOpen, submitting]);
+
+  // Move focus into the dialog and restore it to the amount step on close.
+  useEffect(() => {
+    if (!paymentModalOpen) return undefined;
+    const amountButton = confirmAmountButtonRef.current;
+    paymentCloseButtonRef.current?.focus();
+    return () => amountButton?.focus();
+  }, [paymentModalOpen]);
+
+  // Enter in the amount field follows the same confirmation step as a click.
+  function submitAmountStep(event) {
+    if (requestMethod === "payment") {
+      event.preventDefault();
+      confirmPaymentAmount();
+      return;
+    }
+    submitRequest(event);
+  }
 
   async function submitRequest(event) {
     event.preventDefault();
@@ -5318,11 +5282,12 @@ function TokenRequest({ profile }) {
           fpsName: requestFpsName,
         });
         setProof(null);
-        setRequestMethod("");
+        setRequestMethod("payment");
         setFpsIdentifier("");
         setFpsName("");
         setSelectedPackage(tokenPackages[0].hkd);
         setCustomHkd("");
+        setPaymentModalOpen(false);
         return;
       }
       const requestRef = doc(collection(db, "tokenRequests"));
@@ -5386,7 +5351,7 @@ function TokenRequest({ profile }) {
       await batch.commit();
 
       setPromoCode("");
-      setRequestMethod("");
+      setRequestMethod("payment");
       setFpsIdentifier("");
       setFpsName("");
       setSelectedPackage(tokenPackages[0].hkd);
@@ -5410,39 +5375,7 @@ function TokenRequest({ profile }) {
             <h1>申請代幣</h1>
           </div>
         </div>
-        <form className="stack-form" onSubmit={submitRequest}>
-          <fieldset className="token-request-methods">
-            <legend>選擇申請方式</legend>
-            <div role="radiogroup" aria-label="代幣申請方式">
-              <button
-                aria-checked={requestMethod === "payment"}
-                className={requestMethod === "payment" ? "selected" : ""}
-                role="radio"
-                type="button"
-                onClick={() => {
-                  setRequestMethod("payment");
-                  setPromoCode("");
-                }}
-              >
-                <BadgeDollarSign size={22} />
-                <span><strong>付款購買代幣</strong><small>查看付款資料並上載付款證明</small></span>
-              </button>
-              <button
-                aria-checked={requestMethod === "promo"}
-                className={requestMethod === "promo" ? "selected" : ""}
-                role="radio"
-                type="button"
-                onClick={() => {
-                  setRequestMethod("promo");
-                  setProof(null);
-                }}
-              >
-                <Gift size={22} />
-                <span><strong>推廣活動兌換代幣</strong><small>使用推廣活動邀請碼申請</small></span>
-              </button>
-            </div>
-          </fieldset>
-          {requestMethod && <>
+        <form className="stack-form" onSubmit={submitAmountStep}>
           {requestMethod === "payment" && <>
           <div className="form-field">
             <span>選擇充值金額</span>
@@ -5494,48 +5427,7 @@ function TokenRequest({ profile }) {
             <small>付款金額 HK${formatTokenNumber(hkdAmount)}</small>
           </div>
           </>}
-          {requestMethod === "payment" && (isBeta ? (
-            <div className="platform-fps-panel">
-              <div>
-                <span>平台 FPS 識別碼</span>
-                <strong>{paymentSettings.fpsIdentifier || "尚未設定"}</strong>
-              </div>
-              <div>
-                <span>收款人姓名</span>
-                <strong>{paymentSettings.fpsName || "尚未設定"}</strong>
-              </div>
-              <button
-                className="small-btn"
-                type="button"
-                disabled={!paymentSettings.fpsIdentifier}
-                onClick={() => navigator.clipboard.writeText(paymentSettings.fpsIdentifier)}
-              >
-                <Copy size={15} />複製 FPS 號碼
-              </button>
-            </div>
-          ) : (
-            <>
-              <label>
-                轉數快識別碼
-                <input value={fpsIdentifier} onChange={(event) => setFpsIdentifier(event.target.value)} placeholder="請輸入 FPS 識別碼" required />
-              </label>
-              <label>
-                收款人姓名
-                <input value={fpsName} onChange={(event) => setFpsName(event.target.value)} placeholder="請輸入收款人姓名" required />
-              </label>
-            </>
-          ))}
-          {requestMethod === "payment" ? (
-            <>
-              <FileUpload
-                label="付款證明圖片"
-                file={proof}
-                onChange={setProof}
-                required
-              />
-              <p className="form-note">請按以上資料付款，再上載付款證明；所有申請須經人工審核。</p>
-            </>
-          ) : (
+          {requestMethod === "promo" && (
             <label>
               推廣活動邀請碼
               <input
@@ -5548,7 +5440,7 @@ function TokenRequest({ profile }) {
               />
             </label>
           )}
-          {isBeta && (
+          {isBeta && requestMethod === "promo" && (
             <div className="claimable-token-field">
               <span>可領取的代幣</span>
               <strong>{requestedTokenAmount ? <TokenAmount value={requestedTokenAmount} /> : "輸入有效邀請碼"}</strong>
@@ -5559,11 +5451,17 @@ function TokenRequest({ profile }) {
               每位用戶每個完整邀請碼只可使用一次。批准後代幣會加入帳戶，活動獎勵不會計入 VIP 累積入金。
             </p>
           )}
-          <button className="primary-btn" type="submit" disabled={submitting}>
-            <FileImage size={18} />
-            {submitting ? "提交中..." : "提交申請"}
-          </button>
-          </>}
+          {requestMethod === "payment" ? (
+            <>
+              <button className="primary-btn" type="button" ref={confirmAmountButtonRef} onClick={confirmPaymentAmount}>確認金額</button>
+              <button className="token-method-link" type="button" onClick={() => { setRequestMethod("promo"); setProof(null); }}><Gift size={16} />使用推廣活動邀請碼</button>
+            </>
+          ) : (
+            <>
+              <button className="primary-btn" type="submit" disabled={submitting}><FileImage size={18} />{submitting ? "提交中..." : "提交申請"}</button>
+              <button className="token-method-link" type="button" onClick={() => { setRequestMethod("payment"); setPromoCode(""); }}>返回選擇入金金額</button>
+            </>
+          )}
         </form>
       </section>
 
@@ -5581,6 +5479,35 @@ function TokenRequest({ profile }) {
       </section>
       </div>
       {isBeta && <VipProgramPanel deposit={cumulativeDeposit} profile={profile} rewards={vipRewards} tiers={vipTiers} />}
+      {paymentModalOpen && (
+        <div className="modal-backdrop payment-modal-backdrop" role="presentation" onMouseDown={submitting ? undefined : () => setPaymentModalOpen(false)}>
+          <section className="modal payment-modal" role="dialog" aria-modal="true" aria-labelledby="payment-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="icon-btn payment-modal-close" type="button" ref={paymentCloseButtonRef} aria-label="關閉入金視窗" disabled={submitting} onClick={() => setPaymentModalOpen(false)}><X size={19} /></button>
+            <h2 id="payment-modal-title">入金資料及付款證明</h2>
+            <p className="form-note">請按以下資料付款，再上載付款證明；所有申請須經人工審核。</p>
+            <div className="payment-modal-summary">
+              <span>入金金額 <strong>HK${formatTokenNumber(hkdAmount)}</strong></span>
+              <span>可領取代幣 <strong><TokenAmount value={tokenAmount} /></strong></span>
+            </div>
+            <form className="stack-form" onSubmit={submitRequest}>
+              {isBeta ? (
+                <div className="platform-fps-panel">
+                  <div><span>平台 FPS 識別碼</span><strong>{paymentSettings.fpsIdentifier || "尚未設定"}</strong></div>
+                  <div><span>收款人姓名</span><strong>{paymentSettings.fpsName || "尚未設定"}</strong></div>
+                  <button className="small-btn" type="button" disabled={!paymentSettings.fpsIdentifier} onClick={() => navigator.clipboard.writeText(paymentSettings.fpsIdentifier)}><Copy size={15} />複製 FPS 號碼</button>
+                </div>
+              ) : (
+                <>
+                  <label>轉數快識別碼<input value={fpsIdentifier} onChange={(event) => setFpsIdentifier(event.target.value)} placeholder="請輸入 FPS 識別碼" required /></label>
+                  <label>收款人姓名<input value={fpsName} onChange={(event) => setFpsName(event.target.value)} placeholder="請輸入收款人姓名" required /></label>
+                </>
+              )}
+              <FileUpload label="付款證明圖片" file={proof} onChange={setProof} disabled={submitting} />
+              <button className="primary-btn" type="submit" disabled={submitting}><FileImage size={18} />{submitting ? "提交中..." : "上載並提交申請"}</button>
+            </form>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
@@ -6875,7 +6802,16 @@ function AffiliateManager() {
   );
 }
 
-// Admin view of contact-form messages; replies go out by email.
+// Preserve category names for messages received before support moved to WhatsApp.
+const SUPPORT_CATEGORY_OPTIONS = [
+  { value: "tokens", label: "代幣／付款" },
+  { value: "draw", label: "抽卡／賽果" },
+  { value: "shipping", label: "配送" },
+  { value: "account", label: "帳戶／登入" },
+  { value: "other", label: "其他" },
+];
+
+// Admin view of earlier contact-form messages; replies go out by email.
 function SupportInbox() {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -7593,6 +7529,196 @@ function LiveMonitor() {
   );
 }
 
+// Fetch only read-only analytics endpoints; changing the date resets detail pagination.
+function formatAnalyticsTime(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "--" : date.toLocaleString("zh-HK", {
+    timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+// Explicit calendar picker works the same on desktop, tablet and mobile browsers.
+function AnalyticsDatePicker({ day, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [month, setMonth] = useState(day.slice(0, 7));
+  const pickerRef = useRef(null);
+  const [year, monthNumber] = month.split("-").map(Number);
+  const firstWeekday = (new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay() + 6) % 7;
+  const daysInMonth = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  const calendarDays = Array.from({ length: firstWeekday + daysInMonth }, (_, index) => index < firstWeekday ? null : index - firstWeekday + 1);
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+
+  useEffect(() => {
+    if (!open) return undefined;
+    function closePicker(event) {
+      if (event.key === "Escape" || (event.type === "pointerdown" && !pickerRef.current?.contains(event.target))) setOpen(false);
+    }
+    document.addEventListener("pointerdown", closePicker);
+    document.addEventListener("keydown", closePicker);
+    return () => {
+      document.removeEventListener("pointerdown", closePicker);
+      document.removeEventListener("keydown", closePicker);
+    };
+  }, [open]);
+
+  function changeMonth(offset) {
+    const next = new Date(Date.UTC(year, monthNumber - 1 + offset, 1));
+    setMonth(`${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, "0")}`);
+  }
+
+  function selectDay(value) {
+    onChange(value);
+    setMonth(value.slice(0, 7));
+    setOpen(false);
+  }
+
+  return (
+    <div className="analytics-date-picker" ref={pickerRef}>
+      <span className="analytics-date-label">選擇日期</span>
+      <button className="analytics-date-trigger" type="button" aria-label={`選擇日期，目前 ${day}`} aria-expanded={open} onClick={() => { setMonth(day.slice(0, 7)); setOpen((value) => !value); }}>
+        <CalendarDays size={18} /><strong>{day}</strong><ChevronDown size={16} />
+      </button>
+      {open && <div className="analytics-calendar" role="dialog" aria-label="選擇統計日期">
+        <div className="analytics-calendar-heading">
+          <button type="button" aria-label="上個月" onClick={() => changeMonth(-1)}><ChevronLeft size={18} /></button>
+          <strong>{year} 年 {monthNumber} 月</strong>
+          <button type="button" aria-label="下個月" onClick={() => changeMonth(1)}><ChevronRight size={18} /></button>
+        </div>
+        <div className="analytics-calendar-grid">
+          {["一", "二", "三", "四", "五", "六", "日"].map((label) => <span className="analytics-weekday" key={label}>{label}</span>)}
+          {calendarDays.map((date, index) => date ? (
+            <button key={index} type="button" className={`${month}-${String(date).padStart(2, "0")}` === day ? "selected" : ""}
+              aria-label={`${year} 年 ${monthNumber} 月 ${date} 日`} onClick={() => selectDay(`${month}-${String(date).padStart(2, "0")}`)}>{date}</button>
+          ) : <span key={index} />)}
+        </div>
+        <button className="analytics-calendar-today" type="button" onClick={() => selectDay(today)}>今天 · {today}</button>
+      </div>}
+    </div>
+  );
+}
+
+function AdminAnalytics() {
+  const [day, setDay] = useState(() => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()));
+  const [view, setView] = useState("users");
+  const [refresh, setRefresh] = useState(0);
+  const [summary, setSummary] = useState(null);
+  const [summaryError, setSummaryError] = useState("");
+  const [rows, setRows] = useState([]);
+  const [cursor, setCursor] = useState("");
+  const [rowsError, setRowsError] = useState("");
+  const [loadingRows, setLoadingRows] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSummary(null);
+    setSummaryError("");
+    httpsCallable(functions, "adminAnalytics")({ mode: "summary", day })
+      .then(({ data }) => { if (!cancelled) setSummary(data); })
+      .catch((error) => { if (!cancelled) setSummaryError(getSafeErrorMessage(error, "未能讀取統計資料。")); });
+    return () => { cancelled = true; };
+  }, [day, refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingRows(true);
+    setRows([]);
+    setCursor("");
+    setRowsError("");
+    httpsCallable(functions, "adminAnalytics")({ mode: view, day })
+      .then(({ data }) => {
+        if (cancelled) return;
+        setRows(data.items || []);
+        setCursor(data.nextCursor || "");
+      })
+      .catch((error) => { if (!cancelled) setRowsError(getSafeErrorMessage(error, "未能讀取明細。")); })
+      .finally(() => { if (!cancelled) setLoadingRows(false); });
+    return () => { cancelled = true; };
+  }, [day, view, refresh]);
+
+  // Append one server-authorized page without exposing any edit controls.
+  async function loadMore() {
+    if (!cursor || loadingMore) return;
+    setLoadingMore(true);
+    setRowsError("");
+    try {
+      const { data } = await httpsCallable(functions, "adminAnalytics")({ mode: view, day, cursor });
+      setRows((current) => [...current, ...(data.items || [])]);
+      setCursor(data.nextCursor || "");
+    } catch (error) {
+      setRowsError(getSafeErrorMessage(error, "未能載入下一頁。"));
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  const margin = (summary?.settledSalesTokens || 0) - (summary?.payoutTokens || 0);
+  const cards = summary ? [
+    ["會員總數", formatTokenNumber(summary.totalUserCount), "人"],
+    ["當日新會員", formatTokenNumber(summary.newUserCount), "人"],
+    ["當日購買", formatTokenNumber(summary.purchaseCount), "筆"],
+    ["購買人數", formatTokenNumber(summary.buyerCount), "人"],
+    ["當日銷售", formatTokenNumber(summary.salesTokens), "代幣"],
+    ["已結算銷售", formatTokenNumber(summary.settledSalesTokens), "代幣"],
+    ["已結算兌換值", formatTokenNumber(summary.payoutTokens), "代幣"],
+    ["已結算毛利估算", formatTokenNumber(margin), "代幣"],
+    ["未結算購買", formatTokenNumber(summary.unsettledCount), "筆"],
+    ["當日批准入金", `HK$${formatTokenNumber(summary.approvedHkd)}`, `${summary.approvedPaymentCount} 筆`],
+  ] : [];
+  return (
+    <div className="admin-analytics">
+      <section className="panel">
+        <div className="analytics-toolbar">
+          <div><h2>每日數據</h2><p className="muted">香港時間（UTC+8）· 唯讀</p></div>
+          <div className="analytics-controls">
+            <AnalyticsDatePicker day={day} onChange={setDay} />
+            <button className="small-btn" type="button" onClick={() => setRefresh((value) => value + 1)}><RefreshCcw size={15} />重新整理</button>
+          </div>
+        </div>
+        {summaryError && <p className="error-note" role="alert">{summaryError}</p>}
+        {!summary && !summaryError && <InlineLoading label="正在計算當日數據..." />}
+        {summary && <>
+          <div className="analytics-cards">{cards.map(([label, value, unit]) => <div key={label}><small>{label}</small><strong>{value}</strong><span>{unit}</span></div>)}</div>
+          <p className="muted analytics-note">毛利估算＝當日購買中已分配結果的銷售代幣 − 其卡牌兌換值；未結算購買不計入。此數字不包含商品成本、運費或手續費，並非港幣淨利。入金按審批日期計，購買按下單日期計。</p>
+          <p className="muted analytics-note">更新時間：{formatAnalyticsTime(summary.calculatedAt)}</p>
+        </>}
+      </section>
+      <section className="panel">
+        <div className="analytics-toolbar"><div><h2>資料明細</h2><p className="muted">每頁 50 筆，只可檢視。</p></div></div>
+        <div className="analytics-tabs" role="group" aria-label="明細類型">
+          {[["users", "會員"], ["purchases", "購買交易"], ["payments", "入金審批"]].map(([id, label]) =>
+            <button key={id} type="button" className={view === id ? "active" : ""} onClick={() => setView(id)}>{label}</button>)}
+        </div>
+        {rowsError && <p className="error-note" role="alert">{rowsError}</p>}
+        {loadingRows ? <InlineLoading label="正在讀取明細..." /> : <>
+          <div className="analytics-table-wrap"><table className="analytics-table"><thead><tr>
+            {(view === "users" ? ["會員", "電郵／電話", "加入日期", "代幣餘額", "累計入金"]
+              : view === "purchases" ? ["購買時間", "會員", "場次／號碼", "消費", "結果／兌換值"]
+                : ["審批時間", "會員", "狀態", "核實入金", "代幣"]).map((heading) => <th key={heading}>{heading}</th>)}
+          </tr></thead><tbody>{rows.map((item) => <tr key={item.id}>
+            {view === "users" ? <>
+              <td><strong>{item.username || item.displayName || "未命名"}</strong><small>{item.id}</small></td>
+              <td>{displayEmail(item.email) || item.phoneNumber || "--"}</td><td>{formatAnalyticsTime(item.createdAt)}</td>
+              <td>{formatTokenNumber(item.tokens)}</td><td>HK${formatTokenNumber(item.totalDeposits)}</td>
+            </> : view === "purchases" ? <>
+              <td>{formatAnalyticsTime(item.createdAt)}</td><td><strong>{item.username || item.uid || "--"}</strong><small>{item.id}</small></td>
+              <td>{item.drawTitle || "--"} · {formatRoundLabel(item.round)} #{item.number || "--"}</td><td>{formatTokenNumber(item.tokenCost)} 代幣</td>
+              <td>{item.cardId ? `${item.cardName || "已分配"} · ${formatTokenNumber(getCardConversionRefund(item))} 代幣` : "未結算"}</td>
+            </> : <>
+              <td>{formatAnalyticsTime(item.reviewedAt)}</td><td><strong>{item.username || item.uid || "--"}</strong><small>{item.id}</small></td>
+              <td>{item.status === "approved" ? "已批准" : item.status === "rejected" ? "已駁回" : item.status || "--"}</td>
+              <td>{item.proofMode === "promo" ? "推廣碼" : `HK$${formatTokenNumber(item.verifiedHkdAmount)}`}</td><td>{formatTokenNumber(item.amount)}</td>
+            </>}
+          </tr>)}</tbody></table></div>
+          {!rows.length && !rowsError && <p className="muted">沒有紀錄。</p>}
+          {cursor && <button className="small-btn" type="button" disabled={loadingMore} onClick={loadMore}>{loadingMore ? "載入中..." : "載入更多"}</button>}
+        </>}
+      </section>
+    </div>
+  );
+}
+
 function LiveDrawAdminPanel({ profile }) {
   const isBeta = IS_BETA;
   const [activeAdminSection, setActiveAdminSection] = useState(isBeta ? "live" : "rooms");
@@ -7611,11 +7737,12 @@ function LiveDrawAdminPanel({ profile }) {
   const vipTiers = useVipProgram();
   const adminSections = isBeta
     ? [
+        ADMIN_SECTIONS[0],
         { id: "monitor", label: "直播監察", eyebrow: "Live monitor", icon: Bell },
         { id: "live", label: "直播管理", eyebrow: "Live", icon: Gavel },
         BETA_BANNER_SECTION,
         BETA_ANNOUNCEMENTS_SECTION,
-        ...ADMIN_SECTIONS.filter((section) => !["rooms", "create-room"].includes(section.id)),
+        ...ADMIN_SECTIONS.filter((section) => !["analytics", "rooms", "create-room"].includes(section.id)),
         { id: "affiliate", label: "Affiliate", eyebrow: "Affiliate program", icon: UserRoundPlus },
         { id: "support", label: "客服訊息", eyebrow: "Support inbox", icon: Headphones },
         { id: "audit", label: "審計紀錄", eyebrow: "Audit trail", icon: Shield },
@@ -7833,6 +7960,9 @@ function LiveDrawAdminPanel({ profile }) {
         <div className="admin-section">
           <CreateDrawForm profile={profile} cards={cards} previousDraws={draws} />
         </div>
+      )}
+      {activeAdminSection === "analytics" && (
+        <div className="admin-section"><AdminAnalytics /></div>
       )}
       {activeAdminSection === "cards" && (
         <div className="admin-section">
@@ -11852,6 +11982,22 @@ function LiveRoundSettingsList({ allDraws, cards, currentLive, profile, schedule
     }
   }
 
+  // Hide an accidental future broadcast only when no customer has bought a number.
+  async function cancelScheduledBroadcast(broadcast) {
+    if (broadcast.status !== "scheduled") return;
+    if (!window.confirm(`確認取消「${broadcast.title || "LiveDraw 直播"}」？取消後會從玩家的日期選單移除。`)) return;
+
+    setUpdatingId(broadcast.id);
+    try {
+      await httpsCallable(functions, "adminCancelScheduledDraw")({ drawId: broadcast.id });
+      setExpandedId("");
+    } catch (error) {
+      showSafeError(error, "未能取消場次，請稍後再試。");
+    } finally {
+      setUpdatingId("");
+    }
+  }
+
   return (
     <div className="live-round-settings-list">
       {broadcasts.map((broadcast) => {
@@ -11880,6 +12026,11 @@ function LiveRoundSettingsList({ allDraws, cards, currentLive, profile, schedule
               <ChevronDown size={20} aria-hidden="true" />
             </button>
             <div className="live-round-broadcast-actions">
+              {broadcast.status === "scheduled" && (
+                <button className="small-btn danger" type="button" disabled={Boolean(updatingId)} onClick={() => cancelScheduledBroadcast(broadcast)}>
+                  <Trash2 size={15} />{isUpdating ? "處理中..." : "取消多加場次"}
+                </button>
+              )}
               {!isLive && (
                 <button className="primary-btn" type="button" disabled={Boolean(updatingId)} onClick={() => setBroadcastLive(broadcast)}>
                   <Zap size={15} />{isUpdating ? "處理中..." : "設為直播中"}

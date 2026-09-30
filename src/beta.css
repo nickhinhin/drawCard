@@ -2546,6 +2546,39 @@
   color: #fff;
 }
 
+.beta-mode .analytics-cards > div,
+.beta-mode .analytics-table th,
+.beta-mode .analytics-table td {
+  border-color: var(--beta-line);
+}
+
+.beta-mode .analytics-tabs button {
+  border-color: var(--beta-line);
+  color: var(--beta-white);
+}
+
+.beta-mode .analytics-tabs button.active {
+  border-color: var(--beta-red);
+  background: var(--beta-red);
+}
+
+.beta-mode .analytics-date-trigger,
+.beta-mode .analytics-calendar {
+  border-color: var(--beta-line);
+  background: #141419;
+  color: var(--beta-white);
+}
+
+.beta-mode .analytics-calendar-grid button:hover,
+.beta-mode .analytics-calendar-grid button.selected {
+  background: var(--beta-red);
+  color: #fff;
+}
+
+.beta-mode .analytics-calendar-today {
+  border-color: var(--beta-line);
+}
+
 .beta-mode .mini-card.selected {
   box-shadow: 0 0 0 2px rgba(237, 24, 65, .28), inset 0 0 22px rgba(237, 24, 65, .08);
 }
@@ -2817,6 +2850,16 @@
   background: #111116;
   color: #fff;
   box-shadow: 0 24px 90px rgba(0,0,0,.65);
+}
+
+.beta-mode .payment-modal-summary > span {
+  border-color: #34343b;
+  background: #141419;
+  color: #b8b8c1;
+}
+
+.beta-mode .payment-modal-summary strong {
+  color: var(--beta-white);
 }
 
 .beta-mode .blind-box-backdrop {
@@ -5033,7 +5076,8 @@
   pointer-events: none;
 }
 
-.beta-mode .beta-desktop-sticky-controls button {
+.beta-mode .beta-desktop-sticky-controls button,
+.beta-mode .beta-desktop-sticky-controls a {
   display: inline-flex;
   min-height: 44px;
   align-items: center;
@@ -5062,7 +5106,9 @@
 }
 
 .beta-mode .beta-desktop-sticky-controls button:hover,
-.beta-mode .beta-desktop-sticky-controls button:focus-visible {
+.beta-mode .beta-desktop-sticky-controls button:focus-visible,
+.beta-mode .beta-desktop-sticky-controls a:hover,
+.beta-mode .beta-desktop-sticky-controls a:focus-visible {
   transform: translateY(-2px);
   filter: brightness(1.08);
 }
@@ -5307,7 +5353,8 @@
     display: none;
   }
 
-  .beta-mode .beta-mobile-sticky-controls button {
+  .beta-mode .beta-mobile-sticky-controls button,
+  .beta-mode .beta-mobile-sticky-controls a {
     display: flex;
     width: fit-content;
     min-height: 34px;
@@ -6548,4 +6595,26 @@
 .beta-mode .desktop-number-grid button:not(:disabled):focus-visible {
   border-color: var(--beta-red);
   background: rgba(239, 20, 57, 0.12);
+}
+
+/* Secondary text-style action under the token request form. */
+.beta-mode .token-method-link {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid #34343b;
+  border-radius: 3px;
+  background: #111116;
+  color: #e9e9eb;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.beta-mode .token-method-link:hover {
+  border-color: var(--beta-red);
+  background: #19191f;
 }
