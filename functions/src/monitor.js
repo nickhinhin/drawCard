@@ -177,8 +177,9 @@ export function buildMonitorReport({ startMs, endMs, records = [], requests = []
 }
 
 // Audience of a live session from liveVisitors docs (one per room + anonymous browser).
-// Each doc lists the 30-second beat indexes (ms / 30000) and the live rounds it was seen in.
-export const AUDIENCE_BEAT_MS = 30 * 1000;
+// Each doc lists the 5-second beat indexes (ms / 5000) and the live rounds it was seen in.
+export const AUDIENCE_BEAT_MS = 5 * 1000;
+const AUDIENCE_TIMELINE_MAX = 4320; // 6 hours of 5-second points
 
 export function summarizeAudience(visitors, startBeat, endBeat) {
   const perBeat = new Map();
@@ -198,9 +199,9 @@ export function summarizeAudience(visitors, startBeat, endBeat) {
   for (const [beat, count] of perBeat) {
     if (count > peak || (count === peak && beat < peakBeat)) { peak = count; peakBeat = beat; }
   }
-  // Every 30-second point from start to end (zeros included) for the traffic chart.
+  // Every 5-second point from start to end (zeros included) for the traffic chart.
   const timeline = [];
-  for (let beat = startBeat; beat <= endBeat && timeline.length < 1440; beat += 1) {
+  for (let beat = startBeat; beat <= endBeat && timeline.length < AUDIENCE_TIMELINE_MAX; beat += 1) {
     timeline.push({ at: new Date(beat * AUDIENCE_BEAT_MS).toISOString(), count: perBeat.get(beat) || 0 });
   }
   return {

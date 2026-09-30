@@ -177,7 +177,7 @@ try {
 {
   const visitorId = "abcdef0123456789abcd";
   const visitRef = doc(db, "liveVisitors", `${drawId}_${visitorId}`);
-  const beat = Math.floor(Date.now() / 30000);
+  const beat = Math.floor(Date.now() / 5000);
   const visit = (overrides = {}) => ({
     drawId, visitorId, uid: "", lastBeat: beat, beats: arrayUnion(beat), rounds: arrayUnion("round-001"),
     lastSeenAt: serverTimestamp(), ...overrides,
@@ -191,7 +191,7 @@ try {
     }
   };
   await attempt("live audience heartbeat", () => setDoc(visitRef, visit(), { merge: true }), true);
-  await attempt("audience heartbeat for a fake time (inflate peak)", () => setDoc(visitRef, visit({ lastBeat: beat + 120, beats: arrayUnion(beat + 120) }), { merge: true }), false);
+  await attempt("audience heartbeat for a fake time (inflate peak)", () => setDoc(visitRef, visit({ lastBeat: beat + 720, beats: arrayUnion(beat + 720) }), { merge: true }), false);
   await attempt("audience heartbeat with many beats at once", () => setDoc(visitRef, visit({ beats: arrayUnion(beat - 5, beat - 4, beat - 3) }), { merge: true }), false);
   await attempt("audience heartbeat claiming another user's uid", () => setDoc(visitRef, visit({ uid: "someone-else" }), { merge: true }), false);
   await attempt("audience doc id that does not match the visitor", () => setDoc(doc(db, "liveVisitors", `${drawId}_zzzzzzzzzzzzzzzzzzzz`), visit(), { merge: true }), false);

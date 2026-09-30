@@ -7,7 +7,7 @@ import { setGlobalOptions } from "firebase-functions/v2";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { analyzeAuditEntries } from "./audit-analysis.js";
 import { analyticsDayRange, summarizeAdminDay } from "./admin-analytics.js";
-import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeClientError, summarizeAudience } from "./monitor.js";
+import { AUDIENCE_BEAT_MS, buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeClientError, summarizeAudience } from "./monitor.js";
 
 // Least-privilege runtime identity: Firestore, this project's bucket, App Check and logging only.
 // Builds run as the default compute account, which holds only roles/cloudbuild.builds.builder.
@@ -1689,8 +1689,8 @@ export const adminMonitorSession = onCall({ ...adminCallableOptions, timeoutSeco
       db.collection("tokenRequests").where("reviewedAt", ">=", startTs).where("reviewedAt", "<", endTs).get(),
       db.collection("tokenRequests").where("status", "in", ["pending", "awaiting_upload"]).get(),
       db.collection("drawRecords").where("shippingRequestedAt", ">=", startTs).where("shippingRequestedAt", "<", endTs).count().get(),
-      // Heartbeats are every 30 s: include docs last touched just before the start,
-      // then summarizeAudience keeps only the 30-second beats inside the session.
+      // Heartbeats are every 5 s: include docs last touched just before the start,
+      // then summarizeAudience keeps only the 5-second beats inside the session.
       db.collection("liveVisitors").where("lastSeenAt", ">=", Timestamp.fromMillis(start.getTime() - 5 * 60 * 1000)).get(),
     ]);
     const requests = new Map();
@@ -1718,7 +1718,7 @@ export const adminMonitorSession = onCall({ ...adminCallableOptions, timeoutSeco
     const audit = auditEntries ? analyzeAuditEntries(auditEntries) : null;
     const stored = {
       ...report,
-      audience: summarizeAudience(visitors.docs.map((doc) => doc.data()), Math.floor(start.getTime() / 30000), Math.floor(end.getTime() / 30000)),
+      audience: summarizeAudience(visitors.docs.map((doc) => doc.data()), Math.floor(start.getTime() / AUDIENCE_BEAT_MS), Math.floor(end.getTime() / AUDIENCE_BEAT_MS)),
       errors,
       audit: audit ? { summary: audit.summary, entryCount: audit.entryCount, findings: audit.findings.slice(0, 50) } : { unavailable: true },
     };

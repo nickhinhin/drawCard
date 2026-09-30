@@ -97,9 +97,9 @@ test("monitor report summarises sales, token requests and wait times", async () 
   assert.equal(report.shippingRequests, 2);
 });
 
-test("audience summary counts unique visitors, members, peak, rounds and a 30s timeline", async () => {
+test("audience summary counts unique visitors, members, peak, rounds and a 5s timeline", async () => {
   const { summarizeAudience } = await import("../src/monitor.js");
-  const b = 58_000_000;
+  const b = 358_000_000;
   const summary = summarizeAudience([
     { uid: "u1", beats: [b, b + 1, b + 2], rounds: ["round-001", "round-002"] },
     { uid: "", beats: [b + 1, b + 2], rounds: ["round-001"] },
@@ -107,7 +107,7 @@ test("audience summary counts unique visitors, members, peak, rounds and a 30s t
     { uid: "", beats: [b - 30], rounds: ["round-001"] }, // before the session: ignored
   ], b, b + 3);
   assert.deepEqual([summary.unique, summary.members, summary.guests, summary.peak], [3, 2, 1, 3]);
-  assert.equal(summary.peakAt, new Date((b + 2) * 30000).toISOString());
+  assert.equal(summary.peakAt, new Date((b + 2) * 5000).toISOString());
   assert.deepEqual(summary.byRound, [{ round: "round-001", unique: 2 }, { round: "round-002", unique: 2 }]);
   assert.deepEqual(summary.timeline.map((point) => point.count), [1, 2, 3, 0]);
 });
