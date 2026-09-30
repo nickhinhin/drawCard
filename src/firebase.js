@@ -3,6 +3,8 @@ import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "firebase/app-ch
 import { connectAuthEmulator, getAuth, GoogleAuthProvider } from "firebase/auth";
 import {
   connectFirestoreEmulator,
+  disableNetwork,
+  enableNetwork,
   initializeFirestore,
   memoryLocalCache,
   persistentLocalCache,
@@ -64,7 +66,12 @@ function memoryCacheRequested() {
   }
 }
 
-const memoryCacheMode = memoryCacheRequested();
+// Phones and tablets keep no IndexedDB cache: mobile Safari / in-app browsers can hang
+// IndexedDB after the page returns from the background, and a frozen background tab
+// can block the multi-tab cache, leaving purchases stuck until a reload.
+const isMobileBrowser = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+  || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+const memoryCacheMode = isMobileBrowser || memoryCacheRequested();
 
 // Keep confirmed Firestore data across reloads so repeat visits can render immediately.
 export const db = initializeFirestore(app, {
@@ -101,6 +108,39 @@ if (useEmulators) {
   connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
   connectFirestoreEmulator(db, "127.0.0.1", 8080);
   connectFunctionsEmulator(functions, "127.0.0.1", 5001);
+}
+
+// Phones pause background pages and the Firestore connection can die silently; when the
+// player comes back (or the network returns) restart it so purchases do not hang.
+const RECONNECT_AFTER_HIDDEN_MS = 30 * 1000;
+let hiddenSince = 0;
+let reconnecting = false;
+
+async function reconnectFirestore() {
+  if (reconnecting) return;
+  reconnecting = true;
+  try {
+    await disableNetwork(db);
+    await enableNetwork(db);
+  } catch {
+    // Firestore retries on its own; a failed restart must not break the page.
+  } finally {
+    reconnecting = false;
+  }
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      hiddenSince = Date.now();
+      return;
+    }
+    if (hiddenSince && Date.now() - hiddenSince > RECONNECT_AFTER_HIDDEN_MS) reconnectFirestore();
+    hiddenSince = 0;
+  });
+  window.addEventListener("online", reconnectFirestore);
+  // Restored from the back/forward cache: its old connection is gone.
+  window.addEventListener("pageshow", (event) => { if (event.persisted) reconnectFirestore(); });
 }
 
 export const analyticsPromise = new Promise((resolve) => {
