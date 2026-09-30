@@ -50,6 +50,8 @@ const tokenProofCallableOptions = {
   memory: "256MiB",
 };
 const AFFILIATE_CODE_PATTERN = /^AFF[A-F0-9]{20}$/;
+// Tokens given once to every new member account (see ensureAffiliateAccount).
+const SIGNUP_BONUS_TOKENS = 50;
 
 const READ_COLLECTIONS = new Set([
   "users", "cards", "draws", "tokenRequests", "drawRecords", "promoCodes",
@@ -322,7 +324,9 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
     const email = String(request.auth.token.email || "").slice(0, 320);
     const photoURL = String(request.auth.token.picture || "").slice(0, 500);
     transaction.create(userRef, {
-      uid, email, displayName, photoURL, phoneNumber, username: "", tokens: 0, role: "user",
+      // New members start with a one-off signup gift (users cannot create their own profile).
+      uid, email, displayName, photoURL, phoneNumber, username: "", tokens: SIGNUP_BONUS_TOKENS, role: "user",
+      signupBonusTokens: SIGNUP_BONUS_TOKENS, signupBonusAt: FieldValue.serverTimestamp(),
       affiliateStatus: "none",
       referredByUid: referrerUid,
       referredByCode: referrerUid ? requestedReferralCode : "",
@@ -341,7 +345,7 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
         createdAt: FieldValue.serverTimestamp(),
       });
     }
-    return { affiliateCode: "", affiliateStatus: "none", referredByUid: referrerUid };
+    return { affiliateCode: "", affiliateStatus: "none", referredByUid: referrerUid, created: true, signupBonusTokens: SIGNUP_BONUS_TOKENS };
   });
   return { ok: true, ...result };
 });

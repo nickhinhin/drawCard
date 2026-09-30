@@ -13,6 +13,7 @@ export const AUDIT_THRESHOLDS = {
   purchaseBurstCount: 20,
   purchaseBurstMs: 60 * 1000,
   rejectionsPerUser: 3,
+  signupBonusTokens: 50,
   nightStartHour: 1,
   nightEndHour: 6,
 };
@@ -87,6 +88,12 @@ export function analyzeAuditEntries(entries, thresholds = AUDIT_THRESHOLDS) {
     if (SENSITIVE_COLLECTIONS.has(collection) && !isPlayer(entry) && !isServer(entry)) {
       findings.push(finding("high", "direct-edit", "未經網站或伺服器的直接修改", entry,
         `${entry.operation} ${entry.path}，改動欄位：${Object.keys(entry.changes || {}).join(", ") || "-"}`));
+    }
+
+    // 1b. A new account starting with more tokens than the signup gift.
+    if (collection === "users" && entry.operation === "create" && Number(after(entry, "tokens")) > thresholds.signupBonusTokens) {
+      findings.push(finding("high", "signup-tokens", "新帳戶開戶代幣異常", entry,
+        `新帳戶開戶即有 ${after(entry, "tokens")} 代幣（新會員禮物為 ${thresholds.signupBonusTokens}）`));
     }
 
     // 2. Token balance went up without an approved deposit or a card conversion.

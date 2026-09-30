@@ -184,6 +184,8 @@ const CARD_THUMB_COMPRESSION = {
 };
 
 const LIVE_SNAPSHOT_OPTIONS = { includeMetadataChanges: true };
+// Set once the new-member gift pop-up has been shown in this browser.
+const SIGNUP_PROMO_SEEN_KEY = "livedraw-signup-promo-seen";
 // A guest's room / card / round / number kept while they log in (see rememberGuestSelection).
 const PENDING_SELECTION_KEY = "livedraw-pending-selection";
 
@@ -531,6 +533,9 @@ function App() {
   const [signingIn, setSigningIn] = useState(false);
   const [authDialogOpen, setAuthDialogOpen] = useState(false);
   const [authNotice, setAuthNotice] = useState("");
+  const [authInitialAction, setAuthInitialAction] = useState("");
+  const [signupPromoOpen, setSignupPromoOpen] = useState(false);
+  const [welcomeBonus, setWelcomeBonus] = useState(0);
   const googleSignInPendingRef = useRef(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("draw");
@@ -571,10 +576,26 @@ function App() {
     };
   }, []);
 
+  // Guests see the new-member gift once (per browser), 15 seconds after arriving.
+  useEffect(() => {
+    if (!IS_BETA || IS_ADMIN_SITE || authUser || !authReady) return undefined;
+    try {
+      if (localStorage.getItem(SIGNUP_PROMO_SEEN_KEY)) return undefined;
+    } catch {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      try { localStorage.setItem(SIGNUP_PROMO_SEEN_KEY, "1"); } catch { /* shown once per page anyway */ }
+      setSignupPromoOpen(true);
+    }, 15 * 1000);
+    return () => window.clearTimeout(timer);
+  }, [authUser, authReady]);
+
   // Guests who try to pick a number (or pay) are sent straight to login / register.
   useEffect(() => {
     function openLogin(event) {
       setAuthNotice(String(event.detail?.notice || ""));
+      setAuthInitialAction(String(event.detail?.action || ""));
       setAuthDialogOpen(true);
     }
     window.addEventListener("beta-open-login", openLogin);
@@ -662,13 +683,15 @@ function App() {
         // Functions. Refresh once and retry only authentication failures so account
         // creation does not become stuck on the first page load after sign-in.
         await authUser.getIdToken(true);
+        let created;
         try {
-          await ensureAffiliateAccount(accountData);
+          created = await ensureAffiliateAccount(accountData);
         } catch (error) {
           if (error?.code !== "functions/unauthenticated") throw error;
           await authUser.getIdToken(true);
-          await ensureAffiliateAccount(accountData);
+          created = await ensureAffiliateAccount(accountData);
         }
+        if (created?.data?.created && created.data.signupBonusTokens > 0) setWelcomeBonus(created.data.signupBonusTokens);
         window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
         window.sessionStorage.removeItem(PENDING_REGISTRATION_KEY);
       } catch (error) {
@@ -1007,11 +1030,50 @@ function App() {
           authError={authError}
           isBeta={isBeta}
           notice={authNotice}
-          onClose={() => { setAuthDialogOpen(false); setAuthNotice(""); }}
+          initialAction={authInitialAction}
+          onClose={() => { setAuthDialogOpen(false); setAuthNotice(""); setAuthInitialAction(""); }}
           onGoogleLogin={handleLogin}
           signingIn={signingIn}
         />
       )}
+      {signupPromoOpen && !signedIn && !authDialogOpen && (
+        <GiftModal
+          title="新會員送 50 代幣"
+          body="首次註冊即送 50 代幣，可立即用於直播抽卡。"
+          actionLabel="立即註冊"
+          onAction={() => {
+            setSignupPromoOpen(false);
+            setAuthNotice("註冊成功即送 50 代幣。");
+            setAuthInitialAction("register");
+            setAuthDialogOpen(true);
+          }}
+          onClose={() => setSignupPromoOpen(false)}
+        />
+      )}
+      {welcomeBonus > 0 && (
+        <GiftModal
+          title="歡迎加入 LiveDraw！"
+          body={`新會員禮物 ${welcomeBonus} 代幣已存入你的帳戶，可立即用於直播抽卡。`}
+          actionLabel="開始抽卡"
+          onAction={() => { setWelcomeBonus(0); setActiveTab("draw"); }}
+          onClose={() => setWelcomeBonus(0)}
+        />
+      )}
+    </div>
+  );
+}
+
+function GiftModal({ title, body, actionLabel, onAction, onClose }) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal gift-modal" role="dialog" aria-modal="true" aria-labelledby="gift-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="icon-btn modal-close" type="button" onClick={onClose} aria-label="關閉"><X size={19} /></button>
+        <Gift size={40} className="gift-modal-icon" aria-hidden="true" />
+        <h2 id="gift-modal-title">{title}</h2>
+        <p>{body}</p>
+        <button className="primary-btn" type="button" onClick={onAction}>{actionLabel}</button>
+        <button className="ghost-btn gift-modal-later" type="button" onClick={onClose}>稍後再說</button>
+      </section>
     </div>
   );
 }
@@ -1299,8 +1361,8 @@ function WelcomePanel({ authError, onGoogleLogin, onPhoneLogin, signingIn }) {
   );
 }
 
-function AuthDialog({ authError, isBeta = false, notice = "", onClose, onGoogleLogin, signingIn }) {
-  const [accountAction, setAccountAction] = useState(isBeta ? "" : "login");
+function AuthDialog({ authError, isBeta = false, notice = "", initialAction = "", onClose, onGoogleLogin, signingIn }) {
+  const [accountAction, setAccountAction] = useState(isBeta ? initialAction : "login");
   // Phone users sign in with a password. SMS is only for registration and "forgot password".
   const [useSmsLogin, setUseSmsLogin] = useState(false);
   const [password, setPassword] = useState("");
@@ -1511,6 +1573,7 @@ function AuthDialog({ authError, isBeta = false, notice = "", onClose, onGoogleL
           <>
 
             <h2 id="auth-dialog-title">{isRegistration ? "註冊" : "登入"}</h2>
+            {notice && <p className="auth-dialog-notice">{notice}</p>}
             <p className="muted">請選擇使用手機號碼或 Google {isRegistration ? "建立帳戶" : "繼續"}。</p>
             <div className="auth-method-grid">
               <button className="auth-choice-card primary" type="button" onClick={() => setAuthMethod("phone")}>

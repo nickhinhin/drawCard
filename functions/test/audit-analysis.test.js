@@ -73,3 +73,12 @@ test("players with authType unknown are not flagged, and a cleared result side i
   const cleared = { collection: "draws", path: "draws/d1", time: "2026-09-24T05:00:00Z", operation: "update", authType: "unknown", authId: FUNCTIONS_SERVICE_ACCOUNT, changes: { roundResultSides: { before: { "round-001": { 24: "hell" } }, after: { "round-001": {} } } }, context: {} };
   assert.ok(analyzeAuditEntries([cleared]).findings.some((item) => item.rule === "result-tampering"));
 });
+
+test("signup gift: normal new account is fine, extra starting tokens are flagged", () => {
+  assert.deepEqual(rulesOf([
+    entry({ collection: "users", path: "users/n1", operation: "create", changes: { tokens: { before: null, after: 50 } } }),
+  ]), []);
+  assert.ok(rulesOf([
+    entry({ collection: "users", path: "users/n2", operation: "create", changes: { tokens: { before: null, after: 5000 } } }),
+  ]).includes("signup-tokens"));
+});

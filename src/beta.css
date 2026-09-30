@@ -6679,3 +6679,30 @@
 @media print {
   .beta-mode .audience-timeline-bars span { background: #333; }
 }
+
+/* New-member gift pop-ups. */
+.beta-mode .gift-modal {
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+  max-width: 380px;
+  text-align: center;
+}
+
+.beta-mode .gift-modal-icon {
+  color: #ffcf3f;
+}
+
+.beta-mode .gift-modal h2 {
+  margin: 0;
+}
+
+.beta-mode .gift-modal p {
+  margin: 0;
+  color: #d8d8de;
+}
+
+.beta-mode .gift-modal .primary-btn,
+.beta-mode .gift-modal .gift-modal-later {
+  width: 100%;
+}
