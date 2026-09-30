@@ -111,8 +111,8 @@ if (useEmulators) {
 }
 
 // Phones pause background pages and the Firestore connection can die silently; when the
-// player comes back (or the network returns) restart it so purchases do not hang.
-const RECONNECT_AFTER_HIDDEN_MS = 30 * 1000;
+// player comes back after 15 s or more (or the network returns) restart it so purchases do not hang.
+const RECONNECT_AFTER_HIDDEN_MS = 15 * 1000;
 let hiddenSince = 0;
 let reconnecting = false;
 
