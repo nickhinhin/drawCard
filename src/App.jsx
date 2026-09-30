@@ -3046,16 +3046,8 @@ function DrawCard({ profile }) {
             >
               <X size={20} />
             </button>
-            {profile?.uid ? (
-              <ChatRoom drawId={selectedRoom.id} profile={profile} active={chatVisible} />
-            ) : (
-              <section className="panel chat-panel guest-chat-panel">
-              <div className="section-heading compact beta-live-chat-heading">
-                <div><span>LIVE CHAT</span><h2>大廳聊天</h2></div>
-              </div>
-              <p className="muted">登入後即可查看及參與大廳聊天。</p>
-              </section>
-            )}
+            {/* Guests can read the chat; posting asks them to log in. */}
+            <ChatRoom drawId={selectedRoom.id} profile={profile?.uid ? profile : null} active={chatVisible} />
           </div>
         )}
       </div>
@@ -4877,7 +4869,7 @@ function ChatRoom({ drawId, profile, active = true }) {
         ) : messages.length ? (
           messages.map((message) => (
             <article
-              className={message.uid === profile.uid ? "chat-message own-message" : "chat-message"}
+              className={profile && message.uid === profile.uid ? "chat-message own-message" : "chat-message"}
               key={message.id}
             >
               <div>
@@ -4891,6 +4883,11 @@ function ChatRoom({ drawId, profile, active = true }) {
           <p className="muted">大廳暫時未有訊息。</p>
         )}
       </div>
+      {!profile ? (
+        <button className="primary-btn chat-login-btn" type="button" onClick={() => requestLogin("請先登入或註冊，即可在聊天室發言。")}>
+          <LogIn size={18} />登入後即可發言
+        </button>
+      ) : (
       <form className="chat-form" onSubmit={sendMessage}>
         <input
           value={text}
@@ -4904,6 +4901,7 @@ function ChatRoom({ drawId, profile, active = true }) {
           {sending ? "發送中..." : cooldownMs > 0 ? `等待 ${cooldownSec} 秒` : "發送"}
         </button>
       </form>
+      )}
     </section>
   );
 }

@@ -873,7 +873,8 @@ service cloud.firestore {
       }
 
       match /messages/{messageId} {
-        allow read: if signedIn();
+        // Anyone may read the live chat (guests see it read-only); only members can post.
+        allow read: if true;
         allow create: if isValidRoomMessage(drawId, messageId)
           && request.resource.data.source == "draw";
         allow update, delete: if false;

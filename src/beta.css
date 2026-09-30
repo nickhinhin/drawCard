@@ -6618,3 +6618,9 @@
   border-color: var(--beta-red);
   background: #19191f;
 }
+
+/* Guests reading the live chat: a login button instead of the message box. */
+.beta-mode .chat-login-btn {
+  width: 100%;
+  margin-top: 10px;
+}
