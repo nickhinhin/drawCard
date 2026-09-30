@@ -70,6 +70,7 @@ import {
 import {
   FieldValue,
   Timestamp,
+  arrayUnion,
   collection,
   collectionGroup,
   doc,
@@ -83,6 +84,7 @@ import {
   query,
   runTransaction,
   serverTimestamp,
+  setDoc,
   where,
   writeBatch,
 } from "firebase/firestore";
@@ -2401,6 +2403,8 @@ function DrawCard({ profile }) {
     return null;
   }, [isBeta, roomSlug, rooms]);
   const selectedRoomId = selectedRoom?.id || "";
+  // Counts this browser in the live room's audience (獨立人次 / 高峰) while the page is visible.
+  useLiveAudienceHeartbeat(selectedRoom, profile?.uid, pageVisible);
   const currentBetaLive = isBeta
     ? rooms.find((room) => room.status === "live") || rooms.find((room) => room.status === "draft") || null
     : null;
@@ -4707,6 +4711,106 @@ const CHAT_BLOCKED_PATTERN = new RegExp(String.raw`https?://|www\.|[a-z0-9-]+\.(
 function isBlockedChatText(value) {
   // Full-width letters and digits (ｗｈａｔｓａｐｐ, ９１２３) are folded before checking.
   return CHAT_BLOCKED_PATTERN.test(String(value || "").normalize("NFKC").toLowerCase());
+}
+
+// Anonymous per-browser id used only to count live audience (no personal data).
+function getVisitorId() {
+  try {
+    let id = localStorage.getItem("livedraw-visitor-id");
+    if (!/^[A-Za-z0-9]{16,40}$/.test(id || "")) {
+      id = Array.from(crypto.getRandomValues(new Uint8Array(12)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem("livedraw-visitor-id", id);
+    }
+    return id;
+  } catch {
+    return "";
+  }
+}
+
+// While a live room is open and visible, mark this browser as watching every 30 seconds.
+const AUDIENCE_BEAT_MS = 30 * 1000;
+function useLiveAudienceHeartbeat(room, uid, visible) {
+  const roomId = room?.status === "live" ? room.id : "";
+  const liveRound = room?.status === "live" ? toRoundId(getRoomCurrentRound(room)) : "";
+  useEffect(() => {
+    const visitorId = getVisitorId();
+    if (!roomId || !visible || !visitorId) return undefined;
+    function beat() {
+      const beatIndex = Math.floor(Date.now() / AUDIENCE_BEAT_MS);
+      setDoc(doc(db, "liveVisitors", `${roomId}_${visitorId}`), {
+        drawId: roomId,
+        visitorId,
+        uid: uid || "",
+        lastBeat: beatIndex,
+        beats: arrayUnion(beatIndex),
+        rounds: liveRound ? arrayUnion(liveRound) : arrayUnion(),
+        lastSeenAt: serverTimestamp(),
+      }, { merge: true }).catch(() => {});
+    }
+    beat();
+    const timer = window.setInterval(beat, AUDIENCE_BEAT_MS);
+    return () => window.clearInterval(timer);
+  }, [roomId, liveRound, uid, visible]);
+}
+
+// Same maths as summarizeAudience in functions/src/monitor.js (live dashboard view).
+function summarizeLiveAudience(visitors, startBeat, nowBeat) {
+  const perBeat = new Map();
+  const rounds = new Map();
+  let unique = 0;
+  let members = 0;
+  let online = 0;
+  for (const visitor of visitors) {
+    const beats = (visitor.beats || []).map(Number).filter((beat) => beat >= startBeat);
+    if (!beats.length) continue;
+    unique += 1;
+    if (visitor.uid) members += 1;
+    // Seen in the current or previous 30 s beat.
+    if (Number(visitor.lastBeat) >= nowBeat - 1) online += 1;
+    for (const beat of new Set(beats)) perBeat.set(beat, (perBeat.get(beat) || 0) + 1);
+    for (const round of new Set(visitor.rounds || [])) rounds.set(round, (rounds.get(round) || 0) + 1);
+  }
+  let peak = 0;
+  let peakBeat = null;
+  for (const [beat, count] of perBeat) {
+    if (count > peak || (count === peak && beat < peakBeat)) { peak = count; peakBeat = beat; }
+  }
+  const timeline = [];
+  for (let beat = Math.max(startBeat, nowBeat - 39); beat <= nowBeat; beat += 1) {
+    timeline.push({ at: new Date(beat * AUDIENCE_BEAT_MS), count: perBeat.get(beat) || 0 });
+  }
+  return {
+    unique, members, guests: unique - members, online, peak,
+    peakAt: peakBeat === null ? null : new Date(peakBeat * AUDIENCE_BEAT_MS),
+    byRound: [...rounds.entries()].map(([round, count]) => ({ round, unique: count })).sort((a, b) => a.round.localeCompare(b.round)),
+    timeline,
+  };
+}
+
+// Bar chart of people online per 30-second beat.
+function AudienceTimeline({ points, title }) {
+  if (!points?.length) return null;
+  const max = Math.max(1, ...points.map((point) => point.count));
+  const first = points[0];
+  const last = points[points.length - 1];
+  return (
+    <div className="audience-timeline">
+      <div className="audience-timeline-head">
+        <strong>{title}</strong>
+        <small>每 30 秒 · 最高 {max} 人</small>
+      </div>
+      <div className="audience-timeline-bars" role="img" aria-label={`${title}，最高 ${max} 人`}>
+        {points.map((point) => (
+          <span
+            key={String(point.at)}
+            style={{ height: `${Math.max(4, (point.count / max) * 100)}%` }}
+            title={`${formatClock(point.at)} · ${point.count} 人`}
+          />
+        ))}
+      </div>
+      <div className="audience-timeline-axis"><small>{formatClock(first.at)}</small><small>{formatClock(last.at)}</small></div>
+    </div>
+  );
 }
 
 function requestLogin(notice) {
@@ -7163,6 +7267,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const [health, setHealth] = useState(null);
   const [healthError, setHealthError] = useState("");
   const [now, setNow] = useState(Date.now());
+  const [liveVisitors, setLiveVisitors] = useState([]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 10000);
@@ -7176,6 +7281,18 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   ), []);
 
   const currentRoundId = liveRoom ? toRoundId(getRoomCurrentRound(liveRoom)) : "";
+  useEffect(() => {
+    if (!liveRoom?.id) {
+      setLiveVisitors([]);
+      return undefined;
+    }
+    return onSnapshot(
+      query(collection(db, "liveVisitors"), where("drawId", "==", liveRoom.id)),
+      (snapshot) => setLiveVisitors(snapshot.docs.map((item) => item.data())),
+      (error) => console.error("Monitor audience listener failed.", error),
+    );
+  }, [liveRoom?.id]);
+
   useEffect(() => {
     if (!liveRoom?.id || !currentRoundId) {
       setRoundSlots([]);
@@ -7246,6 +7363,8 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const oldestPendingWait = pendingRequests.length ? now - oldestPending : 0;
   const buyingStopped = Boolean(liveRoom && isRoundBuyingBlocked(liveRoom, currentRoundId));
 
+  const audience = summarizeLiveAudience(liveVisitors, Math.floor(sessionStartMs / AUDIENCE_BEAT_MS), Math.floor(now / AUDIENCE_BEAT_MS));
+
   const alerts = [];
   if (!liveRoom) alerts.push({ level: "medium", text: "目前沒有直播中的房間。" });
   if (buyingStopped) alerts.push({ level: "medium", text: `直播中，但${formatRoundLabel(currentRoundId)}已停止購買。` });
@@ -7289,6 +7408,19 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
           <div><span>待審核代幣申請</span><strong>{pendingRequests.length}{pendingRequests.length ? ` · 最耐 ${formatAgo(oldestPendingWait)}` : ""}</strong></div>
           <div><span>待安排配送</span><strong>{shippingQueue.length}</strong></div>
         </div>
+        <h3 className="monitor-audience-title">觀眾（直播房）</h3>
+        <div className="affiliate-summary monitor-kpis">
+          <div><span>目前在線</span><strong>{audience.online}</strong></div>
+          <div><span>高峰在線</span><strong>{audience.peak}{audience.peakAt ? ` · ${formatClock(audience.peakAt)}` : ""}</strong></div>
+          <div><span>獨立人次</span><strong>{audience.unique}</strong></div>
+          <div><span>會員／訪客</span><strong>{audience.members} / {audience.guests}</strong></div>
+        </div>
+        <AudienceTimeline points={audience.timeline} title="人流走勢（最近 20 分鐘）" />
+        {audience.byRound.length > 0 && (
+          <p className="muted monitor-audience-rounds">
+            每場獨立人次：{audience.byRound.map((item) => `${formatRoundLabel(item.round)} ${item.unique} 人`).join("　")}
+          </p>
+        )}
       </section>
 
       <div className="monitor-columns">
@@ -7348,6 +7480,13 @@ function downloadMonitorReport(session) {
   add("概覽", "開始", formatClock(session.startedAt));
   add("概覽", "結束", formatClock(session.endedAt));
   add("概覽", "時長（分鐘）", report.durationMinutes);
+  if (report.audience) {
+    add("觀眾", "獨立人次", report.audience.unique);
+    add("觀眾", "會員／訪客", `${report.audience.members} / ${report.audience.guests}`);
+    add("觀眾", "高峰在線", `${report.audience.peak}${report.audience.peakAt ? `（${formatClock(report.audience.peakAt)}）` : ""}`);
+    (report.audience.byRound || []).forEach((item) => add("每場獨立人次", formatRoundLabel(item.round), item.unique));
+    (report.audience.timeline || []).forEach((point) => add("人流（每 30 秒）", formatClock(point.at), point.count));
+  }
   add("銷售", "購買次數", report.sales?.purchases);
   add("銷售", "消費代幣", report.sales?.tokens);
   add("銷售", "買家人數", report.sales?.buyers);
@@ -7393,7 +7532,16 @@ function MonitorReportView({ session, onClose }) {
         <div><span>平均處理申請</span><strong>{report.tokenRequests?.averageWaitMinutes ?? 0} 分鐘</strong></div>
         <div><span>錯誤</span><strong>{(report.errors?.clientErrorCount ?? 0) + (report.errors?.serverErrorCount ?? 0)}</strong></div>
         <div><span>可疑活動（高／嚴重）</span><strong>{(report.audit?.summary?.high ?? 0) + (report.audit?.summary?.critical ?? 0)}</strong></div>
+        {report.audience && <>
+          <div><span>獨立人次</span><strong>{report.audience.unique}</strong></div>
+          <div><span>高峰在線</span><strong>{report.audience.peak}{report.audience.peakAt ? ` · ${formatClock(report.audience.peakAt)}` : ""}</strong></div>
+          <div><span>會員／訪客</span><strong>{report.audience.members} / {report.audience.guests}</strong></div>
+        </>}
       </div>
+      {report.audience?.timeline?.length > 0 && <AudienceTimeline points={report.audience.timeline} title="人流走勢（整場）" />}
+      {report.audience?.byRound?.length > 0 && (
+        <p className="muted">每場獨立人次：{report.audience.byRound.map((item) => `${formatRoundLabel(item.round)} ${item.unique} 人`).join("　")}</p>
+      )}
       <div className="monitor-columns">
         <div>
           <h4>每場銷售</h4>

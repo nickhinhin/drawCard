@@ -1,6 +1,6 @@
 import { deleteApp, initializeApp } from "firebase/app";
 import {
-  collection, connectFirestoreEmulator, doc, getDoc, getDocs, getFirestore, runTransaction, serverTimestamp, setDoc, updateDoc, writeBatch,
+  arrayUnion, collection, connectFirestoreEmulator, doc, getDoc, getDocs, getFirestore, runTransaction, serverTimestamp, setDoc, updateDoc, writeBatch,
 } from "firebase/firestore";
 import { connectAuthEmulator, createUserWithEmailAndPassword, getAuth } from "firebase/auth";
 
@@ -171,6 +171,31 @@ try {
   results.push("PASS  one normal chat message: allowed");
 } catch (error) {
   results.push(`FAIL  one normal chat message: ${error.code || error.message}`);
+}
+
+// Live audience: a browser may mark itself for the current minute only; nobody but admins reads it.
+{
+  const visitorId = "abcdef0123456789abcd";
+  const visitRef = doc(db, "liveVisitors", `${drawId}_${visitorId}`);
+  const beat = Math.floor(Date.now() / 30000);
+  const visit = (overrides = {}) => ({
+    drawId, visitorId, uid: "", lastBeat: beat, beats: arrayUnion(beat), rounds: arrayUnion("round-001"),
+    lastSeenAt: serverTimestamp(), ...overrides,
+  });
+  const attempt = async (label, write, expectAllowed) => {
+    try {
+      await write();
+      results.push(`${expectAllowed ? "PASS" : "FAIL"}  ${label}: ${expectAllowed ? "allowed" : "ACCEPTED"}`);
+    } catch (error) {
+      results.push(`${expectAllowed ? `FAIL  ${label}: ${error.code || error.message}` : `PASS  ${label}: rejected`}`);
+    }
+  };
+  await attempt("live audience heartbeat", () => setDoc(visitRef, visit(), { merge: true }), true);
+  await attempt("audience heartbeat for a fake time (inflate peak)", () => setDoc(visitRef, visit({ lastBeat: beat + 120, beats: arrayUnion(beat + 120) }), { merge: true }), false);
+  await attempt("audience heartbeat with many beats at once", () => setDoc(visitRef, visit({ beats: arrayUnion(beat - 5, beat - 4, beat - 3) }), { merge: true }), false);
+  await attempt("audience heartbeat claiming another user's uid", () => setDoc(visitRef, visit({ uid: "someone-else" }), { merge: true }), false);
+  await attempt("audience doc id that does not match the visitor", () => setDoc(doc(db, "liveVisitors", `${drawId}_zzzzzzzzzzzzzzzzzzzz`), visit(), { merge: true }), false);
+  await attempt("player reads the audience list", () => getDocs(collection(db, "liveVisitors")), false);
 }
 
 // Purchases: display fields must match the card library and the room.

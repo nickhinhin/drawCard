@@ -175,3 +175,42 @@ export function buildMonitorReport({ startMs, endMs, records = [], requests = []
     shippingRequests: shipping,
   };
 }
+
+// Audience of a live session from liveVisitors docs (one per room + anonymous browser).
+// Each doc lists the 30-second beat indexes (ms / 30000) and the live rounds it was seen in.
+export const AUDIENCE_BEAT_MS = 30 * 1000;
+
+export function summarizeAudience(visitors, startBeat, endBeat) {
+  const perBeat = new Map();
+  const rounds = new Map();
+  let unique = 0;
+  let members = 0;
+  for (const visitor of visitors) {
+    const beats = (visitor.beats || []).map(Number).filter((beat) => beat >= startBeat && beat <= endBeat);
+    if (!beats.length) continue;
+    unique += 1;
+    if (visitor.uid) members += 1;
+    for (const beat of new Set(beats)) perBeat.set(beat, (perBeat.get(beat) || 0) + 1);
+    for (const round of new Set(visitor.rounds || [])) rounds.set(round, (rounds.get(round) || 0) + 1);
+  }
+  let peak = 0;
+  let peakBeat = null;
+  for (const [beat, count] of perBeat) {
+    if (count > peak || (count === peak && beat < peakBeat)) { peak = count; peakBeat = beat; }
+  }
+  // Every 30-second point from start to end (zeros included) for the traffic chart.
+  const timeline = [];
+  for (let beat = startBeat; beat <= endBeat && timeline.length < 1440; beat += 1) {
+    timeline.push({ at: new Date(beat * AUDIENCE_BEAT_MS).toISOString(), count: perBeat.get(beat) || 0 });
+  }
+  return {
+    unique,
+    members,
+    guests: unique - members,
+    peak,
+    peakAt: peakBeat === null ? null : new Date(peakBeat * AUDIENCE_BEAT_MS).toISOString(),
+    byRound: [...rounds.entries()].map(([round, count]) => ({ round, unique: count }))
+      .sort((left, right) => left.round.localeCompare(right.round)),
+    timeline,
+  };
+}

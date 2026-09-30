@@ -6624,3 +6624,58 @@
   width: 100%;
   margin-top: 10px;
 }
+
+/* Live monitor audience block. */
+.beta-mode .monitor-audience-title {
+  margin: 16px 0 8px;
+}
+
+.beta-mode .monitor-audience-rounds {
+  margin-top: 8px;
+}
+
+/* 人流走勢: people online per 30 s. */
+.beta-mode .audience-timeline {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #2a2a30;
+  border-radius: 3px;
+  background: #0f0f13;
+}
+
+.beta-mode .audience-timeline-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.beta-mode .audience-timeline-head small,
+.beta-mode .audience-timeline-axis small {
+  color: var(--beta-muted);
+}
+
+.beta-mode .audience-timeline-bars {
+  display: flex;
+  gap: 2px;
+  align-items: flex-end;
+  height: 90px;
+}
+
+.beta-mode .audience-timeline-bars span {
+  flex: 1 1 0;
+  min-width: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--beta-red);
+  opacity: 0.85;
+}
+
+.beta-mode .audience-timeline-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+}
+
+@media print {
+  .beta-mode .audience-timeline-bars span { background: #333; }
+}
