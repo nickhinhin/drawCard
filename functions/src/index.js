@@ -1451,6 +1451,7 @@ export const __test = {
 
 // Data-change audit triggers (see audit.js).
 export * from "./audit.js";
+export { emailNewDepositRequest } from "./deposit-email.js";
 
 // The retention-locked log bucket that holds the data-change audit trail.
 // Until it exists, entries are read from the project's default log bucket (30 days).
