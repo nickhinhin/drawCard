@@ -2659,7 +2659,7 @@ function DrawCard({ profile }) {
       return;
     }
     if (isRoundBuyingBlocked(selectedRoom, activeRoundId)) {
-      alert("管理員已停止本場購買，不能再鎖定新號碼。");
+      alert("本場已停止購買。");
       return;
     }
     if (!profile?.uid) {
@@ -2723,6 +2723,16 @@ function DrawCard({ profile }) {
           String(purchase.slot.number),
         );
         const recordRef = doc(collection(db, "drawRecords"));
+        // Read the room inside the transaction so a stop pressed while the confirm
+        // box was open shows a clear message instead of a permission error; if the
+        // admin stops buying before this commits, the transaction re-runs and stops here.
+        const roomSnap = await transaction.get(doc(db, "draws", purchase.roomId));
+        const latestRoom = roomSnap.exists() ? { id: roomSnap.id, ...roomSnap.data() } : null;
+        if (!isRoomPurchasable(latestRoom)) throw new Error("本場直播已結束，不能再購買號碼。");
+        if (getRoundSortValue(purchase.roundId) < getRoomCurrentRound(latestRoom)) {
+          throw new Error("此場次已完結，不能再購買號碼。");
+        }
+        if (isRoundBuyingBlocked(latestRoom, purchase.roundId)) throw new Error("本場已停止購買。");
         const userSnap = await transaction.get(userRef);
         const slotSnap = await transaction.get(slotRef);
         // Rules require the card library's own name and image on the purchase.
