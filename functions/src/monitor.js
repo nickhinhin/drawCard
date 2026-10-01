@@ -51,11 +51,27 @@ export function createRateLimiter(limit, windowMs, now = () => Date.now()) {
   };
 }
 
+// Errors thrown by scripts that in-app browsers (Instagram, Facebook, Android
+// WebViews) inject into every page; they are not from LiveDraw code.
+const INJECTED_SCRIPT_ERRORS = /webkit\.messageHandlers|_pcmBridgeCallbackHandler|Java object is gone/i;
+const ABORT_ERROR = /\bAbortError\b|^The operation was aborted|aborted a request/i;
+
+// Reports that are noise for the live monitor. Aborted requests only matter
+// when a signed-in player or a live room is involved (e.g. during a purchase);
+// a guest leaving the home page mid-load is expected.
+export function isIgnoredClientError(payload = {}) {
+  const message = String(payload.message || "").replace(CLIENT_ERROR_PREFIX, "");
+  if (INJECTED_SCRIPT_ERRORS.test(message)) return true;
+  const aborted = ABORT_ERROR.test(message) || String(payload.code) === "20";
+  return aborted && !payload.uid && !String(payload.page || "").includes("room=");
+}
+
 // Groups browser error reports by message so the admin sees each problem once.
 export function groupClientErrors(entries) {
   const groups = new Map();
   for (const entry of entries) {
     const payload = entry.jsonPayload || {};
+    if (isIgnoredClientError(payload)) continue;
     const message = String(payload.message || "").replace(CLIENT_ERROR_PREFIX, "");
     const key = `${payload.code}|${message}`;
     if (!groups.has(key)) {
@@ -90,10 +106,27 @@ export function groupClientErrors(entries) {
     .sort((left, right) => right.count - left.count);
 }
 
+// Callables and event triggers are only ever called with POST. A plain GET is a
+// browser or Google's own check opening the function URL (seen seconds after every
+// deploy); the request log, the "invalid method" warning and the "Invalid
+// request" error it produces share one trace and are all dropped.
+function getRequestTraces(entries) {
+  const traces = new Set();
+  for (const entry of entries) {
+    const text = String(entry.textPayload || entry.jsonPayload?.message || "");
+    if (entry.trace && (entry.httpRequest?.requestMethod === "GET" || /^Request has invalid method\. GET/.test(text))) {
+      traces.add(entry.trace);
+    }
+  }
+  return traces;
+}
+
 // Groups Cloud Run / Cloud Functions errors and warnings by service and message.
 export function groupServerErrors(entries) {
   const groups = new Map();
+  const getTraces = getRequestTraces(entries);
   for (const entry of entries) {
+    if (entry.httpRequest?.requestMethod === "GET" || (entry.trace && getTraces.has(entry.trace))) continue;
     const service = entry.resource?.labels?.service_name || entry.resource?.labels?.function_name || "unknown";
     const request = entry.httpRequest;
     // Request logs have no text: describe the failed call instead of showing "{}".

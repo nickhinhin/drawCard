@@ -63,6 +63,29 @@ test("error groups keep the details needed for a hotfix", async () => {
   assert.equal(stackGroup.detail, "Error: boom\n    at run (index.js:9:1)");
 });
 
+test("monitor hides in-app browser noise and GET probes of function URLs", () => {
+  const at = "2026-10-01T13:22:23Z";
+  const client = groupClientErrors([
+    { timestamp: at, jsonPayload: { message: "client error: undefined is not an object (evaluating 'window.webkit.messageHandlers')", page: "/" } },
+    { timestamp: at, jsonPayload: { message: "client error: Error invoking postMessage: Java object is gone", page: "/" } },
+    { timestamp: at, jsonPayload: { message: "client error: AbortError", code: "20", page: "/" } },
+    { timestamp: at, jsonPayload: { message: "client error: The operation was aborted.", code: "20", page: "/" } },
+    { timestamp: at, jsonPayload: { message: "client error: AbortError", code: "20", page: "/", uid: "u1" } },
+    { timestamp: at, jsonPayload: { message: "client error: The operation was aborted.", code: "20", page: "/?room=abc" } },
+  ]);
+  assert.deepEqual(client.map((group) => [group.message, group.count]).sort(), [["AbortError", 1], ["The operation was aborted.", 1]]);
+
+  const service = { labels: { service_name: "adminanalytics" } };
+  const server = groupServerErrors([
+    { timestamp: "t1", severity: "WARNING", trace: "tr1", resource: service, httpRequest: { status: 400, requestMethod: "GET", requestUrl: "https://a.run.app/" } },
+    { timestamp: "t1", severity: "WARNING", trace: "tr1", resource: service, textPayload: "Request has invalid method. GET" },
+    { timestamp: "t1", severity: "ERROR", trace: "tr1", resource: service, jsonPayload: { message: "Error: Invalid request, unable to process." } },
+    { timestamp: "t1", severity: "WARNING", trace: "tr2", resource: service, httpRequest: { status: 404, requestMethod: "GET", requestUrl: "https://a.run.app/favicon.ico" } },
+    { timestamp: "t2", severity: "ERROR", trace: "tr3", resource: service, jsonPayload: { message: "Error: Invalid request, unable to process." } },
+  ]);
+  assert.deepEqual(server.map((group) => [group.message, group.count]), [["Error: Invalid request, unable to process.", 1]]);
+});
+
 test("monitor report summarises sales, token requests and wait times", async () => {
   const { buildMonitorReport } = await import("../src/monitor.js");
   const start = Date.parse("2026-09-24T12:00:00Z");

@@ -6,7 +6,12 @@ import { functions, recoverFromCorruptLocalCache } from "./firebase.js";
 // Each message is sent at most once a minute and a page sends at most 30 reports.
 const MAX_REPORTS_PER_PAGE = 30;
 const REPEAT_WINDOW_MS = 60 * 1000;
-const IGNORED = [/ResizeObserver loop/i, /chrome-extension:\/\//i, /Script error\.?$/i];
+// The last pattern covers scripts that in-app browsers (Instagram, Facebook,
+// Android WebViews) inject into the page; they are not LiveDraw errors.
+const IGNORED = [
+  /ResizeObserver loop/i, /chrome-extension:\/\//i, /Script error\.?$/i,
+  /webkit\.messageHandlers|_pcmBridgeCallbackHandler|Java object is gone/i,
+];
 const lastSent = new Map();
 let reportsSent = 0;
 

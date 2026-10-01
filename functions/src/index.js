@@ -1654,12 +1654,16 @@ async function errorSummary(sinceIso, untilIso) {
     readProjectLogs(CLIENT_ERROR_FILTER, sinceIso, untilIso),
     readProjectLogs(SERVER_ERROR_FILTER, sinceIso, untilIso, 500),
   ]);
+  // Counts come from the groups so ignored noise is left out of the totals too.
+  const clientErrors = groupClientErrors(clientEntries);
+  const serverErrors = groupServerErrors(serverEntries);
+  const countOf = (groups) => groups.reduce((total, group) => total + group.count, 0);
   return {
-    clientErrors: groupClientErrors(clientEntries).slice(0, 50),
-    serverErrors: groupServerErrors(serverEntries).slice(0, 50),
-    clientErrorCount: clientEntries.length,
-    serverErrorCount: serverEntries.filter(isErrorSeverity).length,
-    serverWarningCount: serverEntries.filter((entry) => entry.severity === "WARNING").length,
+    clientErrors: clientErrors.slice(0, 50),
+    serverErrors: serverErrors.slice(0, 50),
+    clientErrorCount: countOf(clientErrors),
+    serverErrorCount: countOf(serverErrors.filter(isErrorSeverity)),
+    serverWarningCount: countOf(serverErrors.filter((group) => group.severity === "WARNING")),
   };
 }
 
