@@ -6731,6 +6731,11 @@
   background: #0b0b0f;
 }
 
+/* 數據分析 → 會員: sortable column headers. */
+.analytics-sort { display: inline-flex; align-items: center; gap: 3px; padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; white-space: nowrap; }
+.analytics-sort:hover, .analytics-sort.active { color: var(--beta-white, #fff); }
+.analytics-sort .idle { opacity: .35; }
+
 .beta-mode .batch-number-target > span:first-child svg {
   width: 28px;
   height: 28px;

@@ -649,12 +649,10 @@ export const adminAnalytics = onCall(adminCallableOptions, async (request) => {
   if (cursor && (cursor.length > 180 || cursor.includes("/"))) {
     throw new HttpsError("invalid-argument", "分頁位置不正確。");
   }
+  if (mode === "users") return adminAnalyticsUsersPage(request.data, cursor);
   let source;
   let query;
-  if (mode === "users") {
-    source = db.collection("users");
-    query = source.orderBy(FieldPath.documentId(), "asc");
-  } else if (mode === "purchases" || mode === "payments") {
+  if (mode === "purchases" || mode === "payments") {
     source = db.collection(mode === "purchases" ? "drawRecords" : "tokenRequests");
     const field = mode === "purchases" ? "createdAt" : "reviewedAt";
     query = source.where(field, ">=", start).where(field, "<", end).orderBy(field, "desc");
@@ -668,9 +666,7 @@ export const adminAnalytics = onCall(adminCallableOptions, async (request) => {
   }
   const page = await query.limit(51).get();
   const docs = page.docs.slice(0, 50);
-  const fields = mode === "users"
-    ? ["username", "displayName", "email", "phoneNumber", "createdAt", "tokens", "totalDeposits", "vipLevel"]
-    : mode === "purchases"
+  const fields = mode === "purchases"
       ? ["uid", "username", "createdAt", "drawTitle", "round", "number", "tokenCost", "cardId", "cardName", "cardValue", "cardConversionValue"]
       : ["uid", "username", "reviewedAt", "status", "proofMode", "verifiedHkdAmount", "amount", "paymentReference"];
   return {
@@ -681,6 +677,35 @@ export const adminAnalytics = onCall(adminCallableOptions, async (request) => {
     nextCursor: page.size > 50 ? docs.at(-1)?.id || "" : "",
   };
 });
+
+const ANALYTICS_USER_FIELDS = ["username", "displayName", "email", "phoneNumber", "createdAt", "tokens", "totalDeposits", "vipLevel"];
+const ANALYTICS_USER_SORTS = new Set(["createdAt", "tokens", "totalDeposits"]);
+
+// Members are sorted in memory so users without a field (most have no totalDeposits
+// until their first approved deposit) still appear; the cursor is the next offset.
+async function adminAnalyticsUsersPage(data, cursor) {
+  const sort = ANALYTICS_USER_SORTS.has(data?.sort) ? data.sort : "createdAt";
+  const sign = data?.direction === "asc" ? 1 : -1;
+  const offset = cursor ? Number(cursor) : 0;
+  if (!Number.isInteger(offset) || offset < 0) throw new HttpsError("invalid-argument", "分頁位置不正確。");
+  const snapshot = await db.collection("users").select(...ANALYTICS_USER_FIELDS).get();
+  const sortValue = (doc) => {
+    const value = doc.get(sort);
+    return sort === "createdAt" ? value?.toMillis?.() || 0 : Number(value || 0);
+  };
+  const docs = snapshot.docs
+    .map((doc) => ({ doc, value: sortValue(doc) }))
+    .sort((left, right) => sign * (left.value - right.value) || left.doc.id.localeCompare(right.doc.id))
+    .slice(offset, offset + 50)
+    .map(({ doc }) => doc);
+  return {
+    items: docs.map((doc) => ({
+      id: doc.id,
+      ...Object.fromEntries(ANALYTICS_USER_FIELDS.map((field) => [field, serialize(doc.get(field) ?? null)])),
+    })),
+    nextCursor: snapshot.size > offset + 50 ? String(offset + 50) : "",
+  };
+}
 
 export const adminWrite = onCall(adminCallableOptions, async (request) => {
   const actor = assertAdmin(request);

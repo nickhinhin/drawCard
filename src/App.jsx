@@ -7,6 +7,7 @@ import {
   Check,
   ChevronDown,
   ChevronLeft,
+  ChevronUp,
   ChevronRight,
   ArrowDown,
   ArrowUp,
@@ -7822,6 +7823,15 @@ function AdminAnalytics() {
   const [summary, setSummary] = useState(null);
   const [summaryError, setSummaryError] = useState("");
   const [rows, setRows] = useState([]);
+  const [userSort, setUserSort] = useState({ field: "createdAt", direction: "desc" });
+  const sortParams = view === "users" ? { sort: userSort.field, direction: userSort.direction } : {};
+
+  function toggleUserSort(field) {
+    setUserSort((current) => ({
+      field,
+      direction: current.field === field && current.direction === "desc" ? "asc" : "desc",
+    }));
+  }
   const [cursor, setCursor] = useState("");
   const [rowsError, setRowsError] = useState("");
   const [loadingRows, setLoadingRows] = useState(true);
@@ -7843,7 +7853,7 @@ function AdminAnalytics() {
     setRows([]);
     setCursor("");
     setRowsError("");
-    httpsCallable(functions, "adminAnalytics")({ mode: view, day })
+    httpsCallable(functions, "adminAnalytics")({ mode: view, day, ...(view === "users" ? { sort: userSort.field, direction: userSort.direction } : {}) })
       .then(({ data }) => {
         if (cancelled) return;
         setRows(data.items || []);
@@ -7852,7 +7862,7 @@ function AdminAnalytics() {
       .catch((error) => { if (!cancelled) setRowsError(getSafeErrorMessage(error, "未能讀取明細。")); })
       .finally(() => { if (!cancelled) setLoadingRows(false); });
     return () => { cancelled = true; };
-  }, [day, view, refresh]);
+  }, [day, view, refresh, userSort]);
 
   // Append one server-authorized page without exposing any edit controls.
   async function loadMore() {
@@ -7860,7 +7870,7 @@ function AdminAnalytics() {
     setLoadingMore(true);
     setRowsError("");
     try {
-      const { data } = await httpsCallable(functions, "adminAnalytics")({ mode: view, day, cursor });
+      const { data } = await httpsCallable(functions, "adminAnalytics")({ mode: view, day, cursor, ...sortParams });
       setRows((current) => [...current, ...(data.items || [])]);
       setCursor(data.nextCursor || "");
     } catch (error) {
@@ -7910,9 +7920,16 @@ function AdminAnalytics() {
         {rowsError && <p className="error-note" role="alert">{rowsError}</p>}
         {loadingRows ? <InlineLoading label="正在讀取明細..." /> : <>
           <div className="analytics-table-wrap"><table className="analytics-table"><thead><tr>
-            {(view === "users" ? ["會員", "電郵／電話", "加入日期", "代幣餘額", "累計入金"]
-              : view === "purchases" ? ["購買時間", "會員", "場次／號碼", "消費", "結果／兌換值"]
-                : ["審批時間", "會員", "狀態", "核實入金", "代幣"]).map((heading) => <th key={heading}>{heading}</th>)}
+            {view === "users" ? [["會員"], ["電郵／電話"], ["加入日期", "createdAt"], ["代幣餘額", "tokens"], ["累計入金", "totalDeposits"]].map(([heading, field]) => (
+              field ? (
+                <th key={heading} aria-sort={userSort.field === field ? (userSort.direction === "asc" ? "ascending" : "descending") : "none"}>
+                  <button className={`analytics-sort ${userSort.field === field ? "active" : ""}`} type="button" onClick={() => toggleUserSort(field)}>
+                    {heading}{userSort.field === field ? (userSort.direction === "asc" ? <ChevronUp size={14} /> : <ChevronDown size={14} />) : <ChevronDown size={14} className="idle" />}
+                  </button>
+                </th>
+              ) : <th key={heading}>{heading}</th>
+            )) : (view === "purchases" ? ["購買時間", "會員", "場次／號碼", "消費", "結果／兌換值"]
+              : ["審批時間", "會員", "狀態", "核實入金", "代幣"]).map((heading) => <th key={heading}>{heading}</th>)}
           </tr></thead><tbody>{rows.map((item) => <tr key={item.id}>
             {view === "users" ? <>
               <td><strong>{item.username || item.displayName || "未命名"}</strong><small>{item.id}</small></td>
