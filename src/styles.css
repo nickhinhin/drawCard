@@ -2338,6 +2338,99 @@ textarea:focus {
   font-size: 0.92rem;
 }
 
+.purchase-overlay-exporter {
+  margin: 0 0 16px;
+}
+
+.purchase-overlay-toggle,
+.purchase-overlay-controls > button {
+  min-height: 40px;
+  padding: 0 16px;
+  border: 1px solid var(--accent, #e5204d);
+  border-radius: 8px;
+  background: var(--accent, #e5204d);
+  color: #fff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.purchase-overlay-controls > button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.purchase-overlay-panel {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+  padding: 16px;
+  border: 1px solid var(--line, #333);
+  border-radius: 12px;
+}
+
+.purchase-overlay-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+
+.purchase-overlay-controls label {
+  display: grid;
+  gap: 6px;
+  min-width: min(220px, 100%);
+  font-weight: 700;
+}
+
+.purchase-overlay-controls select,
+.purchase-overlay-controls input[type="range"] {
+  width: 100%;
+}
+
+.purchase-overlay-session {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px solid var(--line, #333);
+  border-radius: 6px;
+  font-weight: 500;
+}
+
+.purchase-overlay-preview {
+  position: relative;
+  width: min(720px, 100%);
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid #666;
+  border-radius: 8px;
+  background-color: #34343b;
+  background-image: linear-gradient(45deg, #494951 25%, transparent 25%), linear-gradient(-45deg, #494951 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #494951 75%), linear-gradient(-45deg, transparent 75%, #494951 75%);
+  background-size: 20px 20px;
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+}
+
+.purchase-overlay-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.purchase-overlay-panel > .muted {
+  margin: 0;
+}
+
+.purchase-overlay-error {
+  margin: 0;
+  color: #f55;
+}
+
+.purchase-overlay-success {
+  margin: 0;
+  color: #28c76f;
+}
+
 .admin-status-tabs {
   margin-bottom: 14px;
 }
@@ -5254,6 +5347,51 @@ textarea:focus {
   background: #05070b;
 }
 
+.stream-player-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  transform-origin: center;
+}
+
+.stream-player-stage .kick-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  aspect-ratio: auto;
+}
+
+.stream-table-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.stream-overlay-btn {
+  position: absolute;
+  z-index: 3;
+  right: 116px;
+  bottom: 12px;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid rgb(255 255 255 / 28%);
+  border-radius: 8px;
+  background: rgb(0 0 0 / 78%);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.stream-overlay-btn:hover,
+.stream-overlay-btn:focus-visible {
+  border-color: rgb(255 255 255 / 65%);
+  background: rgb(0 0 0 / 92%);
+}
+
 .kick-frame-wrap:fullscreen {
   display: grid;
   place-items: center;
@@ -5275,11 +5413,10 @@ textarea:focus {
   background: #000;
 }
 
-.kick-frame-wrap:fullscreen .kick-frame,
-.kick-frame-wrap.is-mobile-fullscreen .kick-frame {
-  width: 100vw;
-  max-height: 100vh;
-  transform-origin: center;
+.kick-frame-wrap:fullscreen .stream-player-stage,
+.kick-frame-wrap.is-mobile-fullscreen .stream-player-stage {
+  max-width: none;
+  max-height: none;
 }
 
 .stream-fullscreen-btn,

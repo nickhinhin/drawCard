@@ -1660,6 +1660,11 @@
   aspect-ratio: 16 / 9;
 }
 
+.beta-mode .stream-player-stage .kick-frame {
+  height: 100%;
+  aspect-ratio: auto;
+}
+
 .beta-mode .room-stream-panel {
   grid-area: stream;
 }

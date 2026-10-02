@@ -1,0 +1,11 @@
+[
+  {
+    "origin": [
+      "https://livedraw-adminpage-7e3c2.web.app",
+      "https://livedraw-adminpage-7e3c2.firebaseapp.com"
+    ],
+    "method": ["GET", "HEAD"],
+    "responseHeader": ["Content-Type"],
+    "maxAgeSeconds": 3600
+  }
+]

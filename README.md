@@ -65,6 +65,11 @@ deployed with `npm run deploy:admin`). Follow `ADMIN_SECURITY_HANDOFF.md` to con
 the UID allowlist, Firebase custom claim and App Check. The public website build does
 not contain any administration code (`scripts/assert-no-web-admin.mjs` enforces this).
 
+The OBS card PNG exporter reads Firebase Storage images into a browser canvas.
+The bucket's CORS rule is recorded in `storage.cors.json`; it allows image reads
+from the admin site. Firebase Hosting and Storage Rules deployments do not apply
+bucket CORS, so keep this rule when recreating or migrating the bucket.
+
 ## Data model
 
 - `users/{uid}`: profile, display username, token balance, role. Auth `uid` is the only identity.

@@ -94,6 +94,8 @@ import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
 import { reportClientError } from "./errorReporting.js";
 import { getToken as getAppCheckToken } from "firebase/app-check";
 import { appCheck, auth, db, functions, googleProvider } from "./firebase";
+import StreamTableOverlay from "./StreamTableOverlay.jsx";
+import PurchaseOverlayExporter from "./PurchaseOverlayExporter.jsx";
 
 const PENDING_AFFILIATE_CODE_KEY = "livedraw-pending-affiliate-code";
 const PENDING_REGISTRATION_KEY = "livedraw-pending-registration";
@@ -3041,7 +3043,12 @@ function DrawCard({ profile }) {
               )}
             </div>
           </div>
-          <KickEmbed kickUrl={selectedRoom.kickUrl} title={selectedRoom.title} />
+          <KickEmbed
+            kickUrl={selectedRoom.kickUrl}
+            title={selectedRoom.title}
+            slots={slots}
+            showTableOverlay={isBeta && Number(selectedRoom.cardCount) === 20}
+          />
           {!isBeta && (
             <div className="draw-meta">
               <span>{selectedRoom.cardCount} 張卡</span>
@@ -4534,8 +4541,9 @@ function NumberGrid({
   );
 }
 
-const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
+const KickEmbed = memo(function KickEmbed({ kickUrl, title, slots = [], showTableOverlay = false }) {
   const [isMuted, setIsMuted] = useState(true);
+  const [tableOverlayVisible, setTableOverlayVisible] = useState(true);
   const [isCompactPlayer, setIsCompactPlayer] = useState(() => (
     typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches
   ));
@@ -4708,22 +4716,21 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
   }
 
   const usesNativeMobilePlayer = isCompactPlayer && !mobilePlayerFailed;
+  const stageStyle = isFullscreen && inlinePlayerSizeRef.current ? {
+    width: `${inlinePlayerSizeRef.current.width}px`,
+    height: `${inlinePlayerSizeRef.current.height}px`,
+    transform: `scale(${fullscreenScale})`,
+  } : undefined;
 
   return (
     <div className={`kick-frame-wrap${isMobileFullscreen ? " is-mobile-fullscreen" : ""}${usesNativeMobilePlayer ? " uses-native-mobile-player" : ""}`} ref={frameWrapRef}>
+      <div className="stream-player-stage" style={stageStyle}>
       {usesNativeMobilePlayer ? (
         mobilePlaybackUrl ? (
           <video
             className="kick-frame"
             ref={playerFrameRef}
             src={mobilePlaybackUrl}
-            style={isFullscreen && inlinePlayerSizeRef.current ? {
-              width: `${inlinePlayerSizeRef.current.width}px`,
-              height: `${inlinePlayerSizeRef.current.height}px`,
-              maxWidth: "none",
-              maxHeight: "none",
-              transform: `scale(${fullscreenScale})`,
-            } : undefined}
             title={`${title} Kick stream`}
             autoPlay
             muted={isMuted}
@@ -4740,13 +4747,6 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
           className="kick-frame"
           ref={playerFrameRef}
           src={embedUrl}
-          style={isFullscreen && inlinePlayerSizeRef.current ? {
-            width: `${inlinePlayerSizeRef.current.width}px`,
-            height: `${inlinePlayerSizeRef.current.height}px`,
-            maxWidth: "none",
-            maxHeight: "none",
-            transform: `scale(${fullscreenScale})`,
-          } : undefined}
           title={`${title} Kick stream`}
           allow="autoplay *; fullscreen *; picture-in-picture *"
           sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
@@ -4754,6 +4754,20 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
           scrolling="no"
           allowFullScreen
         />
+      )}
+      {showTableOverlay && tableOverlayVisible && <StreamTableOverlay slots={slots} />}
+      </div>
+      {showTableOverlay && (
+        <button
+          className="stream-overlay-btn"
+          type="button"
+          onClick={() => setTableOverlayVisible((visible) => !visible)}
+          aria-pressed={tableOverlayVisible}
+          aria-label={tableOverlayVisible ? "隱藏桌面圖層" : "顯示桌面圖層"}
+          title={tableOverlayVisible ? "隱藏桌面圖層" : "顯示桌面圖層"}
+        >
+          {tableOverlayVisible ? "隱藏圖層" : "顯示圖層"}
+        </button>
       )}
       <button
         className="stream-mute-btn"
@@ -8626,6 +8640,9 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
               <button className="small-btn" type="button" onClick={clearUnassignedSides}>清除未確認</button>
             </div>
           </div>
+          {Number(selectedDraw?.cardCount || 20) === 20 && (
+            <PurchaseOverlayExporter records={sessionRecords} cards={cards} />
+          )}
           <div className="admin-finance-summary">
             <span><small>購買總金額</small><strong><TokenAmount value={totalPurchaseAmount} /></strong></span>
             <span><small>需要兌換總金額</small><strong><TokenAmount value={totalExchangeAmount} /></strong></span>
