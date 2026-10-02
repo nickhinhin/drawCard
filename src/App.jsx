@@ -471,6 +471,7 @@ const ADMIN_SECTIONS = [
   { id: "packages", label: "套餐設定", eyebrow: "Token packages", icon: Ticket },
   { id: "vip", label: "VIP 設定", eyebrow: "VIP program", icon: Crown },
   { id: "records", label: "購買紀錄", eyebrow: "Room records", icon: ListChecks },
+  { id: "conversions", label: "卡牌轉幣紀錄", eyebrow: "Card conversions", icon: RefreshCcw },
   { id: "shipping", label: "配送需求", eyebrow: "Shipping requests", icon: Truck },
 ];
 
@@ -8011,6 +8012,7 @@ function LiveDrawAdminPanel({ profile }) {
   const [draws, setDraws] = useState([]);
   const [cards, setCards] = useState([]);
   const [records, setRecords] = useState([]);
+  const [recordsError, setRecordsError] = useState("");
   const [adminLoading, setAdminLoading] = useState({
     requests: true,
     draws: true,
@@ -8116,17 +8118,20 @@ function LiveDrawAdminPanel({ profile }) {
 
   // Purchase and delivery history is the largest dataset, so defer it until needed.
   useEffect(() => {
-    if (activeAdminSection !== "records" && activeAdminSection !== "shipping") return undefined;
+    if (!["records", "conversions", "shipping"].includes(activeAdminSection)) return undefined;
 
     setAdminLoading((current) => ({ ...current, records: true }));
+    setRecordsError("");
     const recordsQuery = query(collection(db, "drawRecords"), orderBy("createdAt", "desc"));
     return onSnapshot(recordsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      setRecordsError("");
       if (isSnapshotReady(snapshot)) {
         setAdminLoading((current) => ({ ...current, records: false }));
       }
     }, (error) => {
       console.error("Admin record listener failed.", error);
+      setRecordsError(getSafeErrorMessage(error, "未能載入卡牌紀錄。"));
       setAdminLoading((current) => ({ ...current, records: false }));
     });
   }, [activeAdminSection]);
@@ -8360,7 +8365,53 @@ function LiveDrawAdminPanel({ profile }) {
           <ShippingRequestManager records={records} loading={adminLoading.records} />
         </div>
       )}
+      {activeAdminSection === "conversions" && (
+        <div className="admin-section">
+          <AdminCardConversionRecords records={records} loading={adminLoading.records} error={recordsError} />
+        </div>
+      )}
     </div>
+  );
+}
+
+// Read the completed card-to-token transitions from their original purchase records.
+function AdminCardConversionRecords({ records, loading, error }) {
+  const [search, setSearch] = useState("");
+  const [visibleCount, setVisibleCount] = useState(50);
+  const converted = useMemo(() => records
+    .filter((record) => record.convertedToTokens === true || record.collectionStatus === "converted")
+    .sort((a, b) => toMillis(b.convertedAt) - toMillis(a.convertedAt)), [records]);
+  const searchText = search.trim().toLocaleLowerCase();
+  const filtered = converted.filter((record) => [
+    record.username, record.uid, record.cardName, record.drawTitle, record.id,
+  ].some((value) => String(value || "").toLocaleLowerCase().includes(searchText)));
+  const totalTokens = filtered.reduce((sum, record) => sum + Number(record.tokenRefund || 0), 0);
+
+  return (
+    <section className="panel">
+      <div className="analytics-toolbar">
+        <div><h2>卡牌轉回代幣紀錄</h2><p className="muted">顯示已完成轉換的卡牌及實際存入用戶錢包的代幣。</p></div>
+        <div className="analytics-controls">
+          <label className="analytics-date-picker">搜尋用戶／卡牌／場次／紀錄 ID
+            <input type="search" value={search} onChange={(event) => { setSearch(event.target.value); setVisibleCount(50); }} placeholder="輸入用戶名稱或 UID" />
+          </label>
+        </div>
+      </div>
+      {error && <p className="error-note" role="alert">{error}</p>}
+      {loading ? <InlineLoading label="正在載入轉幣紀錄..." /> : !error && <>
+        <p className="muted">{filtered.length} 筆紀錄 · 合共 {formatTokenNumber(totalTokens)} 代幣</p>
+        <div className="analytics-table-wrap"><table className="analytics-table"><thead><tr>
+          <th>轉換時間</th><th>用戶</th><th>卡牌／場次</th><th>存入代幣</th>
+        </tr></thead><tbody>{filtered.slice(0, visibleCount).map((record) => <tr key={record.id}>
+          <td>{record.convertedAt ? formatAnalyticsTime(new Date(toMillis(record.convertedAt))) : "時間未記錄"}</td>
+          <td><strong>{record.username || record.uid || "未命名用戶"}</strong><small>{record.uid || "--"}</small></td>
+          <td><strong>{record.cardName || "未記錄卡牌"}</strong><small>{record.drawTitle || record.roomSlug || "VIP 獎勵"} · {record.round ? formatRoundLabel(record.round) : "--"} · #{record.number || "--"}</small><small>紀錄 ID：{record.id}</small></td>
+          <td><strong>+{formatTokenNumber(record.tokenRefund)} 代幣</strong></td>
+        </tr>)}</tbody></table></div>
+        {!filtered.length && <p className="muted">沒有符合條件的轉幣紀錄。</p>}
+        {filtered.length > visibleCount && <button className="small-btn" type="button" onClick={() => setVisibleCount((count) => count + 50)}>載入更多</button>}
+      </>}
+    </section>
   );
 }
 
