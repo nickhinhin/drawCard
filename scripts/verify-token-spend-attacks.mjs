@@ -200,7 +200,7 @@ try {
 
 // Purchases: display fields must match the card library and the room.
 async function purchaseSlot2(overrides) {
-  const recordRef = doc(collection(db, "drawRecords"));
+  const recordRef = overrides.recordId ? doc(db, "drawRecords", overrides.recordId) : doc(collection(db, "drawRecords"));
   const slot = {
     purchaseRecordId: recordRef.id, status: "locked", uid, username, tokenCost: PRICE,
     targetCardId: "card-1", targetCardName: "Audit card", targetCardImageUrl: "", targetCardValue: PRICE,
@@ -226,6 +226,7 @@ for (const [label, overrides] of [
   ["fake room title on purchase record", { record: { drawTitle: "VIP4 升級獎勵" } }],
   ["javascript: room link on purchase record", { record: { roomLink: "javascript:alert(1)" } }],
   ["non-integer sort on purchase record", { record: { roundSort: "first" } }],
+  ["purchase record squatting another user's VIP reward id", { recordId: "vip_someone-else_vip2" }],
 ]) {
   try {
     await purchaseSlot2(overrides);

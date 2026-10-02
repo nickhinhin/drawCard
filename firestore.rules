@@ -924,7 +924,9 @@ service cloud.firestore {
     match /drawRecords/{recordId} {
       allow read: if isAdmin() || isOwner(resource.data.uid);
       // VIP rewards are issued only by adminReviewTokenRequest after an admin approves a deposit.
-      allow create: if isMatchingRoundDrawRecord(recordId);
+      // "vip_" ids are reserved for server-issued rewards (vip_<uid>_<tierId>); a
+      // purchase record taking one would make the server skip that user's reward.
+      allow create: if !recordId.matches("vip_.*") && isMatchingRoundDrawRecord(recordId);
       allow update: if isVipRewardClaim() || isCardTokenConversion(recordId) || isShippingRequest();
       allow delete: if false;
     }
