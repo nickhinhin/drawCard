@@ -153,8 +153,8 @@ export default function PurchaseOverlayExporter({ records, cards = [] }) {
   const [preview, setPreview] = useState(null);
   const sessions = useMemo(() => getSessions(records, cards), [records, cards]);
   const session = sessions.find((item) => item.key === selectedKey) || sessions[0];
-  const readyCards = loaded?.key === session?.key ? loaded.cards : null;
-  const previewUrl = preview?.key === session?.key ? preview.url : "";
+  const readyCards = session && loaded?.key === session.key ? loaded.cards : null;
+  const previewUrl = session && preview?.key === session.key ? preview.url : "";
 
   useEffect(() => {
     if (!open || !session) return undefined;
