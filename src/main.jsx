@@ -28,10 +28,10 @@ if (IS_ADMIN_SITE) {
   window.dataLayer = window.dataLayer || [];
   window.gtag = function gtag() { window.dataLayer.push(arguments); };
   window.gtag("js", new Date());
-  window.gtag("config", "AW-18481965647");
+  window.gtag("config", "AW-18489859354");
   const googleTag = document.createElement("script");
   googleTag.async = true;
-  googleTag.src = "https://www.googletagmanager.com/gtag/js?id=AW-18481965647";
+  googleTag.src = "https://www.googletagmanager.com/gtag/js?id=AW-18489859354";
   document.head.appendChild(googleTag);
 }
 
