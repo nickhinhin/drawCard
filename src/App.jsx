@@ -94,7 +94,6 @@ import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
 import { reportClientError } from "./errorReporting.js";
 import { getToken as getAppCheckToken } from "firebase/app-check";
 import { appCheck, auth, db, functions, googleProvider } from "./firebase";
-import StreamTableOverlay from "./StreamTableOverlay.jsx";
 import PurchaseOverlayExporter from "./PurchaseOverlayExporter.jsx";
 
 const PENDING_AFFILIATE_CODE_KEY = "livedraw-pending-affiliate-code";
@@ -3046,8 +3045,6 @@ function DrawCard({ profile }) {
           <KickEmbed
             kickUrl={selectedRoom.kickUrl}
             title={selectedRoom.title}
-            slots={slots}
-            showTableOverlay={isBeta && Number(selectedRoom.cardCount) === 20}
           />
           {!isBeta && (
             <div className="draw-meta">
@@ -4554,9 +4551,8 @@ function NumberGrid({
   );
 }
 
-const KickEmbed = memo(function KickEmbed({ kickUrl, title, slots = [], showTableOverlay = false }) {
+const KickEmbed = memo(function KickEmbed({ kickUrl, title }) {
   const [isMuted, setIsMuted] = useState(true);
-  const [tableOverlayVisible, setTableOverlayVisible] = useState(true);
   const [isCompactPlayer, setIsCompactPlayer] = useState(() => (
     typeof window !== "undefined" && window.matchMedia("(max-width: 760px)").matches
   ));
@@ -4768,20 +4764,7 @@ const KickEmbed = memo(function KickEmbed({ kickUrl, title, slots = [], showTabl
           allowFullScreen
         />
       )}
-      {showTableOverlay && tableOverlayVisible && <StreamTableOverlay slots={slots} />}
       </div>
-      {showTableOverlay && (
-        <button
-          className="stream-overlay-btn"
-          type="button"
-          onClick={() => setTableOverlayVisible((visible) => !visible)}
-          aria-pressed={tableOverlayVisible}
-          aria-label={tableOverlayVisible ? "隱藏桌面圖層" : "顯示桌面圖層"}
-          title={tableOverlayVisible ? "隱藏桌面圖層" : "顯示桌面圖層"}
-        >
-          {tableOverlayVisible ? "隱藏圖層" : "顯示圖層"}
-        </button>
-      )}
       <button
         className="stream-mute-btn"
         type="button"
