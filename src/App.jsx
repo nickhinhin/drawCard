@@ -1,4 +1,4 @@
-import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   BadgeDollarSign,
   Bell,
@@ -4248,6 +4248,8 @@ function RoomRoundOverview({
   onDateChange,
   onRoundChange,
 }) {
+  const dateTabsRef = useRef(null);
+  const roundStripRef = useRef(null);
   const groups = getRoundsByDate(draw, roundOptions);
   const dateOptions = availableRoomDates.length
     ? availableRoomDates
@@ -4263,10 +4265,21 @@ function RoomRoundOverview({
   const activeRoundStatus = getRoundDisplayStatus(draw, activeRoundId);
   const activeResultImage = draw.roundResultImages?.[activeRoundId] || "";
 
+  // Keep the selected live round visible without scrolling the whole page.
+  useLayoutEffect(() => {
+    for (const strip of [dateTabsRef.current, roundStripRef.current]) {
+      const button = strip?.querySelector("button.active");
+      if (!button) continue;
+      const left = strip.scrollLeft + button.getBoundingClientRect().left
+        - strip.getBoundingClientRect().left - (strip.clientWidth - button.clientWidth) / 2;
+      strip.scrollTo({ left, behavior: "auto" });
+    }
+  }, [activeRoundId, activeGroup?.key, draw.id]);
+
   return (
     <section className="room-round-overview" aria-label="抽卡場次">
       <div className="room-round-date-navigation">
-        <div className="room-round-date-tabs" aria-label="選擇直播日期">
+        <div className="room-round-date-tabs" aria-label="選擇直播日期" ref={dateTabsRef}>
           {dateOptions.map((option) => {
             const groupStatuses = option.rounds.map((roundId) => getRoundDisplayStatus(option.room, roundId));
             const dateStatusLabel = groupStatuses.some((status) => status.key === "live")
@@ -4289,7 +4302,7 @@ function RoomRoundOverview({
           })}
         </div>
       </div>
-      <div className="room-round-card-strip">
+      <div className="room-round-card-strip" ref={roundStripRef}>
         {(activeGroup?.rounds || roundOptions).map((roundId) => {
           const roundStatus = getRoundDisplayStatus(draw, roundId);
           return (
