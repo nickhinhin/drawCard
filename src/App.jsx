@@ -4834,13 +4834,17 @@ function summarizeLiveAudience(visitors, startBeat, nowBeat) {
   let unique = 0;
   let members = 0;
   let online = 0;
+  const onlineVisitors = [];
   for (const visitor of visitors) {
     const beats = (visitor.beats || []).map(Number).filter((beat) => beat >= startBeat);
     if (!beats.length) continue;
     unique += 1;
     if (visitor.uid) members += 1;
     // Seen within the last ~10–15 seconds (allows one late heartbeat).
-    if (Number(visitor.lastBeat) >= nowBeat - 2) online += 1;
+    if (Number(visitor.lastBeat) >= nowBeat - 2) {
+      online += 1;
+      onlineVisitors.push(visitor);
+    }
     for (const beat of new Set(beats)) perBeat.set(beat, (perBeat.get(beat) || 0) + 1);
     for (const round of new Set(visitor.rounds || [])) rounds.set(round, (rounds.get(round) || 0) + 1);
   }
@@ -4855,7 +4859,7 @@ function summarizeLiveAudience(visitors, startBeat, nowBeat) {
     timeline.push({ at: new Date(beat * AUDIENCE_BEAT_MS), count: perBeat.get(beat) || 0 });
   }
   return {
-    unique, members, guests: unique - members, online, peak,
+    unique, members, guests: unique - members, online, onlineVisitors, peak,
     peakAt: peakBeat === null ? null : new Date(peakBeat * AUDIENCE_BEAT_MS),
     byRound: [...rounds.entries()].map(([round, count]) => ({ round, unique: count })).sort((a, b) => a.round.localeCompare(b.round)),
     timeline,
@@ -7350,6 +7354,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const [healthError, setHealthError] = useState("");
   const [now, setNow] = useState(Date.now());
   const [liveVisitors, setLiveVisitors] = useState([]);
+  const [onlineUsernames, setOnlineUsernames] = useState({});
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), AUDIENCE_BEAT_MS);
@@ -7446,6 +7451,21 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const buyingStopped = Boolean(liveRoom && isRoundBuyingBlocked(liveRoom, currentRoundId));
 
   const audience = summarizeLiveAudience(liveVisitors, Math.floor(sessionStartMs / AUDIENCE_BEAT_MS), Math.floor(now / AUDIENCE_BEAT_MS));
+  const onlineVisitors = audience.onlineVisitors;
+  const onlineMemberIds = [...new Set(onlineVisitors.map((visitor) => visitor.uid).filter(Boolean))].sort();
+  const onlineMemberKey = onlineMemberIds.join("|");
+  const onlineGuestCount = onlineVisitors.filter((visitor) => !visitor.uid).length;
+
+  // Watch only the profiles currently in the room so username changes appear immediately.
+  useEffect(() => {
+    if (!onlineMemberKey) return undefined;
+    const unsubscribes = onlineMemberKey.split("|").map((uid) => onSnapshot(
+      doc(db, "users", uid),
+      (snapshot) => setOnlineUsernames((current) => ({ ...current, [uid]: snapshot.data()?.username || "" })),
+      (error) => console.error("Monitor online username listener failed.", error),
+    ));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [onlineMemberKey]);
 
   const alerts = [];
   if (!liveRoom) alerts.push({ level: "medium", text: "目前沒有直播中的房間。" });
@@ -7496,6 +7516,17 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
           <div><span>高峰在線</span><strong>{audience.peak}{audience.peakAt ? ` · ${formatClock(audience.peakAt)}` : ""}</strong></div>
           <div><span>獨立人次</span><strong>{audience.unique}</strong></div>
           <div><span>會員／訪客</span><strong>{audience.members} / {audience.guests}</strong></div>
+        </div>
+        <div className="monitor-online-users">
+          <strong>在線會員（{onlineMemberIds.length}）</strong>
+          {onlineMemberIds.length ? (
+            <ul>
+              {onlineMemberIds.map((uid) => (
+                <li key={uid}>{onlineUsernames[uid] || (uid in onlineUsernames ? "未設定用戶名" : "讀取中...")}</li>
+              ))}
+            </ul>
+          ) : <p className="muted">目前沒有會員在線。</p>}
+          {onlineGuestCount > 0 && <p className="muted">另有 {onlineGuestCount} 位未登入訪客在線。</p>}
         </div>
         <AudienceTimeline points={audience.timeline} title="人流走勢（最近 10 分鐘）" />
         {audience.byRound.length > 0 && (

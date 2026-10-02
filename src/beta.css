@@ -6248,6 +6248,31 @@
   margin-top: 6px;
 }
 
+.beta-mode .monitor-online-users {
+  margin: 14px 0 18px;
+}
+
+.beta-mode .monitor-online-users ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.beta-mode .monitor-online-users li {
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--beta-line);
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+
+.beta-mode .monitor-online-users p {
+  margin: 8px 0 0;
+}
+
 .beta-mode .monitor-columns {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
