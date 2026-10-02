@@ -5577,7 +5577,7 @@ function TokenRequest({ profile }) {
         <form className="stack-form" onSubmit={submitAmountStep}>
           {requestMethod === "payment" && <>
           <div className="form-field">
-            <span>選擇充值金額</span>
+            <span>選擇入金金額</span>
             <div className="token-package-grid">
               {tokenPackages.map((item) => (
                 <button
@@ -6126,6 +6126,7 @@ function CollectionPage({ profile }) {
     note: "",
   });
   const [shippingBusy, setShippingBusy] = useState(false);
+  const [shippingCodAgreed, setShippingCodAgreed] = useState(false);
   const shippingRegion = SHIPPING_REGIONS.find((region) => region.id === shippingForm.region)
     || SHIPPING_REGIONS[0];
 
@@ -6291,6 +6292,7 @@ function CollectionPage({ profile }) {
       return;
     }
     setShippingIds(ids);
+    setShippingCodAgreed(false);
     setShippingForm({
       name: profile.displayName || profile.username || "",
       phone: profile.phoneNumber || "",
@@ -6303,6 +6305,10 @@ function CollectionPage({ profile }) {
 
   async function submitShippingRequest(event) {
     event.preventDefault();
+    if (!shippingCodAgreed) {
+      alert("請先確認同意運費到付。");
+      return;
+    }
     if (!shippingForm.name.trim() || !shippingForm.phone.trim() || !shippingForm.address.trim()) {
       alert(shippingForm.method === "sf-pickup" ? "請填寫收件人、電話並選擇順豐自提點。" : "請填寫收件人、電話及完整地址。");
       return;
@@ -6611,7 +6617,11 @@ function CollectionPage({ profile }) {
                 </label>
               )}
               <label>備註<textarea rows={2} value={shippingForm.note} onChange={(event) => setShippingForm((current) => ({ ...current, note: event.target.value }))} placeholder="選填" /></label>
-              <button className="primary-btn" type="submit" disabled={shippingBusy}>
+              <label className="shipping-cod-confirm">
+                <input type="checkbox" checked={shippingCodAgreed} onChange={(event) => setShippingCodAgreed(event.target.checked)} required />
+                <span>我確認配送運費採用到付方式，並同意於收件時支付運費。</span>
+              </label>
+              <button className="primary-btn" type="submit" disabled={shippingBusy || !shippingCodAgreed}>
                 <Package size={17} />{shippingBusy ? "提交中..." : "確認申請配送"}
               </button>
             </form>
