@@ -24,6 +24,14 @@ const CONTEXT_FIELDS = [
 const auditOptions = {
   region: "asia-east2",
   memory: "256MiB",
+  // The region allows only 20 vCPU across all functions (a new project cannot raise
+  // it yet). At the default 1 vCPU per instance, the 19 audit triggers alone used it
+  // up during a live show (3/10/2026). Each audit instance now takes 1/6 vCPU and at
+  // most 2 instances, so audits use at most ~6 vCPU and never starve player functions.
+  // Events over the limit are retried, so no audit entry is lost.
+  cpu: "gcf_gen1",
+  concurrency: 1,
+  maxInstances: 2,
   timeoutSeconds: 30,
   // Retry on failure; the analysis removes duplicate deliveries by eventId.
   retry: true,
