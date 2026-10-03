@@ -6801,3 +6801,9 @@
 .beta-mode .phone-gift-card.done { grid-template-columns: auto 1fr; align-items: center; }
 .beta-mode .phone-gift-card.done p { margin: 0; color: var(--beta-white); }
 .beta-mode .phone-gift-card.done strong { margin-right: 6px; }
+
+/* Chat slow mode: note in the room chat and the switch in 直播監察. */
+.beta-mode .chat-slow-mode { margin: 0 0 8px; padding: 6px 10px; border-left: 3px solid var(--beta-red); background: #1b1418; color: #f1c6cc; font-size: 13px; font-weight: 700; }
+.beta-mode .monitor-slow-mode { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; margin: 14px 0; padding: 12px 14px; border: 1px solid var(--beta-line); border-radius: 4px; }
+.beta-mode .monitor-slow-mode p { display: grid; gap: 4px; margin: 0; }
+.beta-mode .monitor-slow-mode small { color: #b9b9c2; }

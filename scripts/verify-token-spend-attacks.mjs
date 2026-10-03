@@ -173,6 +173,42 @@ try {
   results.push(`FAIL  one normal chat message: ${error.code || error.message}`);
 }
 
+// Slow mode: with draws/{id}.chatCooldownSeconds = 10, a member must wait 10 s between messages.
+async function patch(path, fields) {
+  const mask = Object.keys(fields).map((field) => `updateMask.fieldPaths=${field}`).join("&");
+  const res = await fetch(`http://127.0.0.1:${firestorePort}/v1/projects/${projectId}/databases/(default)/documents/${path}?${mask}`, {
+    method: "PATCH", headers: { Authorization: "Bearer owner", "Content-Type": "application/json" }, body: JSON.stringify({ fields }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+async function chatAfter(secondsAgo) {
+  await patch(`users/${uid}`, { lastChatAt: { timestampValue: new Date(Date.now() - secondsAgo * 1000).toISOString() } });
+  const batch = writeBatch(db);
+  const message = doc(collection(db, "draws", drawId, "messages"));
+  batch.update(doc(db, "users", uid), { lastChatAt: serverTimestamp(), lastChatMessageId: message.id, updatedAt: serverTimestamp() });
+  batch.set(message, chatMessage());
+  await batch.commit();
+}
+await patch(`draws/${drawId}`, { chatCooldownSeconds: i(10) });
+for (const [label, secondsAgo, expectAllowed] of [
+  ["slow mode: message 4 s after the last one", 4, false],
+  ["slow mode: message 11 s after the last one", 11, true],
+]) {
+  try {
+    await chatAfter(secondsAgo);
+    results.push(`${expectAllowed ? "PASS" : "FAIL"}  ${label}: ${expectAllowed ? "allowed" : "ACCEPTED"}`);
+  } catch (error) {
+    results.push(expectAllowed ? `FAIL  ${label}: ${error.code || error.message}` : `PASS  ${label}: rejected`);
+  }
+}
+try {
+  await updateDoc(doc(db, "draws", drawId), { chatCooldownSeconds: 3 });
+  results.push("FAIL  player switches slow mode off: ACCEPTED");
+} catch {
+  results.push("PASS  player switches slow mode off: rejected");
+}
+await patch(`draws/${drawId}`, { chatCooldownSeconds: i(3) });
+
 // Old live audience collection: nobody may write it any more and only admins read it.
 {
   const visitorId = "abcdef0123456789abcd";

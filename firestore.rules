@@ -260,10 +260,17 @@ service cloud.firestore {
         && request.resource.data.updatedAt == request.time;
     }
 
-    function chatCooldownPassed() {
+    function chatCooldownPassed(seconds) {
       return !("lastChatAt" in userDoc(request.auth.uid).data)
         || !(userDoc(request.auth.uid).data.lastChatAt is timestamp)
-        || request.time >= userDoc(request.auth.uid).data.lastChatAt + duration.value(3, "s");
+        || request.time >= userDoc(request.auth.uid).data.lastChatAt + duration.value(seconds, "s");
+    }
+
+    // Seconds between messages in a room: 3 normally, longer in slow mode
+    // (admins set draws/{id}.chatCooldownSeconds to 3–60).
+    function roomChatCooldownSeconds(drawId) {
+      let seconds = drawDoc(drawId).data.get("chatCooldownSeconds", 3);
+      return seconds is int && seconds >= 3 && seconds <= 60 ? seconds : 3;
     }
 
     // Each cooldown update names exactly one message, so a batch cannot post several.
@@ -276,7 +283,7 @@ service cloud.firestore {
         && request.resource.data.lastChatMessageId.size() > 0
         && request.resource.data.lastChatMessageId.size() <= 40
         && request.resource.data.updatedAt == request.time
-        && chatCooldownPassed();
+        && chatCooldownPassed(3);
     }
 
     // A refund requires an existing eligible award to transition in this commit.
@@ -573,7 +580,7 @@ service cloud.firestore {
       return signedIn()
         && ownsUsername(userDoc(request.auth.uid).data.username)
         && drawDoc(drawId).data.status == "live"
-        && chatCooldownPassed()
+        && chatCooldownPassed(roomChatCooldownSeconds(drawId))
         && afterUserDoc(request.auth.uid).data.lastChatAt == request.time
         && afterUserDoc(request.auth.uid).data.get("lastChatMessageId", "") == messageId
         && request.resource.data.keys().hasOnly([

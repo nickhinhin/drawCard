@@ -154,6 +154,10 @@ function validateAdminWrite(collectionName, documentId, data) {
       && !["draft", "scheduled", "live", "completed", "cancelled"].includes(data.status)) {
     throw new HttpsError("invalid-argument", "直播狀態無效。");
   }
+  if (collectionName === "draws" && data.chatCooldownSeconds !== undefined
+      && !(Number.isSafeInteger(data.chatCooldownSeconds) && data.chatCooldownSeconds >= 3 && data.chatCooldownSeconds <= 60)) {
+    throw new HttpsError("invalid-argument", "聊天冷卻時間必須為 3 至 60 秒。");
+  }
   if (collectionName === "cards") {
     if (data.name !== undefined && (typeof data.name !== "string" || !data.name.trim() || data.name.length > 200)) {
       throw new HttpsError("invalid-argument", "卡牌名稱無效。");

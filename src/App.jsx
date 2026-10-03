@@ -219,7 +219,17 @@ const SUPPORT_WHATSAPP_URL = "https://wa.me/85254208951";
 const collectionStatuses = ["pending", "shipping", "shipped"];
 const betaCollectionStatuses = ["pending", "shipping", "shipped", "converted"];
 const CONVERSION_RATE = 0.8;
-const CHAT_COOLDOWN_MS = 3000;
+// Seconds between chat messages per member. Slow mode (draws/{id}.chatCooldownSeconds)
+// switches on automatically while 直播監察 is open and the room is busy.
+const CHAT_COOLDOWN_SECONDS = 3;
+const SLOW_MODE_SECONDS = 10;
+const SLOW_MODE_ON_AT = 500;
+const SLOW_MODE_OFF_BELOW = 400;
+
+function roomChatCooldownSeconds(room) {
+  const seconds = Number(room?.chatCooldownSeconds);
+  return Number.isInteger(seconds) && seconds >= 3 && seconds <= 60 ? seconds : CHAT_COOLDOWN_SECONDS;
+}
 const MY_RECORDS_PAGE_SIZE = 6;
 const MY_COLLECTION_PAGE_SIZE = 12;
 const PLAYER_CARD_BATCH_SIZE = 40;
@@ -3263,7 +3273,7 @@ function DrawCard({ profile }) {
               <X size={20} />
             </button>
             {/* Guests can read the chat; posting asks them to log in. */}
-            <ChatRoom drawId={selectedRoom.id} profile={profile?.uid ? profile : null} active={chatVisible} />
+            <ChatRoom drawId={selectedRoom.id} profile={profile?.uid ? profile : null} active={chatVisible} cooldownSeconds={roomChatCooldownSeconds(selectedRoom)} />
           </div>
         )}
       </div>
@@ -5071,7 +5081,8 @@ function useMediaQuery(queryText) {
 
 // `active` is false while the chat cannot be seen; the live listener then stops so
 // hidden chats do not pay one read per message per viewer.
-function ChatRoom({ drawId, profile, active = true }) {
+function ChatRoom({ drawId, profile, active = true, cooldownSeconds = CHAT_COOLDOWN_SECONDS }) {
+  const cooldownLimitMs = cooldownSeconds * 1000;
   const isBeta = IS_BETA;
   const chatLogRef = useRef(null);
   const [messages, setMessages] = useState([]);
@@ -5114,18 +5125,18 @@ function ChatRoom({ drawId, profile, active = true }) {
 
     function tick() {
       setCooldownMs(
-        Math.max(0, CHAT_COOLDOWN_MS - (Date.now() - lastChatAt.toMillis())),
+        Math.max(0, cooldownLimitMs - (Date.now() - lastChatAt.toMillis())),
       );
     }
 
     tick();
-    if (CHAT_COOLDOWN_MS - (Date.now() - lastChatAt.toMillis()) <= 0) {
+    if (cooldownLimitMs - (Date.now() - lastChatAt.toMillis()) <= 0) {
       return undefined;
     }
 
     const timer = window.setInterval(tick, 250);
     return () => window.clearInterval(timer);
-  }, [profile?.lastChatAt]);
+  }, [profile?.lastChatAt, cooldownLimitMs]);
 
   // Keep the live conversation pinned to the newest message as updates arrive.
   useEffect(() => {
@@ -5155,8 +5166,8 @@ function ChatRoom({ drawId, profile, active = true }) {
 
         if (lastChatAt?.toMillis) {
           const elapsed = Date.now() - lastChatAt.toMillis();
-          if (elapsed < CHAT_COOLDOWN_MS) {
-            const waitSec = Math.ceil((CHAT_COOLDOWN_MS - elapsed) / 1000);
+          if (elapsed < cooldownLimitMs) {
+            const waitSec = Math.ceil((cooldownLimitMs - elapsed) / 1000);
             throw new Error(`請等待 ${waitSec} 秒後再發送訊息。`);
           }
         }
@@ -5195,6 +5206,9 @@ function ChatRoom({ drawId, profile, active = true }) {
           <h2>大廳聊天</h2>
         </div>
       </div>
+      {cooldownSeconds > CHAT_COOLDOWN_SECONDS && (
+        <p className="chat-slow-mode">慢速模式：每 {cooldownSeconds} 秒可發言一次</p>
+      )}
       <div className="chat-log" ref={chatLogRef} aria-live="polite">
         {messagesLoading ? (
           <InlineLoading label="正在載入大廳訊息..." />
@@ -7618,6 +7632,36 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
     [presence.sessions, presence.rounds, sessionStartMs, now],
   );
   const onlineKeys = Object.keys(presence.online);
+  const onlineTotal = onlineKeys.length;
+  const chatCooldown = roomChatCooldownSeconds(liveRoom);
+  const slowModeOn = chatCooldown > CHAT_COOLDOWN_SECONDS;
+  const [slowModeSaving, setSlowModeSaving] = useState(false);
+
+  async function setSlowMode(on, automatic) {
+    if (!liveRoom?.id || slowModeSaving) return;
+    setSlowModeSaving(true);
+    try {
+      await adminUpdateDoc(doc(db, "draws", liveRoom.id), {
+        chatCooldownSeconds: on ? SLOW_MODE_SECONDS : CHAT_COOLDOWN_SECONDS,
+        chatSlowModeAuto: Boolean(on && automatic),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      if (!automatic) showSafeError(error, "未能更改慢速模式。");
+      else console.error("Automatic slow mode failed.", error);
+    } finally {
+      setSlowModeSaving(false);
+    }
+  }
+
+  // Busy room: switch slow mode on at 500 online, and off again below 400 only if it
+  // was switched on automatically (a manual setting is left alone).
+  useEffect(() => {
+    if (!liveRoom?.id || slowModeSaving) return;
+    if (!slowModeOn && onlineTotal >= SLOW_MODE_ON_AT) setSlowMode(true, true);
+    else if (slowModeOn && liveRoom.chatSlowModeAuto && onlineTotal < SLOW_MODE_OFF_BELOW) setSlowMode(false, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveRoom?.id, liveRoom?.chatSlowModeAuto, slowModeOn, onlineTotal]);
   const onlineMemberIds = onlineKeys.filter((key) => !isGuestKey(key)).sort();
   const onlineMemberKey = onlineMemberIds.join("|");
   const onlineGuestCount = onlineKeys.length - onlineMemberIds.length;
@@ -7678,10 +7722,19 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
         </div>
         <h3 className="monitor-audience-title">觀眾（直播房）</h3>
         <div className="affiliate-summary monitor-kpis">
-          <div><span>目前在線（總數）</span><strong>{onlineKeys.length}</strong></div>
+          <div><span>目前在線（總數）</span><strong>{onlineTotal}</strong></div>
           <div><span>高峰在線</span><strong>{audience.peak}{audience.peakAt ? ` · ${formatClock(audience.peakAt)}` : ""}</strong></div>
           <div><span>獨立人次</span><strong>{audience.unique}</strong></div>
           <div><span>會員／訪客</span><strong>{audience.members} / {audience.guests}</strong></div>
+        </div>
+        <div className="monitor-slow-mode">
+          <p>
+            <strong>聊天慢速模式：{slowModeOn ? `已開啟（每 ${chatCooldown} 秒一則${liveRoom?.chatSlowModeAuto ? "，自動" : ""}）` : "未開啟（每 3 秒一則）"}</strong>
+            <small>在線達 {SLOW_MODE_ON_AT} 人時自動開啟，少於 {SLOW_MODE_OFF_BELOW} 人時自動關閉（需保持此頁開啟）。</small>
+          </p>
+          <button className="small-btn" type="button" disabled={!liveRoom || slowModeSaving} onClick={() => setSlowMode(!slowModeOn, false)}>
+            {slowModeSaving ? "更新中..." : slowModeOn ? "關閉慢速模式" : `開啟慢速模式（${SLOW_MODE_SECONDS} 秒）`}
+          </button>
         </div>
         <div className="monitor-online-users">
           <strong>在線會員（{onlineMemberIds.length}）</strong>
