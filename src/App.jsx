@@ -117,11 +117,11 @@ function isPhoneAccount(user) {
   return Boolean(user?.phoneNumber) && (user.providerData || []).some((item) => item.providerId === "phone");
 }
 
-function hasPhonePassword(user) {
 function hasGoogleProvider(user) {
   return (user?.providerData || []).some((item) => item.providerId === "google.com");
 }
 
+function hasPhonePassword(user) {
   return (user?.providerData || []).some((item) => item.providerId === "password");
 }
 
@@ -544,9 +544,9 @@ function App() {
   const [authInitialAction, setAuthInitialAction] = useState("");
   const [signupPromoOpen, setSignupPromoOpen] = useState(false);
   const [welcomeBonus, setWelcomeBonus] = useState(0);
-  const googleSignInPendingRef = useRef(false);
   // Google sign-ups get the gift later, after verifying a phone on the account page.
   const [phoneGiftOffer, setPhoneGiftOffer] = useState(false);
+  const googleSignInPendingRef = useRef(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("draw");
   const [usernameConflict, setUsernameConflict] = useState(false);
@@ -702,8 +702,8 @@ function App() {
           created = await ensureAffiliateAccount(accountData);
         }
         if (created?.data?.created && created.data.signupBonusTokens > 0) setWelcomeBonus(created.data.signupBonusTokens);
-        window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
         else if (created?.data?.created && !authUser.phoneNumber) setPhoneGiftOffer(true);
+        window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
         window.sessionStorage.removeItem(PENDING_REGISTRATION_KEY);
       } catch (error) {
         initializationStarted = false;
@@ -1070,7 +1070,6 @@ function App() {
           onClose={() => setWelcomeBonus(0)}
         />
       )}
-    </div>
       {phoneGiftOffer && welcomeBonus === 0 && (
         <GiftModal
           title="驗證手機號碼送 50 代幣"
@@ -1080,6 +1079,7 @@ function App() {
           onClose={() => setPhoneGiftOffer(false)}
         />
       )}
+    </div>
   );
 }
 
@@ -1930,15 +1930,14 @@ function BetaAccountSettings({ authUser, profile }) {
           <span>{displayEmail(authUser?.email) || authUser?.phoneNumber || ""}</span>
         </div>
       </div>
-      <UsernameEditForm authUser={authUser} profile={profile} />
       {profile && <PhoneGiftCard authUser={authUser} profile={profile} />}
+      <UsernameEditForm authUser={authUser} profile={profile} />
       {isPhoneAccount(authUser) && hasPhonePassword(authUser) && <ChangePhonePasswordForm authUser={authUser} />}
       <AffiliateLinkCard profile={profile} />
     </section>
   );
 }
 
-function AffiliateLinkCard({ profile, compact = false }) {
 // Members who signed up without a phone (Google) verify one by SMS to receive the
 // signup gift. The server checks Firebase Auth's verified number, once per number.
 function PhoneGiftCard({ authUser, profile }) {
@@ -2055,6 +2054,7 @@ function getPhoneGiftErrorMessage(error) {
   return getSafeErrorMessage(error, "未能領取禮物，請稍後再試。");
 }
 
+function AffiliateLinkCard({ profile, compact = false }) {
   const [copied, setCopied] = useState(false);
   const [contact, setContact] = useState(profile?.phoneNumber || displayEmail(profile?.email) || "");
   const [message, setMessage] = useState("");

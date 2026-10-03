@@ -6758,23 +6758,6 @@
   aspect-ratio: 240 / 330;
   border-radius: 4px;
   object-fit: contain;
-
-/* 數據分析 → 會員: sortable column headers. */
-.analytics-sort { display: inline-flex; align-items: center; gap: 3px; padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; white-space: nowrap; }
-.analytics-sort:hover, .analytics-sort.active { color: var(--beta-white, #fff); }
-.analytics-sort .idle { opacity: .35; }
-
-/* 帳戶設定: verify a phone to receive the signup gift (Google members). */
-.beta-mode .phone-gift-card { display: grid; gap: 14px; margin: 22px 0 6px; padding: 16px; border: 1px solid var(--beta-red); border-radius: 4px; background: #1b1418; }
-.beta-mode .phone-gift-card form { display: grid; gap: 12px; }
-.beta-mode .phone-gift-card .primary-btn { justify-self: start; }
-.beta-mode .phone-gift-heading { display: flex; gap: 12px; align-items: flex-start; }
-.beta-mode .phone-gift-heading svg, .beta-mode .phone-gift-card.done svg { flex: none; color: var(--beta-red); }
-.beta-mode .phone-gift-heading strong { display: block; font-size: 16px; color: var(--beta-white); }
-.beta-mode .phone-gift-heading small { display: block; margin-top: 4px; color: #b9b9c2; }
-.beta-mode .phone-gift-card.done { grid-template-columns: auto 1fr; align-items: center; }
-.beta-mode .phone-gift-card.done p { margin: 0; color: var(--beta-white); }
-.beta-mode .phone-gift-card.done strong { margin-right: 6px; }
   background: #0b0b0f;
 }
 
@@ -6801,3 +6784,20 @@
 }
 
 .beta-mode .batch-number-result button { min-height: 40px; font-size: 14px; }
+
+/* 數據分析 → 會員: sortable column headers. */
+.analytics-sort { display: inline-flex; align-items: center; gap: 3px; padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; white-space: nowrap; }
+.analytics-sort:hover, .analytics-sort.active { color: var(--beta-white, #fff); }
+.analytics-sort .idle { opacity: .35; }
+
+/* 帳戶設定: verify a phone to receive the signup gift (Google members). */
+.beta-mode .phone-gift-card { display: grid; gap: 14px; margin: 22px 0 6px; padding: 16px; border: 1px solid var(--beta-red); border-radius: 4px; background: #1b1418; }
+.beta-mode .phone-gift-card form { display: grid; gap: 12px; }
+.beta-mode .phone-gift-card .primary-btn { justify-self: start; }
+.beta-mode .phone-gift-heading { display: flex; gap: 12px; align-items: flex-start; }
+.beta-mode .phone-gift-heading svg, .beta-mode .phone-gift-card.done svg { flex: none; color: var(--beta-red); }
+.beta-mode .phone-gift-heading strong { display: block; font-size: 16px; color: var(--beta-white); }
+.beta-mode .phone-gift-heading small { display: block; margin-top: 4px; color: #b9b9c2; }
+.beta-mode .phone-gift-card.done { grid-template-columns: auto 1fr; align-items: center; }
+.beta-mode .phone-gift-card.done p { margin: 0; color: var(--beta-white); }
+.beta-mode .phone-gift-card.done strong { margin-right: 6px; }
