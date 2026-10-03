@@ -30,11 +30,25 @@ const userCallableOptions = {
 // Only the web admin site calls these endpoints. App Check proves the request
 // comes from that site; `assertAdmin` then verifies Firebase Authentication,
 // the server-issued `admin` custom claim and the allowlist before any access.
+// The region allows 20 vCPU for the whole project. Admin calls are few and light, so
+// each instance takes 1/6 vCPU (one request at a time, up to 5 instances); player
+// functions keep 1 vCPU. Heavy admin jobs use adminHeavyCallableOptions instead.
 const adminCallableOptions = {
   region: "asia-east2",
   enforceAppCheck: ENFORCE_APP_CHECK,
   timeoutSeconds: 60,
   memory: "256MiB",
+  cpu: "gcf_gen1",
+  concurrency: 1,
+  maxInstances: 5,
+};
+// Image conversion, monitor reports and audit analysis: full speed, one instance.
+const adminHeavyCallableOptions = {
+  ...adminCallableOptions,
+  cpu: 1,
+  concurrency: 4,
+  maxInstances: 1,
+  memory: "512MiB",
 };
 const affiliateApplicationsCallableOptions = {
   ...adminCallableOptions,
@@ -1317,7 +1331,7 @@ export const adminCancelScheduledDraw = onCall(adminCallableOptions, async (requ
   return { ok: true };
 });
 
-export const adminUploadImage = onCall({ ...adminCallableOptions, memory: "512MiB" }, async (request) => {
+export const adminUploadImage = onCall(adminHeavyCallableOptions, async (request) => {
   const actor = assertAdmin(request);
   const contentType = String(request.data?.contentType || "");
   if (!IMAGE_TYPES.has(contentType)) throw new HttpsError("invalid-argument", "只接受 JPEG、PNG 或 WebP 圖片。");
@@ -1568,7 +1582,7 @@ async function fetchAuditPage(startDate, endDate, pageToken = "") {
 
 // One-click review: scans the selected range and returns suspicious-activity findings.
 const AUDIT_ANALYSIS_MAX_ENTRIES = 50000;
-export const adminAuditAnalyze = onCall({ ...adminCallableOptions, timeoutSeconds: 300, memory: "512MiB" }, async (request) => {
+export const adminAuditAnalyze = onCall({ ...adminHeavyCallableOptions, timeoutSeconds: 300 }, async (request) => {
   const actor = assertAdmin(request);
   const { startDate, endDate } = auditRange(request);
   const entries = [];
@@ -1732,7 +1746,7 @@ export const adminLiveHealth = onCall({ ...adminCallableOptions, timeoutSeconds:
 });
 
 // Start / stop a monitored live session. Stopping builds and stores the session report.
-export const adminMonitorSession = onCall({ ...adminCallableOptions, timeoutSeconds: 300, memory: "512MiB" }, async (request) => {
+export const adminMonitorSession = onCall({ ...adminHeavyCallableOptions, timeoutSeconds: 300 }, async (request) => {
   const actor = assertAdmin(request);
   const action = request.data?.action;
   const sessions = db.collection("monitorSessions");
