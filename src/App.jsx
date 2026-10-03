@@ -5724,6 +5724,14 @@ function TokenRequest({ profile }) {
           <div className="form-field">
             <span>選擇入金金額</span>
             <div className="token-package-grid">
+              <button
+                className={usingCustomAmount ? "token-package selected" : "token-package"}
+                type="button"
+                onClick={() => setSelectedPackage("custom")}
+              >
+                <strong>自訂金額</strong>
+                <span>HK$100 起</span>
+              </button>
               {tokenPackages.map((item) => (
                 <button
                   className={selectedPackage === item.hkd ? "token-package selected" : "token-package"}
@@ -5738,14 +5746,6 @@ function TokenRequest({ profile }) {
                   </span>
                 </button>
               ))}
-              <button
-                className={usingCustomAmount ? "token-package selected" : "token-package"}
-                type="button"
-                onClick={() => setSelectedPackage("custom")}
-              >
-                <strong>自訂金額</strong>
-                <span>HK$100 起</span>
-              </button>
             </div>
           </div>
           {usingCustomAmount && (
