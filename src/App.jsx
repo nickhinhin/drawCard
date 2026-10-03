@@ -1042,11 +1042,11 @@ function App() {
       {signupPromoOpen && !signedIn && !authDialogOpen && (
         <GiftModal
           title="新會員送 50 代幣"
-          body="首次註冊即送 50 代幣，可立即用於直播抽卡。"
+          body="以手機號碼註冊並完成短訊驗證，即送 50 代幣，可立即用於直播抽卡。每個手機號碼只可領取一次。"
           actionLabel="立即註冊"
           onAction={() => {
             setSignupPromoOpen(false);
-            setAuthNotice("註冊成功即送 50 代幣。");
+            setAuthNotice("以手機號碼註冊並完成短訊驗證，即送 50 代幣。");
             setAuthInitialAction("register");
             setAuthDialogOpen(true);
           }}
@@ -1581,7 +1581,7 @@ function AuthDialog({ authError, isBeta = false, notice = "", initialAction = ""
             <div className="auth-method-grid">
               <button className="auth-choice-card primary" type="button" onClick={() => setAuthMethod("phone")}>
                 <Smartphone size={24} />
-                <span><strong>手機號碼</strong><small>{isRegistration ? "使用 SMS 驗證碼註冊" : "手機號碼 + 密碼"}</small></span>
+                <span><strong>手機號碼</strong><small>{isRegistration ? "使用 SMS 驗證碼註冊，送 50 代幣" : "手機號碼 + 密碼"}</small></span>
               </button>
               <button className="auth-choice-card" type="button" onClick={continueWithGoogle} disabled={signingIn}>
                 <LogIn size={24} />

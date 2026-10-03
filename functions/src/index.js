@@ -270,6 +270,11 @@ function adminDocument(collectionName, documentId) {
   return db.collection(collectionName).doc(assertIdentifier(documentId, "文件 ID"));
 }
 
+// One signup gift per verified phone number; the number itself is not stored.
+export function signupBonusClaimId(phoneNumber) {
+  return createHash("sha256").update(`signup-bonus:${phoneNumber}`).digest("hex");
+}
+
 export const ensureAffiliateAccount = onCall(userCallableOptions, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "請先登入會員帳戶。");
   // Passwords exist only as a second factor-free login for verified phone accounts;
@@ -321,12 +326,20 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
       referrerUid = "";
     }
 
+    // The signup gift needs a phone number verified by SMS (Firebase Auth's own
+    // phone_number claim, not the client-sent field) and is given once per number,
+    // so deleting the account or using more Google accounts does not earn it again.
+    const verifiedPhone = String(request.auth.token.phone_number || "");
+    const bonusClaimRef = verifiedPhone ? db.collection("signupBonusClaims").doc(signupBonusClaimId(verifiedPhone)) : null;
+    const bonusAlreadyClaimed = bonusClaimRef ? (await transaction.get(bonusClaimRef)).exists : true;
+    const signupBonusTokens = bonusAlreadyClaimed ? 0 : SIGNUP_BONUS_TOKENS;
+
     const email = String(request.auth.token.email || "").slice(0, 320);
     const photoURL = String(request.auth.token.picture || "").slice(0, 500);
     transaction.create(userRef, {
-      // New members start with a one-off signup gift (users cannot create their own profile).
-      uid, email, displayName, photoURL, phoneNumber, username: "", tokens: SIGNUP_BONUS_TOKENS, role: "user",
-      signupBonusTokens: SIGNUP_BONUS_TOKENS, signupBonusAt: FieldValue.serverTimestamp(),
+      // Users cannot create their own profile; the gift (if any) is added here.
+      uid, email, displayName, photoURL, phoneNumber, username: "", tokens: signupBonusTokens, role: "user",
+      ...(signupBonusTokens ? { signupBonusTokens, signupBonusAt: FieldValue.serverTimestamp() } : {}),
       affiliateStatus: "none",
       referredByUid: referrerUid,
       referredByCode: referrerUid ? requestedReferralCode : "",
@@ -334,6 +347,9 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
       ...(ageConfirmed ? { ageConfirmed: true, ageConfirmedAt: FieldValue.serverTimestamp() } : {}),
       createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp(),
     });
+    if (signupBonusTokens) {
+      transaction.create(bonusClaimRef, { uid, tokens: signupBonusTokens, createdAt: FieldValue.serverTimestamp() });
+    }
     if (referrerUid) {
       const referrerRef = db.collection("users").doc(referrerUid);
       transaction.update(referrerRef, {
@@ -345,7 +361,7 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
         createdAt: FieldValue.serverTimestamp(),
       });
     }
-    return { affiliateCode: "", affiliateStatus: "none", referredByUid: referrerUid, created: true, signupBonusTokens: SIGNUP_BONUS_TOKENS };
+    return { affiliateCode: "", affiliateStatus: "none", referredByUid: referrerUid, created: true, signupBonusTokens };
   });
   return { ok: true, ...result };
 });
