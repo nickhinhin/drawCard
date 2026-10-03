@@ -8019,6 +8019,10 @@ function AdminAnalytics() {
   const [summary, setSummary] = useState(null);
   const [summaryError, setSummaryError] = useState("");
   const [rows, setRows] = useState([]);
+  const [cursor, setCursor] = useState("");
+  const [rowsError, setRowsError] = useState("");
+  const [loadingRows, setLoadingRows] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [userSort, setUserSort] = useState({ field: "createdAt", direction: "desc" });
   const sortParams = view === "users" ? { sort: userSort.field, direction: userSort.direction } : {};
 
@@ -8028,10 +8032,6 @@ function AdminAnalytics() {
       direction: current.field === field && current.direction === "desc" ? "asc" : "desc",
     }));
   }
-  const [cursor, setCursor] = useState("");
-  const [rowsError, setRowsError] = useState("");
-  const [loadingRows, setLoadingRows] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
