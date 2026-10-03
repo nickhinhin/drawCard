@@ -209,42 +209,31 @@ export function buildMonitorReport({ startMs, endMs, records = [], requests = []
   };
 }
 
-// Audience of a live session from liveVisitors docs (one per room + anonymous browser).
-// Each doc lists the 5-second beat indexes (ms / 5000) and the live rounds it was seen in.
-export const AUDIENCE_BEAT_MS = 5 * 1000;
-const AUDIENCE_TIMELINE_MAX = 4320; // 6 hours of 5-second points
+// Audience figures for a monitor report. The admin page computes them from Realtime
+// Database presence (src/liveAudience.js) and sends them with "stop"; only bounded,
+// well-formed values are stored.
+const AUDIENCE_TIMELINE_MAX = 720; // 6 hours of 30-second points
+const count = (value) => (Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000 ? value : 0);
+const isoOrNull = (value) => (typeof value === "string" && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : null);
 
-export function summarizeAudience(visitors, startBeat, endBeat) {
-  const perBeat = new Map();
-  const rounds = new Map();
-  let unique = 0;
-  let members = 0;
-  for (const visitor of visitors) {
-    const beats = (visitor.beats || []).map(Number).filter((beat) => beat >= startBeat && beat <= endBeat);
-    if (!beats.length) continue;
-    unique += 1;
-    if (visitor.uid) members += 1;
-    for (const beat of new Set(beats)) perBeat.set(beat, (perBeat.get(beat) || 0) + 1);
-    for (const round of new Set(visitor.rounds || [])) rounds.set(round, (rounds.get(round) || 0) + 1);
-  }
-  let peak = 0;
-  let peakBeat = null;
-  for (const [beat, count] of perBeat) {
-    if (count > peak || (count === peak && beat < peakBeat)) { peak = count; peakBeat = beat; }
-  }
-  // Every 5-second point from start to end (zeros included) for the traffic chart.
-  const timeline = [];
-  for (let beat = startBeat; beat <= endBeat && timeline.length < AUDIENCE_TIMELINE_MAX; beat += 1) {
-    timeline.push({ at: new Date(beat * AUDIENCE_BEAT_MS).toISOString(), count: perBeat.get(beat) || 0 });
-  }
+export function sanitizeAudience(input) {
+  if (!input || typeof input !== "object") return null;
+  const timeline = (Array.isArray(input.timeline) ? input.timeline : []).slice(0, AUDIENCE_TIMELINE_MAX)
+    .map((point) => ({ at: isoOrNull(point?.at), count: count(point?.count) }))
+    .filter((point) => point.at);
+  const byRound = (Array.isArray(input.byRound) ? input.byRound : []).slice(0, 200)
+    .filter((item) => /^round-\d{3}$/.test(String(item?.round)))
+    .map((item) => ({ round: item.round, unique: count(item.unique) }));
+  const unique = count(input.unique);
+  const members = Math.min(count(input.members), unique);
   return {
     unique,
     members,
     guests: unique - members,
-    peak,
-    peakAt: peakBeat === null ? null : new Date(peakBeat * AUDIENCE_BEAT_MS).toISOString(),
-    byRound: [...rounds.entries()].map(([round, count]) => ({ round, unique: count }))
-      .sort((left, right) => left.round.localeCompare(right.round)),
+    peak: count(input.peak),
+    peakAt: isoOrNull(input.peakAt),
+    byRound,
     timeline,
+    stepSeconds: 30,
   };
 }

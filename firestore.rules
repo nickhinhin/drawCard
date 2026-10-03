@@ -568,25 +568,6 @@ service cloud.firestore {
         && request.resource.data.updatedAt == request.time;
     }
 
-    function isValidLiveVisit(visitId) {
-      let visit = request.resource.data;
-      let nowBeat = request.time.toMillis() / 5000;
-      let earlier = resource == null ? [] : resource.data.beats;
-      let earlierRounds = resource == null ? [] : resource.data.rounds;
-      return visit.keys().hasOnly(["drawId", "visitorId", "uid", "lastBeat", "beats", "rounds", "lastSeenAt"])
-        && visit.drawId is string && visit.drawId.size() > 0 && visit.drawId.size() <= 128
-        && visit.visitorId is string && visit.visitorId.matches("^[A-Za-z0-9]{16,40}$")
-        && visitId == visit.drawId + "_" + visit.visitorId
-        && (resource == null || (resource.data.drawId == visit.drawId && resource.data.visitorId == visit.visitorId))
-        && drawDoc(visit.drawId).data.status == "live"
-        && (visit.uid == "" || (signedIn() && visit.uid == request.auth.uid))
-        && visit.lastSeenAt == request.time
-        && visit.lastBeat is int && visit.lastBeat >= nowBeat - 24 && visit.lastBeat <= nowBeat + 12
-        && visit.beats is list && visit.beats.size() <= 4320
-        && visit.beats.toSet().difference(earlier.toSet()).hasOnly([visit.lastBeat])
-        && visit.rounds is list && visit.rounds.size() <= 60
-        && visit.rounds.toSet().difference(earlierRounds.toSet()).size() <= 1;
-    }
 
     function isValidRoomMessage(drawId, messageId) {
       return signedIn()
@@ -941,10 +922,11 @@ service cloud.firestore {
 
     // Anonymous live audience: one doc per room + browser, touched every 5 seconds while a
     // live room is open. Only admins read it; writes are limited to the current 5 s beat (±2 min).
+    // Old 5-second audience heartbeats. Replaced on 4/10/2026 by presence in the Realtime
+    // Database (database.rules.json); existing docs stay readable by admins only.
     match /liveVisitors/{visitId} {
       allow read: if isAdmin();
-      allow create, update: if isValidLiveVisit(visitId);
-      allow delete: if false;
+      allow write: if false;
     }
 
     // Contact-form messages: written only by submitSupportMessage, read by admins.

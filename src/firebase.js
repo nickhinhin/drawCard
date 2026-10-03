@@ -166,3 +166,17 @@ export const analyticsPromise = new Promise((resolve) => {
     }
   }, 8000);
 });
+
+// Realtime Database (Singapore) holds live-room presence: who is in a room now,
+// each visit's enter / leave time and which rounds each member saw. It is loaded
+// only when a live room or the live monitor needs it, so other pages stay light.
+const DATABASE_URL = "https://livedraw-7e3c2-default-rtdb.asia-southeast1.firebasedatabase.app";
+let realtimeDbPromise = null;
+export function getRealtimeDb() {
+  realtimeDbPromise ||= import("firebase/database").then((module) => {
+    const database = module.getDatabase(app, DATABASE_URL);
+    if (useEmulators) module.connectDatabaseEmulator(database, "127.0.0.1", 9000);
+    return { database, ...module };
+  });
+  return realtimeDbPromise;
+}

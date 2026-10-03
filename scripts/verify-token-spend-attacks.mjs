@@ -173,7 +173,7 @@ try {
   results.push(`FAIL  one normal chat message: ${error.code || error.message}`);
 }
 
-// Live audience: a browser may mark itself for the current minute only; nobody but admins reads it.
+// Old live audience collection: nobody may write it any more and only admins read it.
 {
   const visitorId = "abcdef0123456789abcd";
   const visitRef = doc(db, "liveVisitors", `${drawId}_${visitorId}`);
@@ -190,7 +190,8 @@ try {
       results.push(`${expectAllowed ? `FAIL  ${label}: ${error.code || error.message}` : `PASS  ${label}: rejected`}`);
     }
   };
-  await attempt("live audience heartbeat", () => setDoc(visitRef, visit(), { merge: true }), true);
+  // Replaced by Realtime Database presence (4/10/2026): Firestore heartbeats are now refused.
+  await attempt("old Firestore audience heartbeat", () => setDoc(visitRef, visit(), { merge: true }), false);
   await attempt("audience heartbeat for a fake time (inflate peak)", () => setDoc(visitRef, visit({ lastBeat: beat + 720, beats: arrayUnion(beat + 720) }), { merge: true }), false);
   await attempt("audience heartbeat with many beats at once", () => setDoc(visitRef, visit({ beats: arrayUnion(beat - 5, beat - 4, beat - 3) }), { merge: true }), false);
   await attempt("audience heartbeat claiming another user's uid", () => setDoc(visitRef, visit({ uid: "someone-else" }), { merge: true }), false);

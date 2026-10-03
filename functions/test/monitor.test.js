@@ -120,17 +120,20 @@ test("monitor report summarises sales, token requests and wait times", async () 
   assert.equal(report.shippingRequests, 2);
 });
 
-test("audience summary counts unique visitors, members, peak, rounds and a 5s timeline", async () => {
-  const { summarizeAudience } = await import("../src/monitor.js");
-  const b = 358_000_000;
-  const summary = summarizeAudience([
-    { uid: "u1", beats: [b, b + 1, b + 2], rounds: ["round-001", "round-002"] },
-    { uid: "", beats: [b + 1, b + 2], rounds: ["round-001"] },
-    { uid: "u2", beats: [b + 2], rounds: ["round-002"] },
-    { uid: "", beats: [b - 30], rounds: ["round-001"] }, // before the session: ignored
-  ], b, b + 3);
-  assert.deepEqual([summary.unique, summary.members, summary.guests, summary.peak], [3, 2, 1, 3]);
-  assert.equal(summary.peakAt, new Date((b + 2) * 5000).toISOString());
-  assert.deepEqual(summary.byRound, [{ round: "round-001", unique: 2 }, { round: "round-002", unique: 2 }]);
-  assert.deepEqual(summary.timeline.map((point) => point.count), [1, 2, 3, 0]);
+test("audience sent by the admin page is bounded and cleaned before it is stored", async () => {
+  const { sanitizeAudience } = await import("../src/monitor.js");
+  const clean = sanitizeAudience({
+    unique: 12, members: 99, peak: 7, peakAt: "2026-10-03T12:31:00.000Z",
+    byRound: [{ round: "round-001", unique: 5 }, { round: "<script>", unique: 1 }, { round: "round-002", unique: -3 }],
+    timeline: [{ at: "2026-10-03T12:30:00Z", count: 4 }, { at: "not a date", count: 1 }, { at: "2026-10-03T12:30:30Z", count: 1.5 }],
+    extra: "dropped",
+  });
+  assert.deepEqual(clean, {
+    unique: 12, members: 12, guests: 0, peak: 7, peakAt: "2026-10-03T12:31:00.000Z",
+    byRound: [{ round: "round-001", unique: 5 }, { round: "round-002", unique: 0 }],
+    timeline: [{ at: "2026-10-03T12:30:00.000Z", count: 4 }, { at: "2026-10-03T12:30:30.000Z", count: 0 }],
+    stepSeconds: 30,
+  });
+  assert.equal(sanitizeAudience(null), null);
+  assert.equal(sanitizeAudience({ timeline: Array.from({ length: 5000 }, () => ({ at: "2026-10-03T12:30:00Z", count: 1 })) }).timeline.length, 720);
 });

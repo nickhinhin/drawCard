@@ -72,7 +72,6 @@ import {
 import {
   FieldValue,
   Timestamp,
-  arrayUnion,
   collection,
   collectionGroup,
   doc,
@@ -86,7 +85,6 @@ import {
   query,
   runTransaction,
   serverTimestamp,
-  setDoc,
   where,
   writeBatch,
 } from "firebase/firestore";
@@ -94,7 +92,8 @@ import { httpsCallable } from "firebase/functions";
 import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
 import { reportClientError } from "./errorReporting.js";
 import { getToken as getAppCheckToken } from "firebase/app-check";
-import { appCheck, auth, db, functions, googleProvider } from "./firebase";
+import { appCheck, auth, db, functions, getRealtimeDb, googleProvider } from "./firebase";
+import { isGuestKey, summarizeLiveSessions } from "./liveAudience.js";
 import PurchaseOverlayExporter from "./PurchaseOverlayExporter.jsx";
 
 const PENDING_AFFILIATE_CODE_KEY = "livedraw-pending-affiliate-code";
@@ -2604,7 +2603,7 @@ function DrawCard({ profile }) {
   }, [isBeta, roomSlug, rooms]);
   const selectedRoomId = selectedRoom?.id || "";
   // Counts this browser in the live room's audience (獨立人次 / 高峰) while the page is visible.
-  useLiveAudienceHeartbeat(selectedRoom, profile?.uid, pageVisible);
+  useLivePresence(selectedRoom, profile?.uid, pageVisible);
   const currentBetaLive = isBeta
     ? rooms.find((room) => room.status === "live") || rooms.find((room) => room.status === "draft") || null
     : null;
@@ -4946,74 +4945,72 @@ function getVisitorId() {
   }
 }
 
-// While a live room is open and visible, mark this browser as watching every 5 seconds.
-const AUDIENCE_BEAT_MS = 5 * 1000;
-function useLiveAudienceHeartbeat(room, uid, visible) {
+// While a live room is open and visible, this browser is listed in the Realtime Database
+// under online/{room}. Each visit is written once with its enter time; when the browser
+// disconnects the server itself removes the entry and stores the leave time, so there are
+// no repeated heartbeat writes. Members are also marked once per round they watch.
+const markedRounds = new Set();
+function useLivePresence(room, uid, visible) {
   const roomId = room?.status === "live" ? room.id : "";
   const liveRound = room?.status === "live" ? toRoundId(getRoomCurrentRound(room)) : "";
   useEffect(() => {
     const visitorId = getVisitorId();
-    if (!roomId || !visible || !visitorId) return undefined;
-    function beat() {
-      const beatIndex = Math.floor(Date.now() / AUDIENCE_BEAT_MS);
-      setDoc(doc(db, "liveVisitors", `${roomId}_${visitorId}`), {
-        drawId: roomId,
-        visitorId,
-        uid: uid || "",
-        lastBeat: beatIndex,
-        beats: arrayUnion(beatIndex),
-        rounds: liveRound ? arrayUnion(liveRound) : arrayUnion(),
-        lastSeenAt: serverTimestamp(),
-      }, { merge: true }).catch(() => {});
-    }
-    beat();
-    const timer = window.setInterval(beat, AUDIENCE_BEAT_MS);
-    return () => window.clearInterval(timer);
+    const key = uid || (/^[0-9a-f]{24}$/.test(visitorId) ? `g_${visitorId}` : "");
+    if (!roomId || !visible || !key) return undefined;
+    let stopped = false;
+    let cleanup = () => {};
+    getRealtimeDb().then(({ database, ref, push, set, update, remove, onValue, onDisconnect, serverTimestamp: rtdbNow }) => {
+      if (stopped) return;
+      const onlineRef = ref(database, `online/${roomId}/${key}`);
+      let sessionRef = null;
+      // Runs on the first connection and again after every reconnect.
+      const stopListening = onValue(ref(database, ".info/connected"), async (snapshot) => {
+        if (snapshot.val() !== true || stopped) return;
+        try {
+          sessionRef = push(ref(database, `sessions/${roomId}/${key}`));
+          await set(sessionRef, { in: rtdbNow() });
+          await onDisconnect(sessionRef).update({ out: rtdbNow() });
+          await onDisconnect(onlineRef).remove();
+          await set(onlineRef, { m: Boolean(uid), at: rtdbNow() });
+        } catch {
+          // Presence only feeds the admin audience figures; never disturb the player.
+        }
+      });
+      cleanup = () => {
+        stopListening();
+        onDisconnect(onlineRef).cancel().catch(() => {});
+        remove(onlineRef).catch(() => {});
+        if (sessionRef) {
+          onDisconnect(sessionRef).cancel().catch(() => {});
+          update(sessionRef, { out: rtdbNow() }).catch(() => {});
+        }
+      };
+    }).catch(() => {});
+    return () => {
+      stopped = true;
+      cleanup();
+    };
+  }, [roomId, uid, visible]);
+
+  useEffect(() => {
+    const roundKey = `${roomId}/${liveRound}/${uid}`;
+    if (!roomId || !liveRound || !uid || !visible || markedRounds.has(roundKey)) return;
+    markedRounds.add(roundKey);
+    getRealtimeDb()
+      .then(({ database, ref, set }) => set(ref(database, `rounds/${roundKey}`), true))
+      .catch(() => markedRounds.delete(roundKey));
   }, [roomId, liveRound, uid, visible]);
 }
 
-// Same maths as summarizeAudience in functions/src/monitor.js (live dashboard view).
-function summarizeLiveAudience(visitors, startBeat, nowBeat) {
-  const perBeat = new Map();
-  const rounds = new Map();
-  let unique = 0;
-  let members = 0;
-  let online = 0;
-  const onlineVisitors = [];
-  for (const visitor of visitors) {
-    const beats = (visitor.beats || []).map(Number).filter((beat) => beat >= startBeat);
-    if (!beats.length) continue;
-    unique += 1;
-    if (visitor.uid) members += 1;
-    // Seen within the last ~10–15 seconds (allows one late heartbeat).
-    if (Number(visitor.lastBeat) >= nowBeat - 2) {
-      online += 1;
-      onlineVisitors.push(visitor);
-    }
-    for (const beat of new Set(beats)) perBeat.set(beat, (perBeat.get(beat) || 0) + 1);
-    for (const round of new Set(visitor.rounds || [])) rounds.set(round, (rounds.get(round) || 0) + 1);
-  }
-  let peak = 0;
-  let peakBeat = null;
-  for (const [beat, count] of perBeat) {
-    if (count > peak || (count === peak && beat < peakBeat)) { peak = count; peakBeat = beat; }
-  }
-  const timeline = [];
-  // Last 10 minutes, one point per 5 s.
-  for (let beat = Math.max(startBeat, nowBeat - 119); beat <= nowBeat; beat += 1) {
-    timeline.push({ at: new Date(beat * AUDIENCE_BEAT_MS), count: perBeat.get(beat) || 0 });
-  }
-  return {
-    unique, members, guests: unique - members, online, onlineVisitors, peak,
-    peakAt: peakBeat === null ? null : new Date(peakBeat * AUDIENCE_BEAT_MS),
-    byRound: [...rounds.entries()].map(([round, count]) => ({ round, unique: count })).sort((a, b) => a.round.localeCompare(b.round)),
-    timeline,
-  };
+// Reports since 4/10/2026 (30-second presence data) count members once per round;
+// older reports counted every browser, including guests.
+function roundAudienceLabel(audience) {
+  return audience?.stepSeconds === 30 ? "每場獨立會員" : "每場獨立人次";
 }
 
-// Bar chart of people online per 5-second beat. Long timelines are merged into at most
-// `maxBars` bars, each showing the highest count in its span.
-function AudienceTimeline({ points, title, maxBars = 240 }) {
+// Bar chart of people online at each point (every 30 s; reports before 4/10/2026 used
+// 5 s). Long timelines are merged into at most `maxBars` bars, each showing the highest count.
+function AudienceTimeline({ points, title, stepSeconds = 5, maxBars = 240 }) {
   if (!points?.length) return null;
   const size = Math.ceil(points.length / maxBars);
   const bars = size <= 1 ? points : Array.from({ length: Math.ceil(points.length / size) }, (_item, index) => {
@@ -5023,7 +5020,7 @@ function AudienceTimeline({ points, title, maxBars = 240 }) {
   const max = Math.max(1, ...bars.map((point) => point.count));
   const first = points[0];
   const last = points[points.length - 1];
-  const spanLabel = size <= 1 ? "每 5 秒" : `每 ${size * 5} 秒取最高`;
+  const spanLabel = size <= 1 ? `每 ${stepSeconds} 秒` : `每 ${size * stepSeconds} 秒取最高`;
   return (
     <div className="audience-timeline">
       <div className="audience-timeline-head">
@@ -7508,11 +7505,11 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const [health, setHealth] = useState(null);
   const [healthError, setHealthError] = useState("");
   const [now, setNow] = useState(Date.now());
-  const [liveVisitors, setLiveVisitors] = useState([]);
+  const [presence, setPresence] = useState({ online: {}, sessions: {}, rounds: {} });
   const [onlineUsernames, setOnlineUsernames] = useState({});
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), AUDIENCE_BEAT_MS);
+    const timer = window.setInterval(() => setNow(Date.now()), 5 * 1000);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -7523,16 +7520,26 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   ), []);
 
   const currentRoundId = liveRoom ? toRoundId(getRoomCurrentRound(liveRoom)) : "";
+  // Who is in the room now, every visit's enter / leave time and members per round.
   useEffect(() => {
-    if (!liveRoom?.id) {
-      setLiveVisitors([]);
-      return undefined;
-    }
-    return onSnapshot(
-      query(collection(db, "liveVisitors"), where("drawId", "==", liveRoom.id)),
-      (snapshot) => setLiveVisitors(snapshot.docs.map((item) => item.data())),
-      (error) => console.error("Monitor audience listener failed.", error),
-    );
+    setPresence({ online: {}, sessions: {}, rounds: {} });
+    if (!liveRoom?.id) return undefined;
+    let stopped = false;
+    const stops = [];
+    getRealtimeDb().then(({ database, ref, onValue }) => {
+      if (stopped) return;
+      for (const part of ["online", "sessions", "rounds"]) {
+        stops.push(onValue(
+          ref(database, `${part}/${liveRoom.id}`),
+          (snapshot) => setPresence((current) => ({ ...current, [part]: snapshot.val() || {} })),
+          (error) => console.error(`Monitor ${part} listener failed.`, error),
+        ));
+      }
+    }).catch((error) => console.error("Monitor presence listener failed.", error));
+    return () => {
+      stopped = true;
+      stops.forEach((stop) => stop());
+    };
   }, [liveRoom?.id]);
 
   useEffect(() => {
@@ -7605,11 +7612,15 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const oldestPendingWait = pendingRequests.length ? now - oldestPending : 0;
   const buyingStopped = Boolean(liveRoom && isRoundBuyingBlocked(liveRoom, currentRoundId));
 
-  const audience = summarizeLiveAudience(liveVisitors, Math.floor(sessionStartMs / AUDIENCE_BEAT_MS), Math.floor(now / AUDIENCE_BEAT_MS));
-  const onlineVisitors = audience.onlineVisitors;
-  const onlineMemberIds = [...new Set(onlineVisitors.map((visitor) => visitor.uid).filter(Boolean))].sort();
+  // Recomputed every 5 s (the `now` tick); the chart has one point per 30 s.
+  const audience = useMemo(
+    () => summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Math.max(now, sessionStartMs)),
+    [presence.sessions, presence.rounds, sessionStartMs, now],
+  );
+  const onlineKeys = Object.keys(presence.online);
+  const onlineMemberIds = onlineKeys.filter((key) => !isGuestKey(key)).sort();
   const onlineMemberKey = onlineMemberIds.join("|");
-  const onlineGuestCount = onlineVisitors.filter((visitor) => !visitor.uid).length;
+  const onlineGuestCount = onlineKeys.length - onlineMemberIds.length;
 
   // Watch only the profiles currently in the room so username changes appear immediately.
   useEffect(() => {
@@ -7644,7 +7655,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
               {" · "}已監察 {formatAgo(now - sessionStartMs)}（由 {formatClock(new Date(sessionStartMs))} 開始）
             </p>
           </div>
-          <button className="primary-btn monitor-stop" type="button" disabled={stopping} onClick={onStop}>
+          <button className="primary-btn monitor-stop" type="button" disabled={stopping} onClick={() => onStop(summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Date.now()))}>
             {stopping ? "正在產生報告..." : "停止監察並產生報告"}
           </button>
         </div>
@@ -7667,7 +7678,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
         </div>
         <h3 className="monitor-audience-title">觀眾（直播房）</h3>
         <div className="affiliate-summary monitor-kpis">
-          <div><span>目前在線</span><strong>{audience.online}</strong></div>
+          <div><span>目前在線（總數）</span><strong>{onlineKeys.length}</strong></div>
           <div><span>高峰在線</span><strong>{audience.peak}{audience.peakAt ? ` · ${formatClock(audience.peakAt)}` : ""}</strong></div>
           <div><span>獨立人次</span><strong>{audience.unique}</strong></div>
           <div><span>會員／訪客</span><strong>{audience.members} / {audience.guests}</strong></div>
@@ -7683,10 +7694,10 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
           ) : <p className="muted">目前沒有會員在線。</p>}
           {onlineGuestCount > 0 && <p className="muted">另有 {onlineGuestCount} 位未登入訪客在線。</p>}
         </div>
-        <AudienceTimeline points={audience.timeline} title="人流走勢（最近 10 分鐘）" />
+        <AudienceTimeline points={audience.timeline} stepSeconds={audience.stepSeconds} title="人流走勢（監察期間）" />
         {audience.byRound.length > 0 && (
           <p className="muted monitor-audience-rounds">
-            每場獨立人次：{audience.byRound.map((item) => `${formatRoundLabel(item.round)} ${item.unique} 人`).join("　")}
+            每場獨立會員：{audience.byRound.map((item) => `${formatRoundLabel(item.round)} ${item.unique} 人`).join("　")}
           </p>
         )}
       </section>
@@ -7752,7 +7763,7 @@ function downloadMonitorReport(session) {
     add("觀眾", "獨立人次", report.audience.unique);
     add("觀眾", "會員／訪客", `${report.audience.members} / ${report.audience.guests}`);
     add("觀眾", "高峰在線", `${report.audience.peak}${report.audience.peakAt ? `（${formatClock(report.audience.peakAt)}）` : ""}`);
-    (report.audience.byRound || []).forEach((item) => add("每場獨立人次", formatRoundLabel(item.round), item.unique));
+    (report.audience.byRound || []).forEach((item) => add(roundAudienceLabel(report.audience), formatRoundLabel(item.round), item.unique));
     (report.audience.timeline || []).forEach((point) => add("人流（每 5 秒）", formatClock(point.at), point.count));
   }
   add("銷售", "購買次數", report.sales?.purchases);
@@ -7806,9 +7817,9 @@ function MonitorReportView({ session, onClose }) {
           <div><span>會員／訪客</span><strong>{report.audience.members} / {report.audience.guests}</strong></div>
         </>}
       </div>
-      {report.audience?.timeline?.length > 0 && <AudienceTimeline points={report.audience.timeline} title="人流走勢（整場）" />}
+      {report.audience?.timeline?.length > 0 && <AudienceTimeline points={report.audience.timeline} stepSeconds={report.audience.stepSeconds || 5} title="人流走勢（整場）" />}
       {report.audience?.byRound?.length > 0 && (
-        <p className="muted">每場獨立人次：{report.audience.byRound.map((item) => `${formatRoundLabel(item.round)} ${item.unique} 人`).join("　")}</p>
+        <p className="muted">{roundAudienceLabel(report.audience)}：{report.audience.byRound.map((item) => `${formatRoundLabel(item.round)} ${item.unique} 人`).join("　")}</p>
       )}
       <div className="monitor-columns">
         <div>
@@ -7886,11 +7897,11 @@ function LiveMonitor() {
     }
   }
 
-  async function stopMonitor() {
+  async function stopMonitor(audience) {
     if (!window.confirm("確認停止監察並產生報告？")) return;
     setBusy(true);
     try {
-      const { data } = await httpsCallable(functions, "adminMonitorSession")({ action: "stop", sessionId: activeSession.id });
+      const { data } = await httpsCallable(functions, "adminMonitorSession")({ action: "stop", sessionId: activeSession.id, audience });
       setViewingId(data.sessionId);
     } catch (error) {
       showSafeError(error, "未能停止監察，請再試一次。");

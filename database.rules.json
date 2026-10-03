@@ -1,0 +1,43 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "online": {
+      "$drawId": {
+        ".read": "auth != null && auth.token.admin === true",
+        "$key": {
+          ".write": "$drawId.matches(/^[A-Za-z0-9_-]{1,64}$/) && ((auth != null && $key === auth.uid) || $key.matches(/^g_[0-9a-f]{24}$/))",
+          ".validate": "newData.hasChildren(['m', 'at'])",
+          "m": { ".validate": "newData.val() === (auth != null && $key === auth.uid)" },
+          "at": { ".validate": "newData.val() === now" },
+          "$other": { ".validate": false }
+        }
+      }
+    },
+    "sessions": {
+      "$drawId": {
+        ".read": "auth != null && auth.token.admin === true",
+        "$key": {
+          "$sessionId": {
+            ".write": "$drawId.matches(/^[A-Za-z0-9_-]{1,64}$/) && $sessionId.length <= 32 && ((auth != null && $key === auth.uid) || $key.matches(/^g_[0-9a-f]{24}$/))",
+            ".validate": "newData.hasChild('in') && (data.exists() ? newData.child('in').val() === data.child('in').val() : (newData.child('in').val() === now && !newData.hasChild('out')))",
+            "in": { ".validate": "newData.isNumber()" },
+            "out": { ".validate": "!data.exists() && newData.isNumber() && newData.val() >= newData.parent().child('in').val() && newData.val() <= now + 1000" },
+            "$other": { ".validate": false }
+          }
+        }
+      }
+    },
+    "rounds": {
+      "$drawId": {
+        ".read": "auth != null && auth.token.admin === true",
+        "$roundId": {
+          "$uid": {
+            ".write": "auth != null && $uid === auth.uid && $drawId.matches(/^[A-Za-z0-9_-]{1,64}$/) && $roundId.matches(/^round-[0-9]{3}$/)",
+            ".validate": "newData.val() === true"
+          }
+        }
+      }
+    }
+  }
+}
