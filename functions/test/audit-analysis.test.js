@@ -82,3 +82,14 @@ test("signup gift: normal new account is fine, extra starting tokens are flagged
     entry({ collection: "users", path: "users/n2", operation: "create", changes: { tokens: { before: null, after: 5000 } } }),
   ]).includes("signup-tokens"));
 });
+
+test("a later signup gift is not unexplained, but a larger gain with it still is", () => {
+  const gift = rulesOf([entry({ collection: "users", path: "users/g1", changes: {
+    tokens: { before: 0, after: 50 }, signupBonusTokens: { before: null, after: 50 }, signupBonusAt: { before: null, after: "2026-10-03T13:00:00Z" },
+  } })]);
+  assert.ok(!gift.includes("unexplained-tokens"));
+  const tooMuch = rulesOf([entry({ collection: "users", path: "users/g2", changes: {
+    tokens: { before: 0, after: 5000 }, signupBonusAt: { before: null, after: "2026-10-03T13:00:00Z" },
+  } })]);
+  assert.ok(tooMuch.includes("unexplained-tokens"));
+});

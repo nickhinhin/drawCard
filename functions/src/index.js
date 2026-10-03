@@ -52,6 +52,8 @@ const tokenProofCallableOptions = {
 const AFFILIATE_CODE_PATTERN = /^AFF[A-F0-9]{20}$/;
 // Tokens given once to every new member account (see ensureAffiliateAccount).
 const SIGNUP_BONUS_TOKENS = 50;
+// Members who joined before the gift existed (launched 30/9/2026 23:14 HKT) cannot claim it later.
+const SIGNUP_BONUS_START_MS = Date.parse("2026-09-30T15:00:00Z");
 
 const READ_COLLECTIONS = new Set([
   "users", "cards", "draws", "tokenRequests", "drawRecords", "promoCodes",
@@ -364,6 +366,37 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
     return { affiliateCode: "", affiliateStatus: "none", referredByUid: referrerUid, created: true, signupBonusTokens };
   });
   return { ok: true, ...result };
+});
+
+// Members who signed up without a verified phone (e.g. Google) get the signup gift
+// after linking a phone number by SMS. Same limits as at signup: one gift per
+// account and one per phone number.
+export const claimSignupBonus = onCall(userCallableOptions, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "請先登入會員帳戶。");
+  const verifiedPhone = String(request.auth.token.phone_number || "");
+  if (!verifiedPhone) throw new HttpsError("failed-precondition", "請先完成手機號碼短訊驗證。");
+  const uid = request.auth.uid;
+  const userRef = db.collection("users").doc(uid);
+  const claimRef = db.collection("signupBonusClaims").doc(signupBonusClaimId(verifiedPhone));
+  await db.runTransaction(async (transaction) => {
+    const [userSnapshot, claimSnapshot] = await Promise.all([transaction.get(userRef), transaction.get(claimRef)]);
+    if (!userSnapshot.exists) throw new HttpsError("failed-precondition", "找不到會員帳戶，請重新登入。");
+    const user = userSnapshot.data();
+    if (Number(user.signupBonusTokens || 0) > 0) throw new HttpsError("already-exists", "你已領取新會員禮物。");
+    if (millis(user.createdAt) < SIGNUP_BONUS_START_MS) {
+      throw new HttpsError("failed-precondition", "新會員禮物只適用於 2026 年 9 月 30 日或之後註冊的會員。");
+    }
+    if (claimSnapshot.exists) throw new HttpsError("already-exists", "此手機號碼已領取過新會員禮物。");
+    transaction.update(userRef, {
+      tokens: Number(user.tokens || 0) + SIGNUP_BONUS_TOKENS,
+      signupBonusTokens: SIGNUP_BONUS_TOKENS,
+      signupBonusAt: FieldValue.serverTimestamp(),
+      phoneNumber: verifiedPhone,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    transaction.create(claimRef, { uid, tokens: SIGNUP_BONUS_TOKENS, createdAt: FieldValue.serverTimestamp() });
+  });
+  return { ok: true, signupBonusTokens: SIGNUP_BONUS_TOKENS };
 });
 
 export const submitAffiliateApplication = onCall(userCallableOptions, async (request) => {

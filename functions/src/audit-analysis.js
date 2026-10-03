@@ -99,7 +99,9 @@ export function analyzeAuditEntries(entries, thresholds = AUDIT_THRESHOLDS) {
     // 2. Token balance went up without an approved deposit or a card conversion.
     if (collection === "users" && entry.operation === "update" && changed(entry, "tokens")) {
       const gain = Number(after(entry, "tokens")) - Number(before(entry, "tokens"));
-      if (gain > 0 && !changed(entry, "lastTokenGrantRequestId") && !changed(entry, "lastConversionRecordId")) {
+      // A later signup gift (claimSignupBonus) sets signupBonusAt, which only the server can write.
+      const signupGift = changed(entry, "signupBonusAt") && gain === thresholds.signupBonusTokens;
+      if (gain > 0 && !signupGift && !changed(entry, "lastTokenGrantRequestId") && !changed(entry, "lastConversionRecordId")) {
         findings.push(finding("high", "unexplained-tokens", "代幣無故增加", entry,
           `代幣 ${before(entry, "tokens")} → ${after(entry, "tokens")}（+${gain}），沒有對應的批准入數或卡牌兌換`));
       }

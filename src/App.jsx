@@ -58,6 +58,7 @@ import {
   getAdditionalUserInfo,
   getRedirectResult,
   linkWithCredential,
+  linkWithPhoneNumber,
   onAuthStateChanged,
   reauthenticateWithCredential,
   setPersistence,
@@ -117,6 +118,10 @@ function isPhoneAccount(user) {
 }
 
 function hasPhonePassword(user) {
+function hasGoogleProvider(user) {
+  return (user?.providerData || []).some((item) => item.providerId === "google.com");
+}
+
   return (user?.providerData || []).some((item) => item.providerId === "password");
 }
 
@@ -540,6 +545,8 @@ function App() {
   const [signupPromoOpen, setSignupPromoOpen] = useState(false);
   const [welcomeBonus, setWelcomeBonus] = useState(0);
   const googleSignInPendingRef = useRef(false);
+  // Google sign-ups get the gift later, after verifying a phone on the account page.
+  const [phoneGiftOffer, setPhoneGiftOffer] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [activeTab, setActiveTab] = useState("draw");
   const [usernameConflict, setUsernameConflict] = useState(false);
@@ -696,6 +703,7 @@ function App() {
         }
         if (created?.data?.created && created.data.signupBonusTokens > 0) setWelcomeBonus(created.data.signupBonusTokens);
         window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
+        else if (created?.data?.created && !authUser.phoneNumber) setPhoneGiftOffer(true);
         window.sessionStorage.removeItem(PENDING_REGISTRATION_KEY);
       } catch (error) {
         initializationStarted = false;
@@ -737,7 +745,7 @@ function App() {
   // player must set (or reset) a password, and daily logins use phone + password.
   const needsPhonePassword = Boolean(
     authUser && profile && !needsUsername && isPhoneAccount(authUser) && !passwordGateDone
-      && (signInProvider === "phone" || !hasPhonePassword(authUser)),
+      && (signInProvider === "phone" || (!hasPhonePassword(authUser) && !hasGoogleProvider(authUser))),
   );
   const isProfileLoading = Boolean(authUser && !profile && !profileInitializationError);
 
@@ -1063,6 +1071,15 @@ function App() {
         />
       )}
     </div>
+      {phoneGiftOffer && welcomeBonus === 0 && (
+        <GiftModal
+          title="驗證手機號碼送 50 代幣"
+          body="為帳戶完成手機號碼短訊驗證，即送 50 代幣新會員禮物。每個手機號碼只可領取一次。"
+          actionLabel="立即驗證"
+          onAction={() => { setPhoneGiftOffer(false); setActiveTab("account"); }}
+          onClose={() => setPhoneGiftOffer(false)}
+        />
+      )}
   );
 }
 
@@ -1914,6 +1931,7 @@ function BetaAccountSettings({ authUser, profile }) {
         </div>
       </div>
       <UsernameEditForm authUser={authUser} profile={profile} />
+      {profile && <PhoneGiftCard authUser={authUser} profile={profile} />}
       {isPhoneAccount(authUser) && hasPhonePassword(authUser) && <ChangePhonePasswordForm authUser={authUser} />}
       <AffiliateLinkCard profile={profile} />
     </section>
@@ -1921,6 +1939,122 @@ function BetaAccountSettings({ authUser, profile }) {
 }
 
 function AffiliateLinkCard({ profile, compact = false }) {
+// Members who signed up without a phone (Google) verify one by SMS to receive the
+// signup gift. The server checks Firebase Auth's verified number, once per number.
+function PhoneGiftCard({ authUser, profile }) {
+  const [phoneCountry, setPhoneCountry] = useState("+852");
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [code, setCode] = useState("");
+  const [confirmation, setConfirmation] = useState(null);
+  const [linkedPhone, setLinkedPhone] = useState(authUser?.phoneNumber || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState(false);
+  const recaptchaHostRef = useRef(null);
+  const recaptchaRef = useRef(null);
+
+  useEffect(() => () => { try { recaptchaRef.current?.clear(); } catch { /* already removed */ } }, []);
+
+  async function claimGift() {
+    // A fresh ID token carries the newly linked phone_number claim.
+    await authUser.getIdToken(true);
+    await httpsCallable(functions, "claimSignupBonus")();
+    setDone(true);
+  }
+
+  async function sendCode(event) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      try { recaptchaRef.current?.clear(); } catch { /* replaced below */ }
+      const container = document.createElement("div");
+      recaptchaHostRef.current.replaceChildren(container);
+      recaptchaRef.current = new RecaptchaVerifier(auth, container, { size: "invisible" });
+      await recaptchaRef.current.render();
+      setConfirmation(await linkWithPhoneNumber(authUser, normalizePhoneNumber(phoneCountry, phoneNumber), recaptchaRef.current));
+    } catch (sendError) {
+      setError(getPhoneGiftErrorMessage(sendError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmCode(event) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      const result = await confirmation.confirm(code.trim());
+      setLinkedPhone(result.user.phoneNumber || "");
+      await claimGift();
+    } catch (confirmError) {
+      setError(getPhoneGiftErrorMessage(confirmError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function retryClaim() {
+    setError("");
+    setBusy(true);
+    try {
+      await claimGift();
+    } catch (claimError) {
+      setError(getPhoneGiftErrorMessage(claimError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Members who already have the gift see nothing; one who just claimed sees the success note.
+  if (!done && Number(profile?.signupBonusTokens || 0) > 0) return null;
+  // Same cut-off as the server: members who joined before the gift existed are not eligible.
+  if (!done && toMillis(profile?.createdAt) < Date.parse("2026-09-30T15:00:00Z")) return null;
+  if (done) {
+    return <div className="phone-gift-card done"><Gift size={22} /><p><strong>已領取 50 代幣！</strong>新會員禮物已存入你的帳戶。</p></div>;
+  }
+  return (
+    <div className="phone-gift-card">
+      <div className="phone-gift-heading">
+        <Gift size={22} />
+        <div>
+          <strong>驗證手機號碼，領取 50 代幣</strong>
+          <small>完成短訊驗證即送新會員禮物，每個手機號碼只可領取一次。</small>
+        </div>
+      </div>
+      {linkedPhone ? (
+        <button className="primary-btn" type="button" onClick={retryClaim} disabled={busy}>{busy ? "領取中..." : `以 ${linkedPhone} 領取 50 代幣`}</button>
+      ) : confirmation ? (
+        <form onSubmit={confirmCode}>
+          <label className="field"><span>短訊驗證碼</span>
+            <input value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" autoComplete="one-time-code" placeholder="6 位數字" required />
+          </label>
+          <button className="primary-btn" type="submit" disabled={busy || code.length !== 6}>{busy ? "驗證中..." : "驗證並領取"}</button>
+        </form>
+      ) : (
+        <form onSubmit={sendCode}>
+          <PhoneNumberField country={phoneCountry} onCountryChange={setPhoneCountry} value={phoneNumber} onChange={setPhoneNumber} />
+          <button className="primary-btn" type="submit" disabled={busy || !phoneNumber}>{busy ? "發送中..." : "發送驗證碼"}</button>
+        </form>
+      )}
+      {error && <p className="error-note" role="alert">{error}</p>}
+      <div ref={recaptchaHostRef} />
+    </div>
+  );
+}
+
+function getPhoneGiftErrorMessage(error) {
+  const code = String(error?.code || "");
+  if (code === "auth/credential-already-in-use" || code === "auth/account-exists-with-different-credential") {
+    return "此手機號碼已用於另一個 LiveDraw 帳戶，不能再用於領取禮物。";
+  }
+  if (code === "auth/provider-already-linked") return "此帳戶已驗證手機號碼，請重新整理頁面。";
+  if (code === "auth/requires-recent-login") return "為保障帳戶安全，請先登出並重新登入，然後再驗證。";
+  if (code.startsWith("auth/")) return getPhoneAuthErrorMessage(error);
+  return getSafeErrorMessage(error, "未能領取禮物，請稍後再試。");
+}
+
   const [copied, setCopied] = useState(false);
   const [contact, setContact] = useState(profile?.phoneNumber || displayEmail(profile?.email) || "");
   const [message, setMessage] = useState("");
