@@ -1662,7 +1662,7 @@ async function fetchAuditPage(startDate, endDate, pageToken = "") {
     `timestamp>="${startDate.toISOString()}"`,
     `timestamp<"${endDate.toISOString()}"`,
   ].join(" AND ");
-  const { access_token: accessToken } = await applicationDefault().getAccessToken();
+  const accessToken = await loggingAccessToken();
   const listEntries = async (resourceNames) => {
     const response = await loggingList(accessToken, {
       resourceNames, filter, orderBy: "timestamp asc", pageSize: 1000,
@@ -1804,9 +1804,18 @@ export const adminUpdateSupportMessage = onCall(adminCallableOptions, async (req
 
 // Reads project logs between two instants (newest first).
 // Cloud Logging allows about 60 list calls a minute; back off briefly when throttled.
+// In the emulator the log readers talk to a local stand-in (scripts/verify-logging-flows.mjs
+// starts one) and never use real credentials, so tests cannot read the live project's logs.
+const IN_EMULATOR = process.env.FUNCTIONS_EMULATOR === "true";
+const LOGGING_LIST_URL = IN_EMULATOR ? "http://127.0.0.1:9399/v2/entries:list" : "https://logging.googleapis.com/v2/entries:list";
+async function loggingAccessToken() {
+  if (IN_EMULATOR) return "emulator";
+  return (await applicationDefault().getAccessToken()).access_token;
+}
+
 async function loggingList(accessToken, body) {
   for (let attempt = 0; ; attempt += 1) {
-    const response = await fetch("https://logging.googleapis.com/v2/entries:list", {
+    const response = await fetch(LOGGING_LIST_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -1817,7 +1826,7 @@ async function loggingList(accessToken, body) {
 }
 
 async function readProjectLogs(filter, sinceIso, untilIso, pageSize = 1000) {
-  const { access_token: accessToken } = await applicationDefault().getAccessToken();
+  const accessToken = await loggingAccessToken();
   const response = await loggingList(accessToken, {
     resourceNames: ["projects/livedraw-7e3c2"],
     filter: `${filter} AND timestamp>="${sinceIso}"${untilIso ? ` AND timestamp<"${untilIso}"` : ""}`,

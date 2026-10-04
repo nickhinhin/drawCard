@@ -119,7 +119,7 @@ expect("void a card in shipping", await adjust({ action: "voidCard", recordId: `
 expect("void own card", await adjust({ action: "voidCard", recordId: `own-${stamp}`, reason: "mistake" }), "PERMISSION_DENIED");
 expect("void a pending card", await adjust({ action: "voidCard", recordId: `pending-${stamp}`, reason: "wrong card" }), "OK");
 expect("void the same card again", await adjust({ action: "voidCard", recordId: `pending-${stamp}`, reason: "again" }), "FAILED_PRECONDITION");
-expect("unknown action", await adjust({ action: "deleteUser", uid: memberUid, reason: "x" }), "INVALID_ARGUMENT");
+expect("unknown action", await adjust({ action: "deleteUser", uid: memberUid, reason: "valid reason" }), "INVALID_ARGUMENT");
 check("3 successful changes logged in memberAdjustments", (await count("memberAdjustments")) - before === 3, `${(await count("memberAdjustments")) - before} new`);
 
 // ---- C. converted / voided cards can never be shipped ----

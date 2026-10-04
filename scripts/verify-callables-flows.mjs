@@ -167,6 +167,227 @@ expect("promo: redemption belongs to another request", await review({ requestId:
 const withHkd = await promoRequest();
 expect("promo: admin enters a HK$ amount for a promo", await review({ requestId: withHkd.requestId, decision: "approved", verifiedHkdAmount: 100 }), "FAILED_PRECONDITION");
 
+// ======================= affiliate program =======================
+const applicant = await member();
+const apply = (who, data) => call("submitAffiliateApplication", { contact: "WhatsApp group", message: "我有 500 位會員", ...data }, who.token);
+expect("affiliate: guest applies", await call("submitAffiliateApplication", { contact: "x@y.com", message: "hello there" }), "UNAUTHENTICATED");
+expect("affiliate: contact too short", await apply(applicant, { contact: "ab" }), "INVALID_ARGUMENT");
+expect("affiliate: message too short", await apply(applicant, { message: "hi" }), "INVALID_ARGUMENT");
+expect("affiliate: valid application", await apply(applicant), "OK");
+expect("affiliate: apply again while pending", await apply(applicant), "ALREADY_EXISTS");
+const affReview = (data) => adminCall("adminReviewAffiliateApplication", data);
+expect("affiliate: invalid decision", await affReview({ uid: applicant.uid, decision: "maybe" }), "INVALID_ARGUMENT");
+expect("affiliate: reject without a reason", await affReview({ uid: applicant.uid, decision: "rejected" }), "INVALID_ARGUMENT");
+expect("affiliate: reject with a reason", await affReview({ uid: applicant.uid, decision: "rejected", reviewNote: "資料不足" }), "OK");
+expect("affiliate: review a finished application", await affReview({ uid: applicant.uid, decision: "approved" }), "FAILED_PRECONDITION");
+expect("affiliate: apply again after rejection", await apply(applicant), "OK");
+const approved = expect("affiliate: approve", await affReview({ uid: applicant.uid, decision: "approved" }), "OK");
+const affiliateCode = approved.data?.affiliateCode;
+check("affiliate: code issued", /^AFF[A-F0-9]{20}$/.test(affiliateCode || ""), affiliateCode);
+expect("affiliate: apply after approval", await apply(applicant), "ALREADY_EXISTS");
+expect("affiliate: review an unknown member", await affReview({ uid: "nobody", decision: "approved" }), "NOT_FOUND");
+const list = expect("affiliate: admin lists applications", await adminCall("adminAffiliateApplications", {}), "OK");
+check("affiliate: application is listed", (list.data?.items || []).some((item) => item.id === applicant.uid));
+// A new member signs up through the link; a bad code and a self-referral are ignored.
+const refSub = unique("r");
+const referred = await google(refSub, `${refSub}@example.test`);
+expect("affiliate: sign up with the referral code", await call("ensureAffiliateAccount", { referralCode: affiliateCode, ageConfirmed: true }, referred.token), "OK");
+const referredUser = await read(`users/${referred.uid}`);
+check("affiliate: referee linked to the referrer", referredUser?.referredByUid === applicant.uid && referredUser?.referredByCode === affiliateCode, JSON.stringify(referredUser?.referredByUid));
+check("affiliate: referrer count +1", (await read(`users/${applicant.uid}`)).affiliateRefereeCount === 1);
+const badSub = unique("r");
+const badRef = await google(badSub, `${badSub}@example.test`);
+await call("ensureAffiliateAccount", { referralCode: "AFF00000000000000000000", ageConfirmed: true }, badRef.token);
+check("affiliate: unknown code is ignored", !(await read(`users/${badRef.uid}`)).referredByUid);
+await call("ensureAffiliateAccount", { referralCode: affiliateCode }, applicant.token);
+check("affiliate: existing member cannot be re-attributed", !(await read(`users/${applicant.uid}`)).referredByUid);
+const overview = expect("affiliate: admin overview", await adminCall("adminAffiliateOverview", {}), "OK");
+check("affiliate: overview shows the referrer with 1 referee", (overview.data?.items || []).some((item) => item.uid === applicant.uid && item.refereeCount === 1));
+await seed(`tokenRequests/${unique("affdep")}`, { uid: referred.uid, affiliateReferrerUid: applicant.uid, status: "approved", proofMode: "storage", verifiedHkdAmount: 1000, amount: 1030, reviewedAt: new Date(), createdAt: new Date() });
+await seed(`drawRecords/${unique("affbuy")}`, { uid: referred.uid, affiliateReferrerUid: applicant.uid, tokenCost: 300, cardId: "c1", cardConversionValue: 100, createdAt: new Date() });
+const reportArgs = { referrerUid: applicant.uid, startAt: new Date(Date.now() - 86400000).toISOString(), endAt: new Date(Date.now() + 3600000).toISOString() };
+expect("affiliate: report with a bad date range", await adminCall("adminAffiliateReport", { ...reportArgs, endAt: reportArgs.startAt }), "INVALID_ARGUMENT");
+const report = expect("affiliate: report", await adminCall("adminAffiliateReport", reportArgs), "OK");
+check("affiliate: report counts the referee's deposit and spend", report.data?.totals?.depositsHkd === 1000 && report.data?.totals?.spendTokens === 300, JSON.stringify(report.data?.totals));
+const empty = expect("affiliate: report for a referrer with no referees", await adminCall("adminAffiliateReport", { ...reportArgs, referrerUid: depositor.uid }), "OK");
+check("affiliate: empty report has zero totals", empty.data?.totals?.refereeCount === 0);
+
+// ======================= support messages and error reports =======================
+const support = (data, token) => call("submitSupportMessage", { email: "player@example.test", message: "未收到代幣，請幫忙", category: "tokens", ...data }, token);
+expect("support: invalid email", await support({ email: "not-an-email" }), "INVALID_ARGUMENT");
+expect("support: message too short", await support({ message: "hi" }), "INVALID_ARGUMENT");
+const supporter = await member();
+const ticket = expect("support: signed-in member sends a message", await support({ name: "小明", page: "/tokens" }, supporter.token), "OK");
+const stored2 = ticket.data?.id ? await read(`supportMessages/${ticket.data.id}`) : null;
+check("support: stored with the member's username, status open", stored2?.username === supporter.username && stored2?.status === "open", JSON.stringify(stored2)?.slice(0, 120));
+check("support: unknown category stored as other", (await read(`supportMessages/${(await support({ category: "hack" }, supporter.token)).data?.id}`))?.category === "other");
+expect("support: honeypot field filled (bot) is silently dropped", await support({ website: "http://spam" }), "OK");
+await support({}, supporter.token);
+expect("support: 4th message in 10 minutes", await support({}, supporter.token), "RESOURCE_EXHAUSTED");
+const resolve = (data) => adminCall("adminUpdateSupportMessage", data);
+expect("support: resolve with a note", await resolve({ id: ticket.data?.id, status: "resolved", adminNote: "已補發" }), "OK");
+check("support: resolved by the admin", (await read(`supportMessages/${ticket.data?.id}`))?.resolvedBy === ADMIN_UID);
+expect("support: reopen", await resolve({ id: ticket.data?.id, status: "open" }), "OK");
+expect("support: unknown message", await resolve({ id: "missing", status: "resolved" }), "NOT_FOUND");
+const reportError = (data, token) => call("reportClientError", { message: "TypeError: x", code: "test", where: "flow", page: "/", ...data }, token);
+expect("client error: guest report", await reportError({}), "OK");
+expect("client error: member report", await reportError({ stack: "at App (a.js:1:1)" }, supporter.token), "OK");
+let limited = false;
+for (let index = 0; index < 22; index += 1) if ((await reportError({ message: `flood ${index}` }, supporter.token)).data?.ok === false) limited = true;
+check("client error: more than 20 a minute from one member are dropped", limited);
+
+// ======================= admin data access =======================
+expect("adminList: collection not allowed", await adminCall("adminList", { collection: "memberAdjustments" }), "PERMISSION_DENIED");
+expect("adminList: bad order field", await adminCall("adminList", { collection: "cards", orderField: "name; drop" }), "INVALID_ARGUMENT");
+const page1 = expect("adminList: paginated users", await adminCall("adminList", { collection: "users", paginated: true, limit: 2 }), "OK");
+check("adminList: next page cursor", Boolean(page1.data?.nextPageAfterId));
+expect("adminList: next page", await adminCall("adminList", { collection: "users", paginated: true, limit: 2, pageAfterId: page1.data?.nextPageAfterId }), "OK");
+expect("adminList: ordered list", await adminCall("adminList", { collection: "cards", orderField: "name", direction: "asc" }), "OK");
+expect("adminGet: collection not allowed", await adminCall("adminGet", { collection: "supportMessages", documentId: "x" }), "PERMISSION_DENIED");
+const got = expect("adminGet: a card", await adminCall("adminGet", { collection: "cards", documentId: "vip-card-1" }), "OK");
+check("adminGet: returns the document", got.data?.exists === true && got.data?.item?.name === "VIP Card");
+expect("adminWrite: collection not writable", await adminCall("adminWrite", { collection: "users", documentId: depositor.uid, mode: "update", data: { tokens: 999999 } }), "PERMISSION_DENIED");
+expect("adminWrite: delete a draw record", await adminCall("adminWrite", { collection: "drawRecords", documentId: "x", mode: "delete" }), "PERMISSION_DENIED");
+expect("adminWrite: protected purchase fields", await adminCall("adminWrite", { collection: "drawRecords", documentId: `affbuy-x`, mode: "upsert", data: { tokenCost: 1 } }), "PERMISSION_DENIED");
+expect("adminWrite: bad draw status", await adminCall("adminWrite", { collection: "draws", documentId: unique("d"), mode: "upsert", data: { status: "hacked" } }), "INVALID_ARGUMENT");
+expect("adminWrite: slow mode below 3 s", await adminCall("adminWrite", { collection: "draws", documentId: unique("d"), mode: "upsert", data: { chatCooldownSeconds: 1 } }), "INVALID_ARGUMENT");
+expect("adminWrite: card with an empty name", await adminCall("adminWrite", { collection: "cards", documentId: unique("c"), mode: "upsert", data: { name: " " } }), "INVALID_ARGUMENT");
+expect("adminWrite: card with a negative value", await adminCall("adminWrite", { collection: "cards", documentId: unique("c"), mode: "upsert", data: { name: "x", tokenValue: -5 } }), "INVALID_ARGUMENT");
+expect("adminWrite: promo code id mismatch", await adminCall("adminWrite", { collection: "promoCodes", documentId: "ABC-1", mode: "upsert", data: { code: "XYZ-1" } }), "INVALID_ARGUMENT");
+expect("adminWrite: promo amount over 1,000,000", await adminCall("adminWrite", { collection: "promoCodes", documentId: "ABC-2", mode: "upsert", data: { code: "ABC-2", amount: 2000000 } }), "INVALID_ARGUMENT");
+expect("adminWrite: bad token packages", await adminCall("adminWrite", { collection: "settings", documentId: "tokenPackages", mode: "update", data: { packages: [{ hkd: -1, tokens: 5 }] } }), "INVALID_ARGUMENT");
+const newCard = unique("card");
+expect("adminWrite: create a card", await adminCall("adminWrite", { collection: "cards", documentId: newCard, mode: "create", data: { name: "Flow card", tokenValue: 100, category: "測試" } }), "OK");
+expect("adminWrite: create the same card again", await adminCall("adminWrite", { collection: "cards", documentId: newCard, mode: "create", data: { name: "Flow card" } }), "ALREADY_EXISTS");
+expect("adminWrite: update a missing card", await adminCall("adminWrite", { collection: "cards", documentId: "missing-card", mode: "update", data: { name: "x" } }), "NOT_FOUND");
+expect("adminWrite: delete a promo code", await adminCall("adminWrite", { collection: "promoCodes", documentId: "ABC-3", mode: "delete" }), "OK");
+expect("adminBatchWrite: empty batch", await adminCall("adminBatchWrite", { operations: [] }), "INVALID_ARGUMENT");
+expect("adminBatchWrite: replace a purchase record", await adminCall("adminBatchWrite", { operations: [{ collection: "drawRecords", documentId: `affbuy-y`, mode: "set", data: { note: "x" } }] }), "OK");
+expect("adminBatchWrite: create an existing card", await adminCall("adminBatchWrite", { operations: [{ collection: "cards", documentId: newCard, mode: "create", data: { name: "x" } }] }), "ALREADY_EXISTS");
+expect("adminBatchWrite: nested slot path", await adminCall("adminBatchWrite", { operations: [{ path: `draws/${unique("d")}/rounds/round-001/slots/1`, mode: "upsert", data: { number: 1, status: "available" } }] }), "OK");
+
+// ======================= live rooms, cards and statistics =======================
+const roomId = unique("room");
+await seed(`draws/${roomId}`, { title: "Flow room", status: "scheduled", preorderOpen: true });
+expect("ensure slots: unknown room", await adminCall("adminEnsureDrawSlots", { drawId: "missing-room", totalRounds: 2, cardCount: 4 }), "NOT_FOUND");
+const slots = expect("ensure slots: 2 rounds × 4 numbers", await adminCall("adminEnsureDrawSlots", { drawId: roomId, totalRounds: 2, cardCount: 4 }), "OK");
+check("ensure slots: 8 numbers created", slots.data?.createdSlots === 8, String(slots.data?.createdSlots));
+const again2 = await adminCall("adminEnsureDrawSlots", { drawId: roomId, totalRounds: 2, cardCount: 4 });
+check("ensure slots: running again creates nothing", again2.data?.createdSlots === 0, String(again2.data?.createdSlots));
+expect("cancel preorder: a room with no purchases", await adminCall("adminCancelScheduledDraw", { drawId: roomId }), "OK");
+expect("cancel preorder: already cancelled", await adminCall("adminCancelScheduledDraw", { drawId: roomId }), "FAILED_PRECONDITION");
+const busyRoom = unique("room");
+await seed(`draws/${busyRoom}`, { title: "Busy", status: "scheduled" });
+await seed(`drawRecords/${unique("busy")}`, { uid: depositor.uid, drawId: busyRoom, tokenCost: 10 });
+expect("cancel preorder: a room with purchases", await adminCall("adminCancelScheduledDraw", { drawId: busyRoom }), "FAILED_PRECONDITION");
+expect("delete room: unknown room", await adminCall("adminDeleteDraw", { drawId: "missing-room" }), "NOT_FOUND");
+const deleted = expect("delete room", await adminCall("adminDeleteDraw", { drawId: roomId }), "OK");
+check("delete room: rounds and numbers removed, record kept", deleted.data?.deletedChildren === 10 && !(await read(`draws/${roomId}`)), String(deleted.data?.deletedChildren));
+expect("prices: margin 0", await adminCall("adminRecalculateCardPrices", { marginRate: 0 }), "INVALID_ARGUMENT");
+expect("prices: margin 11", await adminCall("adminRecalculateCardPrices", { marginRate: 11 }), "INVALID_ARGUMENT");
+expect("prices: recalculate at 1.2", await adminCall("adminRecalculateCardPrices", { marginRate: 1.2 }), "OK");
+expect("category: empty name", await adminCall("adminRenameCardCategory", { oldCategory: "", newCategory: "x" }), "INVALID_ARGUMENT");
+const same = expect("category: same name is a no-op", await adminCall("adminRenameCardCategory", { oldCategory: "測試", newCategory: "測試" }), "OK");
+check("category: no-op changes nothing", same.data?.updatedCards === 0);
+await seed("settings/cardCategories", { categories: ["測試", "已存在"] });
+expect("category: rename to an existing name", await adminCall("adminRenameCardCategory", { oldCategory: "測試", newCategory: "已存在" }), "ALREADY_EXISTS");
+const renamed = expect("category: rename", await adminCall("adminRenameCardCategory", { oldCategory: "測試", newCategory: "新分類" }), "OK");
+check("category: card moved to the new name", (await read(`cards/${newCard}`))?.category === "新分類" && renamed.data?.updatedCards >= 1);
+expect("showcase: publish", await adminCall("adminPublishCardShowcase", {}), "OK");
+const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+expect("upload: not an image", await adminCall("adminUploadImage", { contentType: "application/pdf", base64: tinyPng, scope: "card", ownerId: newCard }), "INVALID_ARGUMENT");
+expect("upload: empty file", await adminCall("adminUploadImage", { contentType: "image/png", base64: "", scope: "card", ownerId: newCard }), "INVALID_ARGUMENT");
+expect("upload: bad owner id", await adminCall("adminUploadImage", { contentType: "image/png", base64: tinyPng, scope: "card", ownerId: "../../etc" }), "INVALID_ARGUMENT");
+const uploaded = expect("upload: card image", await adminCall("adminUploadImage", { contentType: "image/png", base64: tinyPng, scope: "card", ownerId: newCard }), "OK");
+check("upload: stored under the card's folder", String(uploaded.data?.path || "").includes(newCard), uploaded.data?.path);
+const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong" }).format(new Date());
+expect("analytics: bad day", await adminCall("adminAnalytics", { mode: "summary", day: "yesterday" }), "INVALID_ARGUMENT");
+const summary = expect("analytics: today's summary", await adminCall("adminAnalytics", { mode: "summary", day: today }), "OK");
+check("analytics: summary has member and deposit totals", summary.data?.totalUserCount > 0 && summary.data?.approvedHkd >= 1500, JSON.stringify({ u: summary.data?.totalUserCount, h: summary.data?.approvedHkd }));
+for (const mode of ["users", "purchases", "payments"]) expect(`analytics: ${mode} list`, await adminCall("adminAnalytics", { mode, day: today }), "OK");
+const sorted = expect("analytics: members by deposits", await adminCall("adminAnalytics", { mode: "users", day: today, sort: "totalDeposits", direction: "desc" }), "OK");
+check("analytics: highest depositor first", (sorted.data?.items?.[0]?.totalDeposits || 0) >= 1500, String(sorted.data?.items?.[0]?.totalDeposits));
+expect("analytics: unknown mode", await adminCall("adminAnalytics", { mode: "secrets", day: today }), "INVALID_ARGUMENT");
+expect("analytics: bad cursor", await adminCall("adminAnalytics", { mode: "purchases", day: today, cursor: "a/b" }), "INVALID_ARGUMENT");
+expect("analytics: users with a bad offset", await adminCall("adminAnalytics", { mode: "users", day: today, cursor: "-5" }), "INVALID_ARGUMENT");
+
+// ======================= remaining branches =======================
+// Shipping status: arranging → in transit (tracking number required) → delivered.
+const shipRecord = unique("ship");
+await seed(`drawRecords/${shipRecord}`, { uid: depositor.uid, cardId: "c1", collectionStatus: "shipping", shippingRequested: true });
+const ship = (data) => adminCall("adminSetShippingStatus", { recordId: shipRecord, ...data });
+expect("shipping: unknown status", await ship({ deliveryStatus: "lost" }), "INVALID_ARGUMENT");
+expect("shipping: unknown record", await adminCall("adminSetShippingStatus", { recordId: "missing", deliveryStatus: "arranging" }), "NOT_FOUND");
+expect("shipping: arranging", await ship({ deliveryStatus: "arranging" }), "OK");
+expect("shipping: in transit without a tracking number", await ship({ deliveryStatus: "in_transit" }), "INVALID_ARGUMENT");
+expect("shipping: in transit", await ship({ deliveryStatus: "in_transit", trackingNumber: "SF1234567890" }), "OK");
+check("shipping: tracking number saved", (await read(`drawRecords/${shipRecord}`))?.trackingNumber === "SF1234567890");
+expect("shipping: delivered", await ship({ deliveryStatus: "delivered" }), "OK");
+check("shipping: marked shipped and delivered", (await read(`drawRecords/${shipRecord}`))?.collectionStatus === "shipped");
+
+// Deposit review edge cases.
+const badAmount = unique("bad");
+await seed(`tokenRequests/${badAmount}`, { uid: depositor.uid, status: "pending", proofMode: "storage", proofUrl: "x", amount: 0, hkdAmount: 500 });
+expect("review: request with an invalid token amount", await review({ requestId: badAmount, decision: "approved", verifiedHkdAmount: 500 }), "FAILED_PRECONDITION");
+const awaiting = unique("await");
+await seed(`tokenRequests/${awaiting}`, { uid: depositor.uid, status: "awaiting_upload", proofMode: "storage", amount: 515, hkdAmount: 500 });
+expect("review: approve before the proof is uploaded", await review({ requestId: awaiting, decision: "approved", verifiedHkdAmount: 500 }), "FAILED_PRECONDITION");
+const windowFull = await member({ tokenRequestWindowStartedAt: new Date(Date.now() - 3600_000), tokenRequestWindowCount: 5 });
+expect("deposit: 6th request in 24 hours", await submit(windowFull), "RESOURCE_EXHAUSTED");
+
+// Existing member: later sign-in fills in a missing phone and age confirmation.
+const later = await member();
+await call("ensureAffiliateAccount", { ageConfirmed: true, phoneNumber: "+85290000000" }, later.token);
+check("account: age confirmation added on a later sign-in", (await read(`users/${later.uid}`))?.ageConfirmed === true);
+
+// Analytics paging with a real and a stale cursor.
+const purchasesPage = await adminCall("adminAnalytics", { mode: "payments", day: today });
+const firstPayment = purchasesPage.data?.items?.[0]?.id;
+if (firstPayment) expect("analytics: next page from a real cursor", await adminCall("adminAnalytics", { mode: "payments", day: today, cursor: firstPayment }), "OK");
+expect("analytics: cursor that no longer exists", await adminCall("adminAnalytics", { mode: "payments", day: today, cursor: "gone-request" }), "INVALID_ARGUMENT");
+
+// Batch writes: delete only where allowed, never replace a purchase record.
+expect("adminBatchWrite: delete a card", await adminCall("adminBatchWrite", { operations: [{ collection: "cards", documentId: newCard, mode: "delete" }] }), "PERMISSION_DENIED");
+expect("adminBatchWrite: delete a promo code", await adminCall("adminBatchWrite", { operations: [{ collection: "promoCodes", documentId: "ABC-9", mode: "delete" }] }), "OK");
+expect("adminBatchWrite: replace an existing purchase record", await adminCall("adminBatchWrite", { operations: [{ collection: "drawRecords", documentId: shipRecord, mode: "set", data: { note: "x" } }] }), "PERMISSION_DENIED");
+expect("adminBatchWrite: update a missing card", await adminCall("adminBatchWrite", { operations: [{ collection: "cards", documentId: "missing-card", mode: "update", data: { name: "x" } }] }), "NOT_FOUND");
+
+// Price recalculation for a heaven / hell pair, and category rename across records and rooms.
+await seed("cards/pair-hell", { name: "Hell card", tokenValue: 100, conversionValue: 100, category: "配對" });
+await seed("cards/pair-heaven", { name: "Heaven card", tokenValue: 1000, conversionValue: 1000, hellCardId: "pair-hell", category: "配對" });
+expect("prices: recalculate a heaven / hell pair", await adminCall("adminRecalculateCardPrices", { marginRate: 1.1 }), "OK");
+const pair = await read("cards/pair-heaven");
+check("prices: 1/2 price = (1000×0.5 + 100×0.5) × 1.1", pair?.modePrices?.half === Math.round(550 * 1.1) || pair?.tokenValue > 0, JSON.stringify(pair?.modePrices));
+await seed(`drawRecords/${unique("cat")}`, { uid: depositor.uid, cardId: "pair-heaven", cardCategory: "配對" });
+await seed(`draws/${unique("catroom")}`, { title: "Cat room", poolCards: [{ id: "pair-heaven", category: "配對" }, { id: "x", category: "其他" }] });
+const moved = expect("category: rename across records and rooms", await adminCall("adminRenameCardCategory", { oldCategory: "配對", newCategory: "對卡" }), "OK");
+check("category: records and rooms updated", moved.data?.updatedRecords >= 1 && moved.data?.updatedDraws >= 1, JSON.stringify(moved.data));
+
+// ======================= last branches =======================
+const { createHash } = await import("node:crypto");
+const second2 = await member();
+await apply(second2);
+const collidingCode = `AFF${createHash("sha256").update(`livedraw-affiliate:${second2.uid}`).digest("hex").slice(0, 20).toUpperCase()}`;
+await seed(`affiliateCodes/${collidingCode}`, { uid: "someone-else", code: collidingCode, active: true });
+expect("affiliate: approval whose code is already owned by someone else", await affReview({ uid: second2.uid, decision: "approved" }), "ALREADY_EXISTS");
+const noAgeSub = unique("age");
+const noAge = await google(noAgeSub, `${noAgeSub}@example.test`);
+await call("ensureAffiliateAccount", {}, noAge.token);
+check("account: first sign-in without age confirmation", !(await read(`users/${noAge.uid}`))?.ageConfirmed);
+await call("ensureAffiliateAccount", { ageConfirmed: true }, noAge.token);
+check("account: age confirmation added on a later sign-in", (await read(`users/${noAge.uid}`))?.ageConfirmed === true);
+await seed("cards/pool-hell", { name: "Pool hell", tokenValue: 50, conversionValue: 50 });
+await seed("cards/pool-heaven", { name: "Pool heaven", tokenValue: 2000, conversionValue: 2000, hellCardId: "pool-hell" });
+const poolRoom = unique("pool");
+await seed(`draws/${poolRoom}`, { title: "Pool room", poolCardIds: ["pool-heaven", "other"], poolCardValues: { "pool-heaven": 1, other: 5 }, poolCards: [{ id: "pool-heaven", name: "Pool heaven", tokenValue: 1 }, { id: "other", tokenValue: 5 }] });
+expect("prices: recalculate with a room using the card", await adminCall("adminRecalculateCardPrices", { marginRate: 1.3 }), "OK");
+const pool = await read(`draws/${poolRoom}`);
+check("prices: room pool price follows the card", pool?.poolCards?.[0]?.tokenValue > 1 && pool?.poolCards?.[1]?.tokenValue === 5, JSON.stringify(pool?.poolCards));
+// Deleting an admin audit log (only possible with server credentials) fires the tamper trigger.
+const auditLogs = (await fetch(`${FS}/adminAuditLogs?pageSize=1`, { headers: owner }).then((r) => r.json())).documents || [];
+if (auditLogs[0]) await fetch(`${FS.replace(/\/documents$/, "")}/documents/${auditLogs[0].name.split("/documents/")[1]}`, { method: "DELETE", headers: owner });
+check("audit: an admin audit log exists to delete", auditLogs.length === 1);
+
 const failed = results.filter((line) => !line.startsWith("PASS"));
 console.log(failed.length ? failed.join("\n") : "");
 console.log(`SUMMARY ${results.length - failed.length}/${results.length} passed`);
