@@ -128,6 +128,7 @@ export const auditSiteSettings = auditTrigger("publicSiteSettings/{settingId}");
 export const auditAffiliateApplications = auditTrigger("affiliateApplications/{applicationId}");
 export const auditAffiliateCodes = auditTrigger("affiliateCodes/{codeId}");
 export const auditAffiliateReferrals = auditTrigger("affiliateReferrals/{referralId}");
+export const auditMemberAdjustments = auditTrigger("memberAdjustments/{adjustmentId}");
 
 // Admin audit documents are written once by functions; any later edit or
 // deletion of them is itself suspicious and gets logged. Separate update and

@@ -209,6 +209,20 @@ try {
 }
 await patch(`draws/${drawId}`, { chatCooldownSeconds: i(3) });
 
+// 會員調整: history is admin-only and written only by the server; players cannot fake an adjustment.
+for (const [label, action] of [
+  ["player reads the member adjustment history", () => getDocs(collection(db, "memberAdjustments"))],
+  ["player writes a member adjustment", () => setDoc(doc(db, "memberAdjustments", `fake-${stamp}`), { type: "tokens", uid, delta: 5000, reason: "x" })],
+  ["player marks own balance as an admin adjustment", () => updateDoc(doc(db, "users", uid), { tokens: 99999, lastAdminAdjustmentId: "fake", updatedAt: serverTimestamp() })],
+]) {
+  try {
+    await action();
+    results.push(`FAIL  ${label}: ACCEPTED`);
+  } catch {
+    results.push(`PASS  ${label}: rejected`);
+  }
+}
+
 // Old live audience collection: nobody may write it any more and only admins read it.
 {
   const visitorId = "abcdef0123456789abcd";

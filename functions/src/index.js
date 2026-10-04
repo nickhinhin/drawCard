@@ -1033,6 +1033,106 @@ export const adminReviewTokenRequest = onCall(adminCallableOptions, async (reque
   return { ok: true };
 });
 
+// Manual member corrections: add / remove tokens, give a card, void a card. Every change
+// needs a reason and is saved in memberAdjustments (shown in 會員調整) and adminAuditLogs.
+// Admins cannot adjust their own account, balances cannot go below zero and only cards
+// that are still pending (not converted, not shipping) can be voided.
+const MEMBER_ADJUSTMENT_MAX_TOKENS = 1_000_000;
+
+export const adminAdjustMember = onCall(adminCallableOptions, async (request) => {
+  const actor = assertAdmin(request);
+  const action = String(request.data?.action || "");
+  const reason = String(request.data?.reason || "").trim();
+  if (reason.length < 2 || reason.length > 200) throw new HttpsError("invalid-argument", "請填寫 2 至 200 字的修改原因。");
+  const adjustmentRef = db.collection("memberAdjustments").doc();
+  const base = {
+    reason, adminUid: actor.uid, adminEmail: actor.email || "", createdAt: FieldValue.serverTimestamp(),
+  };
+
+  if (action === "tokens") {
+    const uid = assertIdentifier(request.data?.uid, "會員 ID");
+    if (uid === actor.uid) throw new HttpsError("permission-denied", "不可調整自己帳戶的代幣。");
+    const delta = Number(request.data?.delta);
+    if (!Number.isSafeInteger(delta) || delta === 0 || Math.abs(delta) > MEMBER_ADJUSTMENT_MAX_TOKENS) {
+      throw new HttpsError("invalid-argument", "調整數量必須為非零整數，上限 1,000,000。");
+    }
+    const userRef = db.collection("users").doc(uid);
+    const result = await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(userRef);
+      if (!snapshot.exists) throw new HttpsError("not-found", "找不到此會員。");
+      const before = Number(snapshot.data().tokens || 0);
+      const after = before + delta;
+      if (after < 0) throw new HttpsError("failed-precondition", `會員目前只有 ${before} 代幣，不可扣減至負數。`);
+      transaction.update(userRef, { tokens: after, lastAdminAdjustmentId: adjustmentRef.id, updatedAt: FieldValue.serverTimestamp() });
+      const entry = { ...base, type: "tokens", uid, username: String(snapshot.data().username || ""), delta, before, after };
+      transaction.create(adjustmentRef, entry);
+      transaction.set(db.collection("adminAuditLogs").doc(), auditRecord(actor, "member:tokens", "users", uid, { tokens: before }, { tokens: after, delta, reason }, request));
+      return { before, after };
+    });
+    return { ok: true, adjustmentId: adjustmentRef.id, ...result };
+  }
+
+  if (action === "giveCard") {
+    const uid = assertIdentifier(request.data?.uid, "會員 ID");
+    if (uid === actor.uid) throw new HttpsError("permission-denied", "不可送卡給自己的帳戶。");
+    const cardId = assertIdentifier(request.data?.cardId, "卡牌 ID");
+    const userRef = db.collection("users").doc(uid);
+    const cardRef = db.collection("cards").doc(cardId);
+    const recordRef = db.collection("drawRecords").doc();
+    await db.runTransaction(async (transaction) => {
+      const [userSnapshot, cardSnapshot] = await Promise.all([transaction.get(userRef), transaction.get(cardRef)]);
+      if (!userSnapshot.exists) throw new HttpsError("not-found", "找不到此會員。");
+      if (!cardSnapshot.exists || cardSnapshot.data().archived) throw new HttpsError("not-found", "找不到此卡牌，或卡牌已封存。");
+      const card = cardSnapshot.data();
+      const username = String(userSnapshot.data().username || "");
+      const name = String(card.name || "");
+      const imageUrl = String(card.thumbUrl || card.imageUrl || "");
+      const value = Math.max(0, Math.floor(Number(card.conversionValue ?? card.tokenValue ?? 0)));
+      // Same shape as a claimed VIP reward, so 我的卡牌, conversion and shipping work as usual.
+      transaction.create(recordRef, {
+        source: "admin", uid, username,
+        drawId: "admin-gift", drawTitle: "管理員贈送", roomSlug: "admin-gift", roomLink: "",
+        round: "admin-gift", roundSort: 0, number: 0, tokenCost: 0,
+        targetCardId: cardId, targetCardName: name, targetCardImageUrl: imageUrl, targetCardValue: value,
+        cardId, cardName: name, cardCategory: String(card.category || ""), cardImageUrl: imageUrl,
+        cardValue: Number(card.tokenValue || value), cardConversionValue: value,
+        collectionStatus: "pending", adminAdjustmentId: adjustmentRef.id, assignedBy: actor.uid,
+        assignedAt: FieldValue.serverTimestamp(), createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.create(adjustmentRef, { ...base, type: "giveCard", uid, username, recordId: recordRef.id, cardId, cardName: name, cardValue: value });
+      transaction.set(db.collection("adminAuditLogs").doc(), auditRecord(actor, "member:give-card", "drawRecords", recordRef.id, null, { uid, cardId, cardName: name, cardConversionValue: value, reason }, request));
+    });
+    return { ok: true, adjustmentId: adjustmentRef.id, recordId: recordRef.id };
+  }
+
+  if (action === "voidCard") {
+    const recordRef = db.collection("drawRecords").doc(assertIdentifier(request.data?.recordId, "卡牌紀錄 ID"));
+    await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(recordRef);
+      if (!snapshot.exists) throw new HttpsError("not-found", "找不到此卡牌紀錄。");
+      const record = snapshot.data();
+      if (record.uid === actor.uid) throw new HttpsError("permission-denied", "不可作廢自己帳戶的卡牌。");
+      if (!record.cardId) throw new HttpsError("failed-precondition", "此紀錄尚未派發卡牌。");
+      if (record.convertedToTokens || String(record.collectionStatus || "pending") !== "pending") {
+        throw new HttpsError("failed-precondition", "只可作廢未兌換、未申請配送的卡牌。");
+      }
+      transaction.update(recordRef, {
+        collectionStatus: "void", voidedAt: FieldValue.serverTimestamp(), voidedBy: actor.uid,
+        voidReason: reason, adminAdjustmentId: adjustmentRef.id, updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.create(adjustmentRef, {
+        ...base, type: "voidCard", uid: String(record.uid || ""), username: String(record.username || ""),
+        recordId: recordRef.id, cardId: String(record.cardId), cardName: String(record.cardName || ""),
+        cardValue: Number(record.cardConversionValue ?? record.cardValue ?? 0),
+      });
+      transaction.set(db.collection("adminAuditLogs").doc(), auditRecord(actor, "member:void-card", "drawRecords", recordRef.id, { collectionStatus: "pending", cardId: record.cardId }, { collectionStatus: "void", reason }, request));
+    });
+    return { ok: true, adjustmentId: adjustmentRef.id };
+  }
+
+  throw new HttpsError("invalid-argument", "操作不正確。");
+});
+
 export const adminSetShippingStatus = onCall(adminCallableOptions, async (request) => {
   const actor = assertAdmin(request);
   const recordId = assertIdentifier(request.data?.recordId, "卡牌紀錄 ID");

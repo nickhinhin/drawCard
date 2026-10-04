@@ -101,10 +101,24 @@ export function analyzeAuditEntries(entries, thresholds = AUDIT_THRESHOLDS) {
       const gain = Number(after(entry, "tokens")) - Number(before(entry, "tokens"));
       // A later signup gift (claimSignupBonus) sets signupBonusAt, which only the server can write.
       const signupGift = changed(entry, "signupBonusAt") && gain === thresholds.signupBonusTokens;
-      if (gain > 0 && !signupGift && !changed(entry, "lastTokenGrantRequestId") && !changed(entry, "lastConversionRecordId")) {
+      // 會員調整 (adminAdjustMember) sets lastAdminAdjustmentId; players cannot write that field.
+      const adminAdjustment = isServer(entry) && changed(entry, "lastAdminAdjustmentId");
+      if (adminAdjustment) {
+        findings.push(finding(Math.abs(gain) >= thresholds.largeGrantTokens ? "high" : "medium", "admin-adjustment", "管理員手動調整代幣", entry,
+          `代幣 ${before(entry, "tokens")} → ${after(entry, "tokens")}（${gain > 0 ? "+" : ""}${gain}），原因見「會員調整」修改紀錄`));
+      } else if (gain > 0 && !signupGift && !changed(entry, "lastTokenGrantRequestId") && !changed(entry, "lastConversionRecordId")) {
         findings.push(finding("high", "unexplained-tokens", "代幣無故增加", entry,
           `代幣 ${before(entry, "tokens")} → ${after(entry, "tokens")}（+${gain}），沒有對應的批准入數或卡牌兌換`));
       }
+    }
+
+    // 2b. Cards given or voided by an admin in 會員調整.
+    if (collection === "drawRecords" && entry.operation === "create" && after(entry, "source") === "admin") {
+      findings.push(finding("medium", "admin-card-gift", "管理員送卡", entry,
+        `送出「${after(entry, "cardName") || after(entry, "cardId")}」（兌換值 ${after(entry, "cardConversionValue") ?? 0}）給 ${after(entry, "username") || after(entry, "uid")}`));
+    }
+    if (collection === "drawRecords" && entry.operation === "update" && after(entry, "collectionStatus") === "void") {
+      findings.push(finding("low", "admin-card-void", "管理員作廢卡牌", entry, `原因：${after(entry, "voidReason") || "--"}`));
     }
 
     // 3. Approver approved their own request or application.

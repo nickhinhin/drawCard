@@ -2236,7 +2236,7 @@ function AccountPanel({ authUser, profile, setActiveTab }) {
       setRecentPicks(
         snapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }))
-          .filter((item) => item.source !== "vip")
+          .filter(isPurchaseRecord)
           .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt))
           .slice(0, 6),
       );
@@ -3810,7 +3810,7 @@ function RoomRecordsDrawer({ currentRoomId, profile }) {
       setRecords(
         snapshot.docs
           .map((item) => ({ id: item.id, ...item.data() }))
-          .filter((item) => item.source !== "vip")
+          .filter(isPurchaseRecord)
           .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt))
           .slice(0, 20),
       );
@@ -6289,7 +6289,7 @@ function CollectionPage({ profile }) {
           snapshot.docs
             .map((item) => ({ id: item.id, ...item.data() }))
             .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt))
-            .filter((record) => record.cardId && (isBeta || !record.convertedToTokens)),
+            .filter((record) => record.cardId && record.collectionStatus !== "void" && (isBeta || !record.convertedToTokens)),
         );
         setCollectionError("");
         if (isSnapshotReady(snapshot)) setCollectionLoading(false);
@@ -6616,10 +6616,10 @@ function CollectionPage({ profile }) {
                   {isBeta ? (
                     <>
                       <span className="collection-room-meta">
-                        {record.drawTitle || record.roomSlug || "抽卡房"} · {formatRoundLabel(record.round)}
+                        {record.drawTitle || record.roomSlug || "抽卡房"}{isPurchaseRecord(record) ? ` · ${formatRoundLabel(record.round)}` : ""}
                       </span>
                       <span className="record-acquired-time">取得時間：{formatRecordAcquiredTime(record)}</span>
-                      {record.source !== "vip" && (
+                      {isPurchaseRecord(record) && (
                         <span className="collection-heaven-card">
                           <small>當日所選天堂卡</small>
                           <b title={record.targetCardName || "舊紀錄未有保存天堂卡名稱"}>
@@ -7166,6 +7166,229 @@ const SUPPORT_CATEGORY_OPTIONS = [
 ];
 
 // Admin view of earlier contact-form messages; replies go out by email.
+// 會員調整: add / remove a member's tokens, give a card or void a card. Every change goes
+// through adminAdjustMember (server checks, reason required) and is kept in memberAdjustments.
+const MEMBER_ADJUSTMENT_LABELS = { tokens: "代幣", giveCard: "送卡", voidCard: "作廢卡牌" };
+
+async function findMemberUid(input) {
+  const text = String(input || "").trim();
+  if (!text) return "";
+  const usernameSnap = await getDoc(doc(db, "usernames", text.toLowerCase()));
+  if (usernameSnap.exists() && usernameSnap.data()?.uid) return usernameSnap.data().uid;
+  const digits = text.replace(/\D/g, "");
+  if (digits.length >= 8) {
+    const phones = [text.startsWith("+") ? `+${digits}` : `+852${digits}`, `+${digits}`];
+    for (const phone of [...new Set(phones)]) {
+      const found = await getDocs(query(collection(db, "users"), where("phoneNumber", "==", phone), limit(1)));
+      if (!found.empty) return found.docs[0].id;
+    }
+  }
+  if (/^[A-Za-z0-9_-]{6,128}$/.test(text)) {
+    const byId = await getDoc(doc(db, "users", text));
+    if (byId.exists()) return byId.id;
+  }
+  return "";
+}
+
+function AdminMemberAdjustments({ cards }) {
+  const [search, setSearch] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [memberUid, setMemberUid] = useState("");
+  const [member, setMember] = useState(null);
+  const [memberCards, setMemberCards] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [delta, setDelta] = useState("");
+  const [tokenReason, setTokenReason] = useState("");
+  const [cardSearch, setCardSearch] = useState("");
+  const [giftCardId, setGiftCardId] = useState("");
+  const [giftReason, setGiftReason] = useState("");
+  const [busy, setBusy] = useState("");
+
+  useEffect(() => {
+    setMember(null);
+    setMemberCards([]);
+    if (!memberUid) return undefined;
+    const stopMember = onSnapshot(doc(db, "users", memberUid), (snapshot) => setMember(snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null));
+    const stopCards = onSnapshot(query(collection(db, "drawRecords"), where("uid", "==", memberUid)), (snapshot) => setMemberCards(
+      snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
+        .filter((record) => record.cardId)
+        .sort((left, right) => toMillis(right.assignedAt || right.createdAt) - toMillis(left.assignedAt || left.createdAt)),
+    ));
+    return () => { stopMember(); stopCards(); };
+  }, [memberUid]);
+
+  // Latest 100 changes; when a member is open, only theirs.
+  useEffect(() => {
+    const historyQuery = memberUid
+      ? query(collection(db, "memberAdjustments"), where("uid", "==", memberUid), limit(200))
+      : query(collection(db, "memberAdjustments"), orderBy("createdAt", "desc"), limit(100));
+    return onSnapshot(historyQuery, (snapshot) => setHistory(
+      snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
+        .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt)),
+    ), (error) => console.error("Member adjustment history listener failed.", error));
+  }, [memberUid]);
+
+  async function lookUp(event) {
+    event.preventDefault();
+    setSearching(true);
+    setSearchError("");
+    try {
+      const uid = await findMemberUid(search);
+      if (!uid) setSearchError("找不到此會員。請輸入玩家名稱、手機號碼或會員 ID。");
+      setMemberUid(uid);
+    } catch (error) {
+      setSearchError(getSafeErrorMessage(error, "未能搜尋會員。"));
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function adjust(data, confirmText) {
+    if (!window.confirm(confirmText)) return false;
+    setBusy(data.action);
+    try {
+      await httpsCallable(functions, "adminAdjustMember")(data);
+      return true;
+    } catch (error) {
+      showSafeError(error, "未能完成調整。");
+      return false;
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function submitTokens(event) {
+    event.preventDefault();
+    const amount = Number(delta);
+    if (!Number.isSafeInteger(amount) || amount === 0) {
+      alert("請輸入非零整數，例如 500 或 -200。");
+      return;
+    }
+    const name = member?.username || memberUid;
+    const done = await adjust(
+      { action: "tokens", uid: memberUid, delta: amount, reason: tokenReason },
+      `確認為 ${name} ${amount > 0 ? "增加" : "扣減"} ${formatTokenNumber(Math.abs(amount))} 代幣？\n原因：${tokenReason}`,
+    );
+    if (done) { setDelta(""); setTokenReason(""); }
+  }
+
+  async function submitGift(event) {
+    event.preventDefault();
+    const card = cards.find((item) => item.id === giftCardId);
+    if (!card) {
+      alert("請先選擇卡牌。");
+      return;
+    }
+    const done = await adjust(
+      { action: "giveCard", uid: memberUid, cardId: card.id, reason: giftReason },
+      `確認送出「${card.name}」給 ${member?.username || memberUid}？\n原因：${giftReason}`,
+    );
+    if (done) { setGiftCardId(""); setGiftReason(""); setCardSearch(""); }
+  }
+
+  async function voidCard(record) {
+    const reason = window.prompt(`作廢「${record.cardName || record.cardId}」的原因（2 至 200 字）：`, "");
+    if (reason === null) return;
+    await adjust({ action: "voidCard", recordId: record.id, reason: reason.trim() }, `確認作廢「${record.cardName || record.cardId}」？此操作不可復原。`);
+  }
+
+  const cardMatches = cardSearch.trim()
+    ? cards.filter((card) => String(card.name || "").toLowerCase().includes(cardSearch.trim().toLowerCase())).slice(0, 30)
+    : [];
+
+  return (
+    <section className="panel member-adjust-panel">
+      <div className="section-heading compact">
+        <UserRoundPlus size={22} />
+        <div>
+          <h2>會員調整</h2>
+          <p className="muted">增減會員代幣、送卡或作廢卡牌。每項修改都必須填寫原因，並會記錄於下方修改紀錄及審計紀錄。不可調整自己的帳戶。</p>
+        </div>
+      </div>
+      <form className="member-adjust-search" onSubmit={lookUp}>
+        <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="玩家名稱、手機號碼或會員 ID" aria-label="搜尋會員" />
+        <button className="small-btn" type="submit" disabled={searching || !search.trim()}><Search size={15} />{searching ? "搜尋中..." : "搜尋"}</button>
+        {memberUid && <button className="small-btn" type="button" onClick={() => { setMemberUid(""); setSearch(""); }}>清除</button>}
+      </form>
+      {searchError && <p className="error-note" role="alert">{searchError}</p>}
+
+      {memberUid && member && (
+        <>
+          <div className="member-adjust-profile">
+            <div><strong>{member.username || "未設定名稱"}</strong><small>{member.phoneNumber || displayEmail(member.email) || "--"} · {memberUid}</small></div>
+            <div><small>代幣餘額</small><strong><TokenAmount value={member.tokens || 0} /></strong></div>
+          </div>
+          <div className="member-adjust-forms">
+            <form onSubmit={submitTokens}>
+              <h3>增減代幣</h3>
+              <label className="field"><span>數量（正數增加，負數扣減）</span>
+                <input type="number" step="1" value={delta} onChange={(event) => setDelta(event.target.value)} placeholder="例如 500 或 -200" required />
+              </label>
+              <label className="field"><span>原因</span>
+                <input value={tokenReason} onChange={(event) => setTokenReason(event.target.value)} maxLength={200} placeholder="例如：補償系統錯誤扣款" required />
+              </label>
+              <button className="primary-btn" type="submit" disabled={busy === "tokens" || !delta || tokenReason.trim().length < 2}>{busy === "tokens" ? "處理中..." : "確認調整"}</button>
+            </form>
+            <form onSubmit={submitGift}>
+              <h3>送卡</h3>
+              <label className="field"><span>搜尋卡牌</span>
+                <input value={cardSearch} onChange={(event) => { setCardSearch(event.target.value); setGiftCardId(""); }} placeholder="輸入卡名" />
+              </label>
+              {cardMatches.length > 0 && !giftCardId && (
+                <div className="member-adjust-card-list">
+                  {cardMatches.map((card) => (
+                    <button key={card.id} type="button" onClick={() => { setGiftCardId(card.id); setCardSearch(card.name || card.id); }}>
+                      {card.name} · 兌換值 {formatTokenNumber(card.conversionValue ?? card.tokenValue ?? 0)}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <label className="field"><span>原因</span>
+                <input value={giftReason} onChange={(event) => setGiftReason(event.target.value)} maxLength={200} placeholder="例如：活動獎品" required />
+              </label>
+              <button className="primary-btn" type="submit" disabled={busy === "giveCard" || !giftCardId || giftReason.trim().length < 2}>{busy === "giveCard" ? "處理中..." : "確認送卡"}</button>
+            </form>
+          </div>
+          <h3>會員卡牌（{memberCards.length}）</h3>
+          {memberCards.length ? (
+            <div className="member-adjust-cards">
+              {memberCards.map((record) => {
+                const voidable = record.collectionStatus === "pending" || (!record.collectionStatus && !record.convertedToTokens);
+                return (
+                  <div key={record.id} className={record.collectionStatus === "void" ? "voided" : ""}>
+                    <span><strong>{record.cardName || record.cardId}</strong><small>{record.drawTitle || "--"}{isPurchaseRecord(record) ? ` · ${formatRoundLabel(record.round)}` : ""} · 兌換值 {formatTokenNumber(record.cardConversionValue ?? record.cardValue ?? 0)}</small></span>
+                    <em>{getCollectionDeliveryLabel(record)}</em>
+                    {voidable && <button className="small-btn" type="button" disabled={busy === "voidCard"} onClick={() => voidCard(record)}>作廢</button>}
+                  </div>
+                );
+              })}
+            </div>
+          ) : <p className="muted">此會員暫時沒有卡牌。</p>}
+        </>
+      )}
+
+      <h3>修改紀錄{memberUid ? "（此會員）" : "（最近 100 項）"}</h3>
+      {history.length ? (
+        <div className="analytics-table-wrap"><table className="analytics-table"><thead><tr>
+          {["時間", "會員", "類型", "內容", "原因", "管理員"].map((heading) => <th key={heading}>{heading}</th>)}
+        </tr></thead><tbody>{history.map((item) => (
+          <tr key={item.id}>
+            <td>{formatAnalyticsTime(toMillis(item.createdAt))}</td>
+            <td><strong>{item.username || "--"}</strong><small>{item.uid}</small></td>
+            <td>{MEMBER_ADJUSTMENT_LABELS[item.type] || item.type}</td>
+            <td>{item.type === "tokens"
+              ? `${item.delta > 0 ? "+" : ""}${formatTokenNumber(item.delta)}（${formatTokenNumber(item.before)} → ${formatTokenNumber(item.after)}）`
+              : `${item.cardName || item.cardId}（兌換值 ${formatTokenNumber(item.cardValue || 0)}）`}</td>
+            <td>{item.reason}</td>
+            <td>{item.adminEmail || item.adminUid}</td>
+          </tr>
+        ))}</tbody></table></div>
+      ) : <p className="muted">暫時沒有修改紀錄。</p>}
+    </section>
+  );
+}
+
 function SupportInbox() {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -7570,7 +7793,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
 
   useEffect(() => onSnapshot(
       query(collection(db, "drawRecords"), where("createdAt", ">=", Timestamp.fromMillis(sessionStartMs)), orderBy("createdAt", "desc")),
-      (snapshot) => setTodayRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).filter((record) => record.source !== "vip")),
+      (snapshot) => setTodayRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).filter(isPurchaseRecord)),
       (error) => console.error("Monitor records listener failed.", error),
   ), [sessionStartMs]);
 
@@ -8240,6 +8463,7 @@ function LiveDrawAdminPanel({ profile }) {
         ...ADMIN_SECTIONS.filter((section) => !["analytics", "rooms", "create-room"].includes(section.id)),
         { id: "affiliate", label: "Affiliate", eyebrow: "Affiliate program", icon: UserRoundPlus },
         { id: "support", label: "客服訊息", eyebrow: "Support inbox", icon: Headphones },
+        { id: "members", label: "會員調整", eyebrow: "Member adjustments", icon: UserRoundPlus },
         { id: "audit", label: "審計紀錄", eyebrow: "Audit trail", icon: Shield },
         BETA_PAYMENT_SECTION,
       ]
@@ -8500,6 +8724,11 @@ function LiveDrawAdminPanel({ profile }) {
       {isBeta && activeAdminSection === "support" && (
         <div className="admin-section narrow-admin-section">
           <SupportInbox />
+        </div>
+      )}
+      {isBeta && activeAdminSection === "members" && (
+        <div className="admin-section narrow-admin-section">
+          <AdminMemberAdjustments cards={cards} />
         </div>
       )}
       {isBeta && activeAdminSection === "affiliate" && (
@@ -13914,7 +14143,13 @@ function getBetaCollectionStatusLabel(status) {
   }[status] || "待處理";
 }
 
+// VIP rewards and cards given in 會員調整 are not purchases.
+function isPurchaseRecord(record) {
+  return record?.source !== "vip" && record?.source !== "admin";
+}
+
 function getBetaCollectionRecordStatus(record) {
+  if (record?.collectionStatus === "void") return "void";
   if (record?.convertedToTokens || record?.collectionStatus === "converted") return "converted";
   if (getDeliveryStage(record) === "delivered") return "shipped";
   if (["shipping", "shipped"].includes(record?.collectionStatus)) return "shipping";
@@ -13940,6 +14175,7 @@ function getDeliveryStage(record) {
 }
 
 function getCollectionDeliveryLabel(record) {
+  if (record?.collectionStatus === "void") return "已作廢";
   if (record?.convertedToTokens || record?.collectionStatus === "converted") return "已轉回代幣";
   const deliveryStage = getDeliveryStage(record);
   if (deliveryStage === "delivered") return "已配送";

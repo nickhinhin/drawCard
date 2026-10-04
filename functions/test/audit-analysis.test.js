@@ -93,3 +93,16 @@ test("a later signup gift is not unexplained, but a larger gain with it still is
   } })]);
   assert.ok(tooMuch.includes("unexplained-tokens"));
 });
+
+test("會員調整 changes are reported as admin adjustments, not unexplained tokens", () => {
+  const rules = (changes, operation = "update", collection = "users") => rulesOf([entry({ collection, path: `${collection}/x`, operation, changes })]);
+  const small = rules({ tokens: { before: 100, after: 600 }, lastAdminAdjustmentId: { before: null, after: "a1" } });
+  assert.ok(small.includes("admin-adjustment") && !small.includes("unexplained-tokens"));
+  const findings = analyzeAuditEntries([entry({ collection: "users", path: "users/x", changes: { tokens: { before: 0, after: 50000 }, lastAdminAdjustmentId: { before: null, after: "a2" } } })]).findings;
+  assert.equal(findings.find((item) => item.rule === "admin-adjustment").severity, "high");
+  // A player cannot pass as an admin adjustment.
+  const fromPlayer = rulesOf([entry({ collection: "users", path: "users/x", ...player("x"), changes: { tokens: { before: 0, after: 500 }, lastAdminAdjustmentId: { before: null, after: "a3" } } })]);
+  assert.ok(fromPlayer.includes("unexplained-tokens"));
+  assert.ok(rules({ source: { before: null, after: "admin" }, cardId: { before: null, after: "c1" } }, "create", "drawRecords").includes("admin-card-gift"));
+  assert.ok(rules({ collectionStatus: { before: "pending", after: "void" } }, "update", "drawRecords").includes("admin-card-void"));
+});

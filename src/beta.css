@@ -6807,3 +6807,25 @@
 .beta-mode .monitor-slow-mode { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; margin: 14px 0; padding: 12px 14px; border: 1px solid var(--beta-line); border-radius: 4px; }
 .beta-mode .monitor-slow-mode p { display: grid; gap: 4px; margin: 0; }
 .beta-mode .monitor-slow-mode small { color: #b9b9c2; }
+
+/* 會員調整 (admin member adjustments). */
+.beta-mode .member-adjust-panel h3 { margin: 22px 0 10px; font-size: 16px; }
+.beta-mode .member-adjust-search { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.beta-mode .member-adjust-search input { flex: 1 1 240px; min-height: 42px; padding: 0 12px; border: 1px solid #3a3a42; border-radius: 3px; background: #0b0b0f; color: #fff; font: inherit; }
+.beta-mode .member-adjust-profile { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; margin-top: 16px; padding: 14px; border: 1px solid var(--beta-line); border-radius: 4px; }
+.beta-mode .member-adjust-profile div { display: grid; gap: 4px; }
+.beta-mode .member-adjust-profile small { color: #b9b9c2; word-break: break-all; }
+.beta-mode .member-adjust-profile strong { font-size: 18px; }
+.beta-mode .member-adjust-forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-top: 16px; }
+.beta-mode .member-adjust-forms form { display: grid; gap: 10px; align-content: start; padding: 14px; border: 1px solid var(--beta-line); border-radius: 4px; }
+.beta-mode .member-adjust-forms h3 { margin: 0; }
+.beta-mode .member-adjust-forms .primary-btn { justify-self: start; }
+.beta-mode .member-adjust-card-list { display: grid; max-height: 220px; overflow-y: auto; border: 1px solid #3a3a42; border-radius: 3px; }
+.beta-mode .member-adjust-card-list button { padding: 8px 10px; border: 0; border-bottom: 1px solid #26262c; background: #0b0b0f; color: #fff; text-align: left; font: inherit; cursor: pointer; }
+.beta-mode .member-adjust-card-list button:hover { background: #1b1418; }
+.beta-mode .member-adjust-cards { display: grid; gap: 6px; }
+.beta-mode .member-adjust-cards > div { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; padding: 8px 10px; border: 1px solid var(--beta-line); border-radius: 3px; }
+.beta-mode .member-adjust-cards > div.voided { opacity: .5; }
+.beta-mode .member-adjust-cards span { display: grid; gap: 2px; }
+.beta-mode .member-adjust-cards small { color: #b9b9c2; }
+.beta-mode .member-adjust-cards em { font-style: normal; font-size: 13px; color: #d0d0d6; }

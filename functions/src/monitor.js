@@ -153,7 +153,8 @@ const toMs = (value) => (typeof value?.toMillis === "function" ? value.toMillis(
 
 // Summary of one monitored live session, computed when the admin stops monitoring.
 export function buildMonitorReport({ startMs, endMs, records = [], requests = [], shipping = 0 }) {
-  const purchases = records.filter((record) => record.source !== "vip");
+  // VIP rewards and admin gifts are not purchases.
+  const purchases = records.filter((record) => record.source !== "vip" && record.source !== "admin");
   const buyers = new Map();
   const rounds = new Map();
   const minutes = new Map();
