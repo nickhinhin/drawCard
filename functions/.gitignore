@@ -1,0 +1,2 @@
+# Local secrets for the emulator only (never real values).
+.secret.local

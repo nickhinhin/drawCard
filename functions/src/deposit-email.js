@@ -69,6 +69,12 @@ export const emailNewDepositRequest = onDocumentCreated({
   const createdAt = event.time ? new Date(event.time) : new Date();
   const email = buildDepositEmail(event.params.requestId, event.data?.data(), createdAt);
   if (!email) return;
+  // The emulator can read the real secret from Secret Manager; never send real mail
+  // while testing.
+  if (process.env.FUNCTIONS_EMULATOR === "true") {
+    logger.info("Emulator: deposit email not sent.", { requestId: event.params.requestId, subject: email.subject });
+    return;
+  }
   const transport = nodemailer.createTransport({
     service: "gmail",
     auth: { user: DEPOSIT_EMAIL_ADDRESS, pass: GMAIL_APP_PASSWORD.value() },
