@@ -216,49 +216,7 @@ service cloud.firestore {
         && request.resource.data.updatedAt == request.time;
     }
 
-    // Approval and credit are reciprocal, single-use transitions after manual review.
-    function isAdminTokenGrant(uid) {
-      let requestId = request.resource.data.lastTokenGrantRequestId;
-      let before = get(tokenRequestPath(requestId)).data;
-      let after = getAfter(tokenRequestPath(requestId)).data;
-      return isAdmin()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          "tokens", "updatedAt", "lastTokenGrantRequestId", "totalDeposits", "vipLevel", "lastVipRewardTier",
-          "pendingTokenRequestCount", "lastTokenRequestClosedId"
-        ])
-        && before.status == "pending" && before.uid == uid
-        && (before.proofMode == "promo" || validTokenPricing(before))
-        && validManualReview(requestId, before, after)
-        && after.status == "approved" && after.reviewedBy == request.auth.uid
-        && request.resource.data.tokens == resource.data.tokens + before.amount
-        && request.resource.data.totalDeposits == resource.data.get("totalDeposits", 0) + after.verifiedHkdAmount
-        && request.resource.data.vipLevel is int
-        && request.resource.data.vipLevel >= -1 && request.resource.data.vipLevel <= 7
-        && (
-          before.get("quotaVersion", 0) != 1
-          || (request.resource.data.lastTokenRequestClosedId == requestId
-            && resource.data.get("pendingTokenRequestCount", 1) > 0
-            && request.resource.data.pendingTokenRequestCount == resource.data.get("pendingTokenRequestCount", 1) - 1)
-        );
-    }
 
-    function isAdminTokenRequestClose(uid) {
-      let requestId = request.resource.data.lastTokenRequestClosedId;
-      let before = get(tokenRequestPath(requestId)).data;
-      let after = getAfter(tokenRequestPath(requestId)).data;
-      return isAdmin()
-        && before.uid == uid
-        && before.quotaVersion == 1
-        && before.status in ["awaiting_upload", "pending"]
-        && after.status == "rejected"
-        && after.reviewedBy == request.auth.uid
-        && after.reviewedAt == request.time
-        && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["pendingTokenRequestCount", "lastTokenRequestClosedId", "updatedAt"])
-        && resource.data.get("pendingTokenRequestCount", 1) > 0
-        && request.resource.data.pendingTokenRequestCount == resource.data.get("pendingTokenRequestCount", 1) - 1
-        && request.resource.data.updatedAt == request.time;
-    }
 
     function chatCooldownPassed(seconds) {
       return !("lastChatAt" in userDoc(request.auth.uid).data)
@@ -440,6 +398,9 @@ service cloud.firestore {
         && data.roundSort is int
         && data.roundSort >= 0
         && data.roundSort <= 100000
+        // The sort key must be the round's own number (round-007 → 7) so a record
+        // cannot be listed under another round in admin views.
+        && data.roundSort == int(data.round.split("-")[1])
         && data.createdAt == request.time;
     }
 
@@ -604,31 +565,6 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time;
     }
 
-    // Preset rates come from protected settings; custom rates use the published tiers.
-    function validTokenPricing(data) {
-      let settingsPath = /databases/$(database)/documents/settings/tokenPackages;
-      let settings = exists(settingsPath) ? get(settingsPath).data : {};
-      let packages = settings.get("packages", [
-        {"hkd": 500, "tokens": 525}, {"hkd": 1000, "tokens": 1050},
-        {"hkd": 3000, "tokens": 3240}, {"hkd": 10000, "tokens": 11000},
-        {"hkd": 30000, "tokens": 35100}
-      ]);
-      let rateVersion = settings.get("rateVersion", exists(settingsPath) ? 1 : 2);
-      let rate = data.hkdAmount >= 30000 ? 1.17 : data.hkdAmount >= 10000 ? 1.1 : data.hkdAmount >= 3000 ? 1.08 : data.hkdAmount >= 500 ? 1.05 : 1.0;
-      return data.hkdAmount is int && data.hkdAmount >= 100 && data.hkdAmount <= 1000000
-        && data.amount is int && data.amount > 0 && data.amount <= 1000000
-        && data.exchangeRate == float(data.amount) / data.hkdAmount
-        && (
-          (data.packageType == "custom" && data.amount == math.floor(data.hkdAmount * rate))
-          || (data.packageType == "preset" && (
-            (rateVersion >= 2 && {"hkd": data.hkdAmount, "tokens": data.amount} in packages)
-            || (rateVersion < 2 && (
-              {"hkd": data.hkdAmount, "tokens": data.amount * 2} in packages
-              || {"hkd": data.hkdAmount, "tokens": data.amount * 2 - 1} in packages
-            ))
-          ))
-        );
-    }
 
     function isValidPromoRequest(data, requestId) {
       let codeId = data.promoCodeId;
@@ -682,24 +618,6 @@ service cloud.firestore {
         && pendingRequest.amount == data.amount;
     }
 
-    // A reviewed promotion is a grant, not a bank deposit or VIP deposit credit.
-    function validManualReview(requestId, before, after) {
-      let codePath = promoCodePath(before.get("promoCodeId", "invalid"));
-      let redemptionPath = promoRedemptionPath(before.get("promoCodeId", "invalid") + "_" + before.uid);
-      let promotion = exists(codePath) ? get(codePath).data : {};
-      let redemption = exists(redemptionPath) ? get(redemptionPath).data : {};
-      return (before.proofMode == "storage" && after.verifiedHkdAmount == before.hkdAmount)
-        || (before.proofMode == "promo" && before.promoCode is string
-          && before.promoCode.size() > 0 && after.promoReviewed == true
-          && after.verifiedHkdAmount == 0
-          && exists(promoCodePath(before.promoCodeId))
-          && promotion.active == true
-          && promotion.code == before.promoCode
-          && promotion.amount == before.amount
-          && exists(promoRedemptionPath(before.promoCodeId + "_" + before.uid))
-          && redemption.requestId == requestId
-          && redemption.amount == before.amount);
-    }
 
     function isValidTokenRequestCreate(requestId) {
       return signedIn()
@@ -752,30 +670,6 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time;
     }
 
-    function isValidTokenRequestReview(requestId) {
-      return isAdmin()
-        && resource.data.status in ["awaiting_upload", "pending"]
-        && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(["status", "adminNote", "reviewedAt", "reviewedBy", "verifiedHkdAmount", "promoReviewed"])
-        && request.resource.data.status in ["approved", "rejected"]
-        && request.resource.data.reviewedAt == request.time
-        && (
-          resource.data.get("quotaVersion", 0) != 1
-          || (afterUserDoc(resource.data.uid).data.lastTokenRequestClosedId == requestId
-            && userDoc(resource.data.uid).data.get("pendingTokenRequestCount", 1) > 0
-            && afterUserDoc(resource.data.uid).data.pendingTokenRequestCount == userDoc(resource.data.uid).data.get("pendingTokenRequestCount", 1) - 1)
-        )
-        && (request.resource.data.status == "rejected" || (
-            resource.data.status == "pending"
-            && (resource.data.proofMode == "promo" || validTokenPricing(resource.data))
-            && validManualReview(requestId, resource.data, request.resource.data)
-            && afterUserDoc(resource.data.uid).data.lastTokenGrantRequestId == requestId
-            && afterUserDoc(resource.data.uid).data.tokens == userDoc(resource.data.uid).data.tokens + resource.data.amount
-          ))
-        && request.resource.data.reviewedBy == request.auth.uid
-        && request.resource.data.adminNote is string
-        && request.resource.data.adminNote.size() <= 500;
-    }
 
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();

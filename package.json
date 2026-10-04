@@ -12,7 +12,7 @@
     "deploy:admin": "npm run build:admin && firebase deploy --config firebase.beta-hosting.json --project livedraw-7e3c2 --only hosting:livedraw-adminpage-7e3c2",
     "preview": "vite preview",
     "lint": "eslint .",
-    "test:security": "firebase emulators:exec --project livedraw-7e3c2 --only auth,firestore,storage \"node scripts/verify-permissions.mjs && node scripts/verify-token-spend-attacks.mjs\" && firebase emulators:exec --project livedraw-7e3c2 --only auth,firestore,functions \"node scripts/verify-callables.mjs\" && firebase emulators:exec --project livedraw-7e3c2 --only auth,database \"node scripts/verify-presence-rules.mjs\" && firebase emulators:exec --config firebase.security-audit.json --project demo-drawcard-security --only auth,firestore \"node scripts/security-audit.mjs\" && npm --prefix functions test && node --test src/liveAudience.test.js"
+    "test:security": "firebase emulators:exec --project livedraw-7e3c2 --only auth,firestore,storage,functions \"node scripts/verify-permissions.mjs && node scripts/verify-token-spend-attacks.mjs && node scripts/verify-callables.mjs && node scripts/verify-callables-flows.mjs && node scripts/verify-rules-matrix.mjs && node scripts/verify-rules-tamper.mjs && REVERSE=1 node scripts/verify-rules-tamper.mjs\" && firebase emulators:exec --project livedraw-7e3c2 --only auth,database \"node scripts/verify-presence-rules.mjs\" && firebase emulators:exec --config firebase.security-audit.json --project demo-drawcard-security --only auth,firestore \"node scripts/security-audit.mjs\" && npm --prefix functions test && node --test src/liveAudience.test.js"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.4",
