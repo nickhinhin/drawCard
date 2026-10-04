@@ -792,6 +792,7 @@ export const adminWrite = onCall(adminCallableOptions, async (request) => {
     const before = snapshot.exists ? snapshot.data() : null;
     if (mode === "create" && snapshot.exists) throw new HttpsError("already-exists", "文件已存在。");
     if (mode === "update" && !snapshot.exists) throw new HttpsError("not-found", "文件不存在。");
+    if (mode !== "delete") assertShippableUpdate(collectionName, before, data);
 
     if (mode === "delete") transaction.delete(ref);
     else {
@@ -900,6 +901,7 @@ export const adminBatchWrite = onCall(adminCallableOptions, async (request) => {
       if (operation.mode === "delete") {
         transaction.delete(operation.ref);
       } else {
+        assertShippableUpdate(operation.collectionName, before, decodeAdminValue(operation.data));
         const fields = {
           ...decodeAdminValue(operation.data),
           ...stampFields(operation),
@@ -1133,6 +1135,22 @@ export const adminAdjustMember = onCall(adminCallableOptions, async (request) =>
   throw new HttpsError("invalid-argument", "操作不正確。");
 });
 
+// Converted or voided cards can never go out for delivery: the player already got the
+// tokens back, or the card was taken away in 會員調整. Checked on every admin path that
+// can move a card into shipping (adminSetShippingStatus, adminWrite, adminBatchWrite).
+export function isClosedCardRecord(record) {
+  return Boolean(record?.convertedToTokens) || ["converted", "void"].includes(record?.collectionStatus);
+}
+
+export function assertShippableUpdate(collectionName, before, data) {
+  if (collectionName !== "drawRecords" || !before || !data) return;
+  const movesToShipping = ["shipping", "shipped"].includes(data.collectionStatus)
+    || data.deliveryStatus !== undefined || data.shippingRequested === true;
+  if (movesToShipping && isClosedCardRecord(before)) {
+    throw new HttpsError("failed-precondition", "此卡牌已作廢或已兌換代幣，不可配送。");
+  }
+}
+
 export const adminSetShippingStatus = onCall(adminCallableOptions, async (request) => {
   const actor = assertAdmin(request);
   const recordId = assertIdentifier(request.data?.recordId, "卡牌紀錄 ID");
@@ -1146,6 +1164,7 @@ export const adminSetShippingStatus = onCall(adminCallableOptions, async (reques
     const snapshot = await transaction.get(ref);
     if (!snapshot.exists) throw new HttpsError("not-found", "找不到卡牌紀錄。");
     const before = snapshot.data();
+    if (isClosedCardRecord(before)) throw new HttpsError("failed-precondition", "此卡牌已作廢或已兌換代幣，不可配送。");
     const update = deliveryStatus === "delivered" ? {
       collectionStatus: "shipped", deliveryStatus, deliveredAt: FieldValue.serverTimestamp(),
     } : deliveryStatus === "in_transit" ? {
