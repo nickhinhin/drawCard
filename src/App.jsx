@@ -552,6 +552,7 @@ function App() {
   const [authNotice, setAuthNotice] = useState("");
   const [authInitialAction, setAuthInitialAction] = useState("");
   const [signupPromoOpen, setSignupPromoOpen] = useState(false);
+  const signupGift = useSignupGift();
   const [welcomeBonus, setWelcomeBonus] = useState(0);
   // Google sign-ups get the gift later, after verifying a phone on the account page.
   const [phoneGiftOffer, setPhoneGiftOffer] = useState(false);
@@ -1054,16 +1055,17 @@ function App() {
           onClose={() => { setAuthDialogOpen(false); setAuthNotice(""); setAuthInitialAction(""); }}
           onGoogleLogin={handleLogin}
           signingIn={signingIn}
+          signupGift={signupGift}
         />
       )}
-      {signupPromoOpen && !signedIn && !authDialogOpen && (
+      {signupPromoOpen && signupGift > 0 && !signedIn && !authDialogOpen && (
         <GiftModal
-          title="新會員送 50 代幣"
-          body="以手機號碼註冊並完成短訊驗證，即送 50 代幣，可立即用於直播抽卡。每個手機號碼只可領取一次。"
+          title={`新會員送 ${formatTokenNumber(signupGift)} 代幣`}
+          body={`以手機號碼註冊並完成短訊驗證，即送 ${formatTokenNumber(signupGift)} 代幣，可立即用於直播抽卡。每個手機號碼只可領取一次。`}
           actionLabel="立即註冊"
           onAction={() => {
             setSignupPromoOpen(false);
-            setAuthNotice("以手機號碼註冊並完成短訊驗證，即送 50 代幣。");
+            setAuthNotice(`以手機號碼註冊並完成短訊驗證，即送 ${formatTokenNumber(signupGift)} 代幣。`);
             setAuthInitialAction("register");
             setAuthDialogOpen(true);
           }}
@@ -1079,10 +1081,10 @@ function App() {
           onClose={() => setWelcomeBonus(0)}
         />
       )}
-      {phoneGiftOffer && welcomeBonus === 0 && (
+      {phoneGiftOffer && signupGift > 0 && welcomeBonus === 0 && (
         <GiftModal
-          title="驗證手機號碼送 50 代幣"
-          body="為帳戶完成手機號碼短訊驗證，即送 50 代幣新會員禮物。每個手機號碼只可領取一次。"
+          title={`驗證手機號碼送 ${formatTokenNumber(signupGift)} 代幣`}
+          body={`為帳戶完成手機號碼短訊驗證，即送 ${formatTokenNumber(signupGift)} 代幣新會員禮物。每個手機號碼只可領取一次。`}
           actionLabel="立即驗證"
           onAction={() => { setPhoneGiftOffer(false); setActiveTab("account"); }}
           onClose={() => setPhoneGiftOffer(false)}
@@ -1390,7 +1392,7 @@ function WelcomePanel({ authError, onGoogleLogin, onPhoneLogin, signingIn }) {
   );
 }
 
-function AuthDialog({ authError, isBeta = false, notice = "", initialAction = "", onClose, onGoogleLogin, signingIn }) {
+function AuthDialog({ authError, isBeta = false, notice = "", initialAction = "", onClose, onGoogleLogin, signingIn, signupGift = 0 }) {
   const [accountAction, setAccountAction] = useState(isBeta ? initialAction : "login");
   // Phone users sign in with a password. SMS is only for registration and "forgot password".
   const [useSmsLogin, setUseSmsLogin] = useState(false);
@@ -1607,7 +1609,7 @@ function AuthDialog({ authError, isBeta = false, notice = "", initialAction = ""
             <div className="auth-method-grid">
               <button className="auth-choice-card primary" type="button" onClick={() => setAuthMethod("phone")}>
                 <Smartphone size={24} />
-                <span><strong>手機號碼</strong><small>{isRegistration ? "使用 SMS 驗證碼註冊，送 50 代幣" : "手機號碼 + 密碼"}</small></span>
+                <span><strong>手機號碼</strong><small>{isRegistration ? `使用 SMS 驗證碼註冊${signupGift > 0 ? `，送 ${formatTokenNumber(signupGift)} 代幣` : ""}` : "手機號碼 + 密碼"}</small></span>
               </button>
               <button className="auth-choice-card" type="button" onClick={continueWithGoogle} disabled={signingIn}>
                 <LogIn size={24} />
@@ -1950,6 +1952,8 @@ function BetaAccountSettings({ authUser, profile }) {
 // Members who signed up without a phone (Google) verify one by SMS to receive the
 // signup gift. The server checks Firebase Auth's verified number, once per number.
 function PhoneGiftCard({ authUser, profile }) {
+  const signupGift = useSignupGift();
+  const [claimedTokens, setClaimedTokens] = useState(0);
   const [phoneCountry, setPhoneCountry] = useState("+852");
   const [phoneNumber, setPhoneNumber] = useState("");
   const [code, setCode] = useState("");
@@ -1966,7 +1970,8 @@ function PhoneGiftCard({ authUser, profile }) {
   async function claimGift() {
     // A fresh ID token carries the newly linked phone_number claim.
     await authUser.getIdToken(true);
-    await httpsCallable(functions, "claimSignupBonus")();
+    const { data } = await httpsCallable(functions, "claimSignupBonus")();
+    setClaimedTokens(Number(data?.signupBonusTokens || 0));
     setDone(true);
   }
 
@@ -2016,23 +2021,23 @@ function PhoneGiftCard({ authUser, profile }) {
   }
 
   // Members who already have the gift see nothing; one who just claimed sees the success note.
-  if (!done && Number(profile?.signupBonusTokens || 0) > 0) return null;
+  if (!done && (Number(profile?.signupBonusTokens || 0) > 0 || signupGift === 0)) return null;
   // Same cut-off as the server: members who joined before the gift existed are not eligible.
   if (!done && toMillis(profile?.createdAt) < Date.parse("2026-09-30T15:00:00Z")) return null;
   if (done) {
-    return <div className="phone-gift-card done"><Gift size={22} /><p><strong>已領取 50 代幣！</strong>新會員禮物已存入你的帳戶。</p></div>;
+    return <div className="phone-gift-card done"><Gift size={22} /><p><strong>已領取 {formatTokenNumber(claimedTokens)} 代幣！</strong>新會員禮物已存入你的帳戶。</p></div>;
   }
   return (
     <div className="phone-gift-card">
       <div className="phone-gift-heading">
         <Gift size={22} />
         <div>
-          <strong>驗證手機號碼，領取 50 代幣</strong>
+          <strong>驗證手機號碼，領取 {formatTokenNumber(signupGift)} 代幣</strong>
           <small>完成短訊驗證即送新會員禮物，每個手機號碼只可領取一次。</small>
         </div>
       </div>
       {linkedPhone ? (
-        <button className="primary-btn" type="button" onClick={retryClaim} disabled={busy}>{busy ? "領取中..." : `以 ${linkedPhone} 領取 50 代幣`}</button>
+        <button className="primary-btn" type="button" onClick={retryClaim} disabled={busy}>{busy ? "領取中..." : `以 ${linkedPhone} 領取 ${formatTokenNumber(signupGift)} 代幣`}</button>
       ) : confirmation ? (
         <form onSubmit={confirmCode}>
           <label className="field"><span>短訊驗證碼</span>
@@ -7204,6 +7209,8 @@ function AdminMemberAdjustments({ cards }) {
   const [giftCardId, setGiftCardId] = useState("");
   const [giftReason, setGiftReason] = useState("");
   const [busy, setBusy] = useState("");
+  const signupGift = useSignupGift();
+  const [giftDraft, setGiftDraft] = useState("");
 
   useEffect(() => {
     setMember(null);
@@ -7293,6 +7300,25 @@ function AdminMemberAdjustments({ cards }) {
     await adjust({ action: "voidCard", recordId: record.id, reason: reason.trim() }, `確認作廢「${record.cardName || record.cardId}」？此操作不可復原。`);
   }
 
+  async function saveSignupGift(event) {
+    event.preventDefault();
+    const tokens = Number(giftDraft);
+    if (!Number.isSafeInteger(tokens) || tokens < 0 || tokens > 10000) {
+      alert("請輸入 0 至 10,000 的整數。0 代表停用新會員禮物。");
+      return;
+    }
+    if (!window.confirm(tokens === 0 ? "確認停用新會員禮物？" : `確認每個已驗證手機號碼的新會員禮物改為 ${formatTokenNumber(tokens)} 代幣？`)) return;
+    setBusy("signupGift");
+    try {
+      await adminSetDoc(doc(db, "publicSiteSettings", "signupBonus"), { tokens, updatedAt: serverTimestamp() }, { merge: true });
+      setGiftDraft("");
+    } catch (error) {
+      showSafeError(error, "未能更新新會員禮物。");
+    } finally {
+      setBusy("");
+    }
+  }
+
   const cardMatches = cardSearch.trim()
     ? cards.filter((card) => String(card.name || "").toLowerCase().includes(cardSearch.trim().toLowerCase())).slice(0, 30)
     : [];
@@ -7306,6 +7332,14 @@ function AdminMemberAdjustments({ cards }) {
           <p className="muted">增減會員代幣、送卡或作廢卡牌。每項修改都必須填寫原因，並會記錄於下方修改紀錄及審計紀錄。不可調整自己的帳戶。</p>
         </div>
       </div>
+      <form className="member-adjust-gift" onSubmit={saveSignupGift}>
+        <div>
+          <strong>新會員禮物：{signupGift > 0 ? `每個已驗證手機號碼送 ${formatTokenNumber(signupGift)} 代幣` : "已停用"}</strong>
+          <small>以手機號碼註冊，或 Google 會員驗證手機後領取；每個號碼只可領取一次。設為 0 即停用。</small>
+        </div>
+        <input type="number" min="0" max="10000" step="1" value={giftDraft} onChange={(event) => setGiftDraft(event.target.value)} placeholder={String(signupGift)} aria-label="新會員禮物代幣數量" />
+        <button className="small-btn" type="submit" disabled={busy === "signupGift" || giftDraft === ""}>{busy === "signupGift" ? "儲存中..." : "儲存"}</button>
+      </form>
       <form className="member-adjust-search" onSubmit={lookUp}>
         <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="玩家名稱、手機號碼或會員 ID" aria-label="搜尋會員" />
         <button className="small-btn" type="submit" disabled={searching || !search.trim()}><Search size={15} />{searching ? "搜尋中..." : "搜尋"}</button>
@@ -14141,6 +14175,23 @@ function getBetaCollectionStatusLabel(status) {
     shipped: "已配送",
     converted: "已轉代幣次數",
   }[status] || "待處理";
+}
+
+// Signup gift for a verified phone number, set by admins in 會員調整
+// (publicSiteSettings/signupBonus.tokens; 0 = no gift). 50 until an admin sets it.
+const DEFAULT_SIGNUP_GIFT = 50;
+function readSignupGift(data) {
+  const tokens = data ? Number(data.tokens) : DEFAULT_SIGNUP_GIFT;
+  return Number.isSafeInteger(tokens) && tokens >= 0 && tokens <= 10000 ? tokens : DEFAULT_SIGNUP_GIFT;
+}
+function useSignupGift() {
+  const [tokens, setTokens] = useState(DEFAULT_SIGNUP_GIFT);
+  useEffect(() => onSnapshot(
+    doc(db, "publicSiteSettings", "signupBonus"),
+    (snapshot) => setTokens(readSignupGift(snapshot.exists() ? snapshot.data() : null)),
+    () => setTokens(DEFAULT_SIGNUP_GIFT),
+  ), []);
+  return tokens;
 }
 
 // VIP rewards and cards given in 會員調整 are not purchases.

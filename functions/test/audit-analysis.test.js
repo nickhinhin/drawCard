@@ -74,13 +74,19 @@ test("players with authType unknown are not flagged, and a cleared result side i
   assert.ok(analyzeAuditEntries([cleared]).findings.some((item) => item.rule === "result-tampering"));
 });
 
-test("signup gift: normal new account is fine, extra starting tokens are flagged", () => {
-  assert.deepEqual(rulesOf([
-    entry({ collection: "users", path: "users/n1", operation: "create", changes: { tokens: { before: null, after: 50 } } }),
-  ]), []);
-  assert.ok(rulesOf([
-    entry({ collection: "users", path: "users/n2", operation: "create", changes: { tokens: { before: null, after: 5000 } } }),
-  ]).includes("signup-tokens"));
+test("signup gift: a new account may start with exactly its recorded gift", () => {
+  const created = (tokens, gift) => rulesOf([entry({ collection: "users", path: "users/n", operation: "create", changes: {
+    tokens: { before: null, after: tokens }, ...(gift === undefined ? {} : { signupBonusTokens: { before: null, after: gift } }),
+  } })]);
+  assert.deepEqual(created(80, 80), []); // admin set the gift to 80
+  assert.deepEqual(created(0), []); // Google sign-up, no gift
+  assert.ok(created(5000, 50).includes("signup-tokens"));
+  assert.ok(created(50).includes("signup-tokens")); // tokens without a recorded gift
+});
+
+test("changing the signup gift amount is reported", () => {
+  const rules = rulesOf([entry({ collection: "publicSiteSettings", path: "publicSiteSettings/signupBonus", changes: { tokens: { before: 50, after: 5000 } } })]);
+  assert.ok(rules.includes("signup-gift-setting"));
 });
 
 test("a later signup gift is not unexplained, but a larger gain with it still is", () => {

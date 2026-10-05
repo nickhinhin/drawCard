@@ -388,6 +388,36 @@ const auditLogs = (await fetch(`${FS}/adminAuditLogs?pageSize=1`, { headers: own
 if (auditLogs[0]) await fetch(`${FS.replace(/\/documents$/, "")}/documents/${auditLogs[0].name.split("/documents/")[1]}`, { method: "DELETE", headers: owner });
 check("audit: an admin audit log exists to delete", auditLogs.length === 1);
 
+// ======================= signup gift amount set by admins =======================
+async function phoneUser(number, linkToToken) {
+  const { sessionInfo } = await post(`${ID}/accounts:sendVerificationCode?key=x`, { phoneNumber: number, recaptchaToken: "x" });
+  const codes = await fetch(`${AUTH}/emulator/v1/projects/${P}/verificationCodes`).then((r) => r.json());
+  const code = codes.verificationCodes.filter((item) => item.phoneNumber === number).at(-1).code;
+  const login = await post(`${ID}/accounts:signInWithPhoneNumber?key=x`, { sessionInfo, code, ...(linkToToken ? { idToken: linkToToken } : {}) });
+  return { token: login.idToken, uid: login.localId };
+}
+const newNumber = () => `+8526${String(Date.now() + (counter += 1)).slice(-7)}`;
+const setGift = (tokens) => adminCall("adminWrite", { collection: "publicSiteSettings", documentId: "signupBonus", mode: "upsert", data: { tokens } });
+for (const bad of [-1, 20000, 1.5, "80"]) expect(`gift setting: ${JSON.stringify(bad)} refused`, await setGift(bad), "INVALID_ARGUMENT");
+expect("gift setting: set to 80", await setGift(80), "OK");
+const phone80 = await phoneUser(newNumber());
+const account80 = await call("ensureAffiliateAccount", { ageConfirmed: true }, phone80.token);
+check("gift setting: phone sign-up gets 80", account80.data?.signupBonusTokens === 80 && (await read(`users/${phone80.uid}`))?.tokens === 80, JSON.stringify(account80.data));
+const g80 = await google(unique("g80"), `${unique("g80")}@example.test`);
+await call("ensureAffiliateAccount", { ageConfirmed: true }, g80.token);
+const g80linked = await phoneUser(newNumber(), g80.token);
+const claim80 = expect("gift setting: Google member claims after linking a phone", await call("claimSignupBonus", {}, g80linked.token), "OK");
+check("gift setting: claim gives 80", claim80.data?.signupBonusTokens === 80 && (await read(`users/${g80.uid}`))?.tokens === 80, JSON.stringify(claim80.data));
+expect("gift setting: switch the gift off (0)", await setGift(0), "OK");
+const phone0 = await phoneUser(newNumber());
+const account0 = await call("ensureAffiliateAccount", { ageConfirmed: true }, phone0.token);
+check("gift setting: no gift while switched off", account0.data?.signupBonusTokens === 0 && ((await read(`users/${phone0.uid}`))?.tokens || 0) === 0, JSON.stringify(account0.data));
+const g0 = await google(unique("g0"), `${unique("g0")}@example.test`);
+await call("ensureAffiliateAccount", { ageConfirmed: true }, g0.token);
+const g0linked = await phoneUser(newNumber(), g0.token);
+expect("gift setting: claim while switched off", await call("claimSignupBonus", {}, g0linked.token), "FAILED_PRECONDITION");
+expect("gift setting: back to 50", await setGift(50), "OK");
+
 const failed = results.filter((line) => !line.startsWith("PASS"));
 console.log(failed.length ? failed.join("\n") : "");
 console.log(`SUMMARY ${results.length - failed.length}/${results.length} passed`);

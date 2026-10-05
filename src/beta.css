@@ -6829,3 +6829,9 @@
 .beta-mode .member-adjust-cards span { display: grid; gap: 2px; }
 .beta-mode .member-adjust-cards small { color: #b9b9c2; }
 .beta-mode .member-adjust-cards em { font-style: normal; font-size: 13px; color: #d0d0d6; }
+
+/* 會員調整: signup gift amount. */
+.beta-mode .member-adjust-gift { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; padding: 12px 14px; border: 1px solid var(--beta-red); border-radius: 4px; background: #1b1418; }
+.beta-mode .member-adjust-gift > div { display: grid; gap: 4px; flex: 1 1 260px; }
+.beta-mode .member-adjust-gift small { color: #b9b9c2; }
+.beta-mode .member-adjust-gift input { width: 120px; min-height: 40px; padding: 0 10px; border: 1px solid #3a3a42; border-radius: 3px; background: #0b0b0f; color: #fff; font: inherit; }

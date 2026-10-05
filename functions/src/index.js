@@ -64,8 +64,16 @@ const tokenProofCallableOptions = {
   memory: "256MiB",
 };
 const AFFILIATE_CODE_PATTERN = /^AFF[A-F0-9]{20}$/;
-// Tokens given once to every new member account (see ensureAffiliateAccount).
-const SIGNUP_BONUS_TOKENS = 50;
+// Signup gift for a verified phone number. Admins set the amount in 會員調整
+// (publicSiteSettings/signupBonus.tokens, 0 switches the gift off); 50 until it is set.
+const DEFAULT_SIGNUP_BONUS_TOKENS = 50;
+const MAX_SIGNUP_BONUS_TOKENS = 10000;
+const signupBonusSettingsRef = () => db.collection("publicSiteSettings").doc("signupBonus");
+
+export function signupBonusAmount(settings) {
+  const tokens = settings ? Number(settings.tokens) : DEFAULT_SIGNUP_BONUS_TOKENS;
+  return Number.isSafeInteger(tokens) && tokens >= 0 && tokens <= MAX_SIGNUP_BONUS_TOKENS ? tokens : DEFAULT_SIGNUP_BONUS_TOKENS;
+}
 // Members who joined before the gift existed (launched 30/9/2026 23:14 HKT) cannot claim it later.
 const SIGNUP_BONUS_START_MS = Date.parse("2026-09-30T15:00:00Z");
 
@@ -167,6 +175,10 @@ function validateAdminWrite(collectionName, documentId, data) {
   if (collectionName === "draws" && data.status !== undefined
       && !["draft", "scheduled", "live", "completed", "cancelled"].includes(data.status)) {
     throw new HttpsError("invalid-argument", "直播狀態無效。");
+  }
+  if (collectionName === "publicSiteSettings" && documentId === "signupBonus" && data.tokens !== undefined
+      && !(Number.isSafeInteger(data.tokens) && data.tokens >= 0 && data.tokens <= MAX_SIGNUP_BONUS_TOKENS)) {
+    throw new HttpsError("invalid-argument", `新會員禮物必須為 0 至 ${MAX_SIGNUP_BONUS_TOKENS} 代幣的整數。`);
   }
   if (collectionName === "draws" && data.chatCooldownSeconds !== undefined
       && !(Number.isSafeInteger(data.chatCooldownSeconds) && data.chatCooldownSeconds >= 3 && data.chatCooldownSeconds <= 60)) {
@@ -352,7 +364,8 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
     const verifiedPhone = String(request.auth.token.phone_number || "");
     const bonusClaimRef = verifiedPhone ? db.collection("signupBonusClaims").doc(signupBonusClaimId(verifiedPhone)) : null;
     const bonusAlreadyClaimed = bonusClaimRef ? (await transaction.get(bonusClaimRef)).exists : true;
-    const signupBonusTokens = bonusAlreadyClaimed ? 0 : SIGNUP_BONUS_TOKENS;
+    const giftSettings = bonusAlreadyClaimed ? null : await transaction.get(signupBonusSettingsRef());
+    const signupBonusTokens = bonusAlreadyClaimed ? 0 : signupBonusAmount(giftSettings.exists ? giftSettings.data() : null);
 
     const email = String(request.auth.token.email || "").slice(0, 320);
     const photoURL = String(request.auth.token.picture || "").slice(0, 500);
@@ -396,8 +409,11 @@ export const claimSignupBonus = onCall(userCallableOptions, async (request) => {
   const uid = request.auth.uid;
   const userRef = db.collection("users").doc(uid);
   const claimRef = db.collection("signupBonusClaims").doc(signupBonusClaimId(verifiedPhone));
-  await db.runTransaction(async (transaction) => {
-    const [userSnapshot, claimSnapshot] = await Promise.all([transaction.get(userRef), transaction.get(claimRef)]);
+  const claimed = await db.runTransaction(async (transaction) => {
+    const [userSnapshot, claimSnapshot, giftSettings] = await Promise.all([
+      transaction.get(userRef), transaction.get(claimRef), transaction.get(signupBonusSettingsRef()),
+    ]);
+    const giftTokens = signupBonusAmount(giftSettings.exists ? giftSettings.data() : null);
     if (!userSnapshot.exists) throw new HttpsError("failed-precondition", "找不到會員帳戶，請重新登入。");
     const user = userSnapshot.data();
     if (Number(user.signupBonusTokens || 0) > 0) throw new HttpsError("already-exists", "你已領取新會員禮物。");
@@ -405,16 +421,18 @@ export const claimSignupBonus = onCall(userCallableOptions, async (request) => {
       throw new HttpsError("failed-precondition", "新會員禮物只適用於 2026 年 9 月 30 日或之後註冊的會員。");
     }
     if (claimSnapshot.exists) throw new HttpsError("already-exists", "此手機號碼已領取過新會員禮物。");
+    if (giftTokens === 0) throw new HttpsError("failed-precondition", "目前沒有新會員禮物。");
     transaction.update(userRef, {
-      tokens: Number(user.tokens || 0) + SIGNUP_BONUS_TOKENS,
-      signupBonusTokens: SIGNUP_BONUS_TOKENS,
+      tokens: Number(user.tokens || 0) + giftTokens,
+      signupBonusTokens: giftTokens,
       signupBonusAt: FieldValue.serverTimestamp(),
       phoneNumber: verifiedPhone,
       updatedAt: FieldValue.serverTimestamp(),
     });
-    transaction.create(claimRef, { uid, tokens: SIGNUP_BONUS_TOKENS, createdAt: FieldValue.serverTimestamp() });
+    transaction.create(claimRef, { uid, tokens: giftTokens, createdAt: FieldValue.serverTimestamp() });
+    return giftTokens;
   });
-  return { ok: true, signupBonusTokens: SIGNUP_BONUS_TOKENS };
+  return { ok: true, signupBonusTokens: claimed };
 });
 
 export const submitAffiliateApplication = onCall(userCallableOptions, async (request) => {

@@ -13,7 +13,6 @@ export const AUDIT_THRESHOLDS = {
   purchaseBurstCount: 20,
   purchaseBurstMs: 60 * 1000,
   rejectionsPerUser: 3,
-  signupBonusTokens: 50,
   nightStartHour: 1,
   nightEndHour: 6,
 };
@@ -91,16 +90,18 @@ export function analyzeAuditEntries(entries, thresholds = AUDIT_THRESHOLDS) {
     }
 
     // 1b. A new account starting with more tokens than the signup gift.
-    if (collection === "users" && entry.operation === "create" && Number(after(entry, "tokens")) > thresholds.signupBonusTokens) {
+    // The gift amount is set by admins, so compare with the gift recorded on the account itself.
+    const giftOnCreate = Number(after(entry, "signupBonusTokens") || 0);
+    if (collection === "users" && entry.operation === "create" && Number(after(entry, "tokens")) > giftOnCreate) {
       findings.push(finding("high", "signup-tokens", "新帳戶開戶代幣異常", entry,
-        `新帳戶開戶即有 ${after(entry, "tokens")} 代幣（新會員禮物為 ${thresholds.signupBonusTokens}）`));
+        `新帳戶開戶即有 ${after(entry, "tokens")} 代幣（新會員禮物為 ${giftOnCreate}）`));
     }
 
     // 2. Token balance went up without an approved deposit or a card conversion.
     if (collection === "users" && entry.operation === "update" && changed(entry, "tokens")) {
       const gain = Number(after(entry, "tokens")) - Number(before(entry, "tokens"));
       // A later signup gift (claimSignupBonus) sets signupBonusAt, which only the server can write.
-      const signupGift = changed(entry, "signupBonusAt") && gain === thresholds.signupBonusTokens;
+      const signupGift = isServer(entry) && changed(entry, "signupBonusAt") && gain === Number(after(entry, "signupBonusTokens"));
       // 會員調整 (adminAdjustMember) sets lastAdminAdjustmentId; players cannot write that field.
       const adminAdjustment = isServer(entry) && changed(entry, "lastAdminAdjustmentId");
       if (adminAdjustment) {
@@ -135,6 +136,12 @@ export function analyzeAuditEntries(entries, thresholds = AUDIT_THRESHOLDS) {
       findings.push(finding("high", "payment-settings", "收款資料被改", entry,
         ["fpsIdentifier", "fpsName"].filter((field) => changed(entry, field))
           .map((field) => `${field}: ${before(entry, field)} → ${after(entry, field)}`).join("；") || "付款設定有改動"));
+    }
+
+    // 4b. Signup gift amount changed in 會員調整.
+    if (entry.path === "publicSiteSettings/signupBonus" && changed(entry, "tokens")) {
+      findings.push(finding("medium", "signup-gift-setting", "新會員禮物數量被更改", entry,
+        `每個手機號碼 ${before(entry, "tokens") ?? 50} → ${after(entry, "tokens")} 代幣`));
     }
 
     // 5. Results changed after a card was already awarded.
