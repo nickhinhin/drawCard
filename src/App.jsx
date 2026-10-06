@@ -2750,16 +2750,7 @@ function DrawCard({ profile }) {
       setSlotsLoading(false);
       return undefined;
     }
-    // Guests cannot read slot ownership, so they see plain numbers; tapping one asks them to log in.
-    if (!profile?.uid) {
-      const roundSize = Math.max(1, Math.min(100, Number(selectedRoom.cardCount) || 30));
-      setSlots(Array.from({ length: roundSize }, (_item, index) => ({
-        id: `guest-${index + 1}`, number: index + 1, status: "available", guestPreview: true,
-      })));
-      setSlotsLoading(false);
-      return undefined;
-    }
-
+    // Guests see the same live board as members; tapping a free number asks them to log in.
     setSlotsLoading(true);
 
     const slotsQuery = query(
@@ -4588,8 +4579,6 @@ function NumberGrid({
           ? `${formatRoundLabel(activeRoundId)}已過場，只可以查看紀錄，不能再鎖定號碼。`
           : buyingBlocked
           ? `${formatRoundLabel(activeRoundId)}已停止購買，只可以查看紀錄，不能再鎖定號碼。`
-          : slots.some((slot) => slot.guestPreview)
-          ? `已選 ${selectedCard.name}，${formatRoundLabel(activeRoundId)}共 ${draw.cardCount} 個號碼。登入後即可查看已被選走的號碼及選擇號碼。`
           : `已選 ${selectedCard.name}，${formatRoundLabel(activeRoundId)}共 ${draw.cardCount} 個號碼，已被選走的號碼無法重選。`}
       </p>}
       {!selectedCard && (

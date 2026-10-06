@@ -755,8 +755,9 @@ service cloud.firestore {
       allow create, update, delete: if false;
 
       match /slots/{slotId} {
-        // Slot documents contain ownership metadata; anonymous visitors must not receive it.
-        allow read: if signedIn();
+        // The live number board (buyer name and status) is shown to guests too; the
+        // buyer's name and uid are already public in the room chat.
+        allow read: if true;
         allow create: if false;
         allow update: if false;
         allow delete: if false;
@@ -767,7 +768,7 @@ service cloud.firestore {
         allow create, update, delete: if false;
 
         match /slots/{slotId} {
-          allow read: if signedIn();
+          allow read: if true;
           allow create: if false;
           allow update: if isValidSlotPurchase(drawId, roundId, slotId);
           allow delete: if false;

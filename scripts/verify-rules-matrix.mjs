@@ -115,12 +115,12 @@ collectionOps("promoRedemptions", ["promoRedemptions"], { list: ["admin"] });
 // draws and nested data
 docOps("draws", path("draws", `d-${t}`), { get: ALL });
 collectionOps("draws", ["draws"], { list: ALL });
-docOps("draws/legacy slot", path("draws", `d-${t}`, "slots", "1"), { get: SIGNED_IN });
-collectionOps("draws/legacy slots", ["draws", `d-${t}`, "slots"], { list: SIGNED_IN });
+docOps("draws/legacy slot", path("draws", `d-${t}`, "slots", "1"), { get: ALL });
+collectionOps("draws/legacy slots", ["draws", `d-${t}`, "slots"], { list: ALL });
 docOps("rounds", path("draws", `d-${t}`, "rounds", "round-001"), { get: ALL });
 collectionOps("rounds", ["draws", `d-${t}`, "rounds"], { list: ALL });
-docOps("round slot", path("draws", `d-${t}`, "rounds", "round-001", "slots", "1"), { get: SIGNED_IN });
-collectionOps("round slots", ["draws", `d-${t}`, "rounds", "round-001", "slots"], { list: SIGNED_IN });
+docOps("round slot", path("draws", `d-${t}`, "rounds", "round-001", "slots", "1"), { get: ALL });
+collectionOps("round slots", ["draws", `d-${t}`, "rounds", "round-001", "slots"], { list: ALL });
 add("slots collection group: own (uid filter)", (db) => getDocs(query(collectionGroup(db, "slots"), where("uid", "==", A))), ["playerA"]);
 add("slots collection group: everyone's", (db) => getDocs(query(collectionGroup(db, "slots"), limit(5))), NONE);
 docOps("chat message", path("draws", `d-${t}`, "messages", "m1"), { get: ALL });
