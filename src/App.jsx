@@ -219,6 +219,11 @@ const SUPPORT_WHATSAPP_URL = "https://wa.me/85254208951";
 const collectionStatuses = ["pending", "shipping", "shipped"];
 const betaCollectionStatuses = ["pending", "shipping", "shipped", "converted"];
 const CONVERSION_RATE = 0.8;
+// Payment proof upload sizes (see preparePaymentProof).
+const MAX_PROOF_SOURCE_BYTES = 25 * 1024 * 1024;
+const PROOF_TARGET_BYTES = 900 * 1024;
+const PROOF_SERVER_LIMIT_BYTES = 2 * 1024 * 1024;
+const PROOF_MAX_SIDE = 2000;
 // Seconds between chat messages per member. Slow mode (draws/{id}.chatCooldownSeconds)
 // switches on automatically while 直播監察 is open and the room is busy.
 const CHAT_COOLDOWN_SECONDS = 3;
@@ -5566,12 +5571,14 @@ function TokenRequest({ profile }) {
       alert("邀請碼格式不正確。請輸入「英文字母-代幣數目」，例如 EVENT-500。");
       return;
     }
-    if (requestMethod === "payment" && proof?.size > 2 * 1024 * 1024) {
-      alert("付款證明圖片不可超過 2MB。");
+    // Large screenshots and HEIC photos are shrunk in the browser before upload
+    // (preparePaymentProof); only reject files that are not images or are huge.
+    if (requestMethod === "payment" && proof && !String(proof.type || "").startsWith("image/")) {
+      alert("付款證明必須是圖片（截圖或相片）。");
       return;
     }
-    if (requestMethod === "payment" && proof && !["image/jpeg", "image/jpg", "image/png", "image/webp"].includes(proof.type || "")) {
-      alert("付款證明必須是 JPEG、PNG 或 WebP 圖片。");
+    if (requestMethod === "payment" && proof?.size > MAX_PROOF_SOURCE_BYTES) {
+      alert("圖片太大（超過 25MB），請改用截圖。");
       return;
     }
     const requestFpsIdentifier = requestMethod === "payment"
@@ -5854,25 +5861,71 @@ function getSafeProofName(proof) {
   return proof.name.replace(/[^\w.-]+/g, "_").slice(0, 80) || "proof.jpg";
 }
 
+// Payment proofs: iPhone screenshots are often 2–5 MB PNGs (or HEIC photos), over the
+// server's 2 MB limit. Small JPEG / PNG / WebP files are sent as they are; anything else
+// is redrawn in the browser at up to 2000 px on the long side (bank text stays readable)
+// and encoded as WebP (JPEG where the browser cannot write WebP) until it is ~900 KB.
+
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error("未能讀取這張圖片，請改用 JPEG 或 PNG 截圖。")); };
+    image.src = url;
+  });
+}
+
+function canvasToBlob(canvas, type, quality) {
+  return new Promise((resolve) => {
+    if (!canvas.toBlob) resolve(null);
+    else canvas.toBlob(resolve, type, quality);
+  });
+}
+
+async function preparePaymentProof(file) {
+  const type = file.type === "image/jpg" ? "image/jpeg" : String(file.type || "");
+  const baseName = String(file.name || "proof").replace(/\.[^.]+$/, "");
+  if (["image/jpeg", "image/png", "image/webp"].includes(type) && file.size <= PROOF_TARGET_BYTES) {
+    return { blob: file, contentType: type, name: file.name || "proof" };
+  }
+  const image = await loadImageFromFile(file);
+  let scale = Math.min(1, PROOF_MAX_SIDE / Math.max(image.naturalWidth || image.width, image.naturalHeight || image.height));
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  let best = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    canvas.width = Math.max(1, Math.round((image.naturalWidth || image.width) * scale));
+    canvas.height = Math.max(1, Math.round((image.naturalHeight || image.height) * scale));
+    context.fillStyle = "#ffffff"; // transparent PNG areas become white, not black, in JPEG
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    for (const quality of [0.85, 0.75, 0.65]) {
+      let blob = await canvasToBlob(canvas, "image/webp", quality);
+      if (!blob || blob.type !== "image/webp") blob = await canvasToBlob(canvas, "image/jpeg", quality);
+      if (!blob) continue;
+      if (!best || blob.size < best.size) best = blob;
+      if (blob.size <= PROOF_TARGET_BYTES) {
+        return { blob, contentType: blob.type, name: `${baseName}.${blob.type === "image/webp" ? "webp" : "jpg"}` };
+      }
+    }
+    scale *= 0.8;
+  }
+  if (!best || best.size > PROOF_SERVER_LIMIT_BYTES) throw new Error("圖片太大，請裁剪後再上傳。");
+  return { blob: best, contentType: best.type, name: `${baseName}.${best.type === "image/webp" ? "webp" : "jpg"}` };
+}
+
 async function submitTokenPaymentRequest({ proof, ...request }) {
   if (!proof) {
-    throw new Error("請上傳 JPEG、PNG 或 WebP 付款證明。");
+    throw new Error("請上傳付款證明截圖。");
   }
-
-  const allowedTypes = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
-  const contentType = proof.type === "image/jpg" ? "image/jpeg" : proof.type || "";
-  if (!allowedTypes.has(contentType)) {
-    throw new Error("付款證明必須是 JPEG、PNG 或 WebP 圖片。");
-  }
-  if (proof.size > 2 * 1024 * 1024) {
-    throw new Error("付款證明圖片不可超過 2MB。");
-  }
+  const prepared = await preparePaymentProof(proof);
 
   const { data } = await httpsCallable(functions, "submitTokenPaymentRequest")({
     ...request,
-    contentType,
-    proofFileName: getSafeProofName(proof),
-    base64: await blobToBase64(proof),
+    contentType: prepared.contentType,
+    proofFileName: getSafeProofName({ name: prepared.name }),
+    base64: await blobToBase64(prepared.blob),
   });
   return data;
 }
