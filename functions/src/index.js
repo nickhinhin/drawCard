@@ -20,12 +20,16 @@ const db = getFirestore();
 // out for 24 h. Callables rely on Firebase Auth, assertAdmin, server-side validation and
 // rate limits. Set this back to `process.env.FUNCTIONS_EMULATOR !== "true"` to re-enable.
 const ENFORCE_APP_CHECK = false;
+// Player callables (sign-up, signup gift, affiliate application): 1 vCPU, up to 80
+// requests per instance and at most 2 instances (160 at once), so a sign-up burst or a
+// script hammering one function cannot use up the region's 20 vCPU for everyone else.
 const userCallableOptions = {
   region: "asia-east2",
   enforceAppCheck: ENFORCE_APP_CHECK,
   consumeAppCheckToken: ENFORCE_APP_CHECK,
   timeoutSeconds: 30,
   memory: "256MiB",
+  maxInstances: 2,
 };
 // Only the web admin site calls these endpoints. App Check proves the request
 // comes from that site; `assertAdmin` then verifies Firebase Authentication,
@@ -56,12 +60,15 @@ const affiliateApplicationsCallableOptions = {
   // Firebase Auth and the server-issued admin claim in `assertAdmin`.
   invoker: "public",
 };
+// Deposit requests carry a payment proof of up to 2 MB (base64), so each instance takes
+// at most 10 at once with 512 MiB, and at most 2 instances run (20 uploads at once).
 const tokenProofCallableOptions = {
   region: "asia-east2",
-  // Payment proofs come only from the web client, which always attaches App Check tokens.
   enforceAppCheck: ENFORCE_APP_CHECK,
   timeoutSeconds: 30,
-  memory: "256MiB",
+  memory: "512MiB",
+  concurrency: 10,
+  maxInstances: 2,
 };
 const AFFILIATE_CODE_PATTERN = /^AFF[A-F0-9]{20}$/;
 // Signup gift for a verified phone number. Admins set the amount in 會員調整
