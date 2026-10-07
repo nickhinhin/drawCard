@@ -62,7 +62,7 @@ const baseRecord = {
   round: "round-001", number: 1, tokenCost: 10,
   targetCardId: "card", targetCardValue: 10, shareMode: "1/2", affiliateReferrerUid: "",
 };
-const assignedRecord = { ...baseRecord, cardId: "card", cardValue: 100, cardConversionValue: 80, collectionStatus: "pending" };
+const assignedRecord = { ...baseRecord, cardId: "card", cardValue: 100, cardConversionValue: 80, collectionStatus: "pending", assignedAt: new Date() };
 const claimableVipReward = {
   source: "vip", vipTierId: "vip0", uid, username, targetCardId: "card",
   targetCardName: "VIP Card", targetCardImageUrl: "", targetCardValue: 100,

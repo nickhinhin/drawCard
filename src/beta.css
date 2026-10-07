@@ -2397,6 +2397,48 @@
   background: rgba(0, 0, 0, .82);
 }
 
+/* 我的卡牌: 14-day shipping deadline. */
+.beta-mode .shipping-deadline {
+  display: block;
+  color: #b8b8c1;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.beta-mode .shipping-deadline.warn {
+  color: #ffb648;
+  font-weight: 700;
+}
+
+.beta-mode .shipping-deadline.expired {
+  color: #ff6b6b;
+  font-weight: 700;
+}
+
+.beta-mode .shipping-deadline-notice {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid #34343b;
+  border-radius: 3px;
+  background: #141419;
+  color: #d6d6dd;
+  font-size: 13px;
+}
+
+.beta-mode .shipping-deadline-notice p {
+  margin: 0;
+}
+
+.beta-mode .shipping-deadline-notice p + p {
+  margin-top: 4px;
+}
+
+.beta-mode .shipping-deadline-notice.warn {
+  border-color: #8a5a00;
+  background: #2a1f08;
+  color: #ffcf70;
+}
+
 .beta-mode .beta-collection-actions {
   display: flex;
   align-items: center;
@@ -3555,6 +3597,23 @@
   color: #b5b5bd;
   line-height: 1.75;
   white-space: pre-line;
+}
+
+.beta-mode .footer-page-copy h3 {
+  margin: 10px 0 0;
+  color: #fff;
+  font-size: 1.05rem;
+}
+
+.beta-mode .footer-page-copy .footer-page-item {
+  padding-left: 1.2em;
+  text-indent: -1.2em;
+}
+
+.beta-mode .footer-page-updated {
+  margin: -10px 0 16px;
+  color: #8d8d96;
+  font-size: 13px;
 }
 
 @media (max-width: 1050px) {

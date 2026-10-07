@@ -490,12 +490,26 @@ service cloud.firestore {
         && request.resource.data.updatedAt == request.time;
     }
 
+    // Players may request shipping within 14 days of receiving a card (assigned, VIP
+    // reward claimed, or created for old records); after that the card can only be
+    // converted to tokens. Cards received before the rule started all have until
+    // 22/10/2026 00:00 HKT. Admins can still arrange shipping. Same rule in the page
+    // (getShippingDeadlineMs in src/App.jsx).
+    function shippingDeadline(record) {
+      let received = record.get("assignedAt", record.get("claimedAt", record.get("createdAt", null)));
+      let grace = timestamp.date(2026, 10, 21) + duration.value(16, "h");
+      return received is timestamp && received + duration.value(14, "d") > grace
+        ? received + duration.value(14, "d")
+        : grace;
+    }
+
     function isShippingRequest() {
       return signedIn()
         && resource.data.uid == request.auth.uid
         && resource.data.cardId is string
         && (!("convertedToTokens" in resource.data) || resource.data.convertedToTokens != true)
         && (resource.data.collectionStatus == "pending" || !("collectionStatus" in resource.data))
+        && request.time < shippingDeadline(resource.data)
         && request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly([
             "collectionStatus",

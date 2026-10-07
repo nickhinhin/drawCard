@@ -91,6 +91,7 @@ import {
 import { httpsCallable } from "firebase/functions";
 import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
 import { reportClientError } from "./errorReporting.js";
+import { TERMS_LAST_UPDATED, TERMS_OF_SERVICE } from "./termsOfService.js";
 import { getToken as getAppCheckToken } from "firebase/app-check";
 import { appCheck, auth, db, functions, getRealtimeDb, googleProvider } from "./firebase";
 import { isGuestKey, summarizeLiveSessions } from "./liveAudience.js";
@@ -226,6 +227,14 @@ const PROOF_SERVER_LIMIT_BYTES = 2 * 1024 * 1024;
 const PROOF_MAX_SIDE = 2000;
 // Seconds between chat messages per member. Slow mode (draws/{id}.chatCooldownSeconds)
 // switches on automatically while 直播監察 is open and the room is busy.
+// Players may request shipping within 14 days of receiving a card; afterwards the card
+// can only be converted to tokens (admins can still arrange shipping). Cards received
+// before the rule started all have until 22/10/2026 00:00 HKT. The same rule is
+// enforced in firestore.rules (shippingDeadline).
+const SHIPPING_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+const SHIPPING_GRACE_DEADLINE_MS = Date.parse("2026-10-21T16:00:00Z");
+const SHIPPING_DEADLINE_WARN_MS = 3 * 24 * 60 * 60 * 1000;
+
 const CHAT_COOLDOWN_SECONDS = 3;
 const SLOW_MODE_SECONDS = 10;
 const SLOW_MODE_ON_AT = 500;
@@ -1263,10 +1272,8 @@ const FOOTER_PAGES = {
   terms: {
     title: "服務條款",
     eyebrow: "TERMS OF SERVICE",
-    body: [
-      "使用平台前，請確認帳戶資料正確並已年滿 18 歲。代幣只可用於平台指定服務，不能視作銀行存款或法定貨幣。",
-      "抽卡結果以房間直播及平台紀錄為準。玩家提交配送資料前應再次核對，因資料錯誤引致的延誤需由玩家承擔。",
-    ],
+    updated: TERMS_LAST_UPDATED,
+    body: TERMS_OF_SERVICE,
   },
   privacy: {
     title: "隱私條款",
@@ -1284,7 +1291,7 @@ const FOOTER_PAGES = {
       "1. 登入帳戶並申請代幣。",
       "2. 進入直播房間，先選擇想要的卡牌，再選擇場次及未被鎖定的號碼。",
       "3. 確認付款後號碼才會鎖定；完成開卡後可在「我的紀錄」及「我的卡牌」查看結果。",
-      "4. 可按卡牌狀態申請配送，或把合資格卡牌轉回代幣。",
+      "4. 卡牌須於取得後 14 日內申請配送，或把卡牌轉回代幣；逾期只可轉回代幣。",
     ],
   },
   faq: {
@@ -1293,6 +1300,7 @@ const FOOTER_PAGES = {
     body: [
       "代幣申請會在管理員核對付款證明後入帳；處理時間會按申請量而不同。",
       "號碼只有在最後確認購買後才會扣除代幣及鎖定。如同一號碼同時被其他玩家購入，系統會要求重新選擇。",
+      "卡牌須於取得後 14 日內在「我的卡牌」申請配送，每張卡牌會顯示剩餘時間；逾期只可轉回代幣。",
       "配送進度及順豐運單號會顯示在「我的卡牌」。",
     ],
   },
@@ -1332,8 +1340,14 @@ function BetaFooter({ onNavigate }) {
             <button className="icon-btn modal-close" type="button" onClick={() => setActivePage("")} aria-label="關閉內容頁"><X size={19} /></button>
 
             <h2 id="footer-page-title">{page.title}</h2>
+            {page.updated && <p className="footer-page-updated">最後更新：{page.updated}</p>}
             <div className="footer-page-copy">
-              {page.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
+              {page.body.map((line, index) => {
+                // Terms: "第…條" / "前言" lines are headings, "• " lines are list items.
+                if (/^(前言|第[一二三四五六七八九十]+條)/.test(line)) return <h3 key={index}>{line}</h3>;
+                if (line.startsWith("• ")) return <p className="footer-page-item" key={index}>{line}</p>;
+                return <p key={index}>{line}</p>;
+              })}
             </div>
             {activePage === "process" && (
               <button className="primary-btn" type="button" onClick={() => { onNavigate("draw"); setActivePage(""); window.scrollTo({ top: 0, behavior: "smooth" }); }}>
@@ -6318,6 +6332,13 @@ function CollectionPage({ profile }) {
   });
   const [shippingBusy, setShippingBusy] = useState(false);
   const [shippingCodAgreed, setShippingCodAgreed] = useState(false);
+  // Ticks every minute for the shipping deadline countdowns.
+  const [clockMs, setClockMs] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockMs(Date.now()), 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const shippingExpired = (record) => clockMs >= getShippingDeadlineMs(record);
   const shippingRegion = SHIPPING_REGIONS.find((region) => region.id === shippingForm.region)
     || SHIPPING_REGIONS[0];
 
@@ -6375,6 +6396,12 @@ function CollectionPage({ profile }) {
       return next.length === current.length ? current : next;
     });
   }, [records]);
+  const pendingRecords = records.filter((record) => getBetaCollectionRecordStatus(record) === "pending");
+  const expiredPendingCount = pendingRecords.filter(shippingExpired).length;
+  const expiringSoonCount = pendingRecords.filter((record) => {
+    const left = getShippingDeadlineMs(record) - clockMs;
+    return left > 0 && left <= SHIPPING_DEADLINE_WARN_MS;
+  }).length;
   const totalValue = records.reduce(
     (sum, record) => sum + Number(record.cardValue || record.tokenCost || 0),
     0,
@@ -6477,10 +6504,22 @@ function CollectionPage({ profile }) {
   }
 
   function openShippingRequest(recordIds) {
-    const ids = recordIds.filter(Boolean);
-    if (!ids.length) {
+    const selected = recordIds.filter(Boolean);
+    if (!selected.length) {
       alert("請先選擇要配送的卡牌。");
       return;
+    }
+    // Cards past the 14-day shipping deadline can only be converted to tokens.
+    const ids = selected.filter((id) => {
+      const record = records.find((item) => item.id === id);
+      return record && !shippingExpired(record);
+    });
+    if (!ids.length) {
+      alert("所選卡牌已過配送申請期限（取得卡牌後 14 日內），只可轉回代幣。");
+      return;
+    }
+    if (ids.length < selected.length) {
+      alert(`所選卡牌中有 ${selected.length - ids.length} 張已過配送申請期限，只可轉回代幣；其餘 ${ids.length} 張可以繼續申請配送。`);
     }
     setShippingIds(ids);
     setShippingCodAgreed(false);
@@ -6509,6 +6548,15 @@ function CollectionPage({ profile }) {
       : shippingForm.method === "address-delivery";
     if (!validMethod) {
       alert("配送地區與配送方式不相符，請重新選擇。");
+      return;
+    }
+    const expiredIds = shippingIds.filter((id) => {
+      const record = records.find((item) => item.id === id);
+      return !record || Date.now() >= getShippingDeadlineMs(record);
+    });
+    if (expiredIds.length) {
+      setShippingIds((current) => current.filter((id) => !expiredIds.includes(id)));
+      alert(`有 ${expiredIds.length} 張卡牌剛過配送申請期限，已從申請中移除，只可轉回代幣。請再確認後提交。`);
       return;
     }
     setShippingBusy(true);
@@ -6644,6 +6692,13 @@ function CollectionPage({ profile }) {
             </button>
           </div>
         )}
+        {isBeta && activeStatus === "pending" && pendingRecords.length > 0 && (
+          <div className={`shipping-deadline-notice ${expiredPendingCount || expiringSoonCount ? "warn" : ""}`}>
+            <p>卡牌須於取得後 14 日內申請配送，逾期只可轉回代幣。</p>
+            {expiringSoonCount > 0 && <p><strong>⚠️ 你有 {expiringSoonCount} 張卡牌將於 3 日內過配送申請期限，請盡快申請配送或轉回代幣。</strong></p>}
+            {expiredPendingCount > 0 && <p><strong>{expiredPendingCount} 張卡牌已過配送申請期限，只可轉回代幣。</strong></p>}
+          </div>
+        )}
         {collectionActionProgress && <p className="form-note collection-action-progress">{collectionActionProgress}</p>}
         {visibleRecords.length ? (
           <div className="collection-grid">
@@ -6703,11 +6758,28 @@ function CollectionPage({ profile }) {
                       轉回 {formatTokenNumber(getCardConversionRefund(record))} 代幣
                     </button>
                   )}
-                  {isBeta && activeStatus === "pending" && (
-                    <button className="primary-btn" type="button" onClick={() => openShippingRequest([record.id])}>
-                      申請配送
-                    </button>
-                  )}
+                  {isBeta && activeStatus === "pending" && (() => {
+                    const deadline = getShippingDeadlineMs(record);
+                    const left = deadline - clockMs;
+                    if (left <= 0) {
+                      return (
+                        <>
+                          <span className="shipping-deadline expired">已過配送申請期限（{formatShippingDeadline(deadline)}），只可轉回代幣</span>
+                          <button className="primary-btn" type="button" disabled>配送期限已過</button>
+                        </>
+                      );
+                    }
+                    return (
+                      <>
+                        <span className={`shipping-deadline ${left <= SHIPPING_DEADLINE_WARN_MS ? "warn" : ""}`}>
+                          配送申請尚餘 {formatShippingTimeLeft(left)}（{formatShippingDeadline(deadline)} 前）
+                        </span>
+                        <button className="primary-btn" type="button" onClick={() => openShippingRequest([record.id])}>
+                          申請配送
+                        </button>
+                      </>
+                    );
+                  })()}
                   {record.trackingNumber && (
                     <a
                       className="small-btn collection-tracking-link"
@@ -14984,6 +15056,24 @@ function estimateDataUrlBytes(dataUrl) {
 // Card assignment is the acquisition moment; older records fall back to their purchase time.
 function getRecordAcquiredAt(record) {
   return record?.assignedAt || record?.createdAt || record?.updatedAt || null;
+}
+
+function getShippingDeadlineMs(record) {
+  const received = toMillis(record?.assignedAt || record?.claimedAt || record?.createdAt);
+  return Math.max(received ? received + SHIPPING_WINDOW_MS : 0, SHIPPING_GRACE_DEADLINE_MS);
+}
+
+function formatShippingTimeLeft(ms) {
+  const hours = Math.max(0, Math.floor(ms / (60 * 60 * 1000)));
+  if (hours >= 24) return `${Math.floor(hours / 24)} 日 ${hours % 24} 小時`;
+  if (hours >= 1) return `${hours} 小時`;
+  return `${Math.max(1, Math.ceil(ms / 60000))} 分鐘`;
+}
+
+function formatShippingDeadline(ms) {
+  return new Intl.DateTimeFormat("zh-HK", {
+    timeZone: "Asia/Hong_Kong", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date(ms));
 }
 
 function formatRecordAcquiredTime(record) {

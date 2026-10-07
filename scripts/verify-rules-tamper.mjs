@@ -126,7 +126,9 @@ async function shippingCase(label, { record = {}, patch = {}, otherOwner, expect
   const player = await newPlayer();
   const recordOwner = otherOwner ? (await newPlayerSilent()).uid : player.uid;
   const id = unique("ship");
-  await seed(`drawRecords/${id}`, { uid: recordOwner, cardId: "card-x", collectionStatus: "pending", cardConversionValue: 400, ...record });
+  const data = { uid: recordOwner, cardId: "card-x", collectionStatus: "pending", cardConversionValue: 400, assignedAt: new Date(), ...record };
+  Object.keys(data).forEach((key) => data[key] === undefined && delete data[key]);
+  await seed(`drawRecords/${id}`, data);
   await signInWithCustomToken(auth, unsignedToken(player.uid));
   await attempt(`shipping: ${label}`, (batch) => batch.update(doc(db, "drawRecords", id), { ...shipping(), ...patch }), expect);
 }
@@ -149,6 +151,17 @@ await shippingCase("voided card", { record: { collectionStatus: "void" } });
 await shippingCase("card already in shipping", { record: { collectionStatus: "shipping" } });
 await shippingCase("record without a card", { record: { cardId: null } });
 await shippingCase("another player's card", { otherOwner: true });
+// 14-day shipping deadline. Cards received before the rule started have until
+// 22/10/2026 00:00 HKT, so older cards are still allowed until then.
+const daysAgo = (days) => new Date(Date.now() - days * 86400000);
+const graceOpen = Date.now() < Date.parse("2026-10-21T16:00:00Z");
+await shippingCase("card assigned 13 days ago", { record: { assignedAt: daysAgo(13) }, expect: true });
+await shippingCase(`card assigned 15 days ago (${graceOpen ? "grace period" : "expired"})`, { record: { assignedAt: daysAgo(15) }, expect: graceOpen });
+await shippingCase(`card assigned 60 days ago (${graceOpen ? "grace period" : "expired"})`, { record: { assignedAt: daysAgo(60) }, expect: graceOpen });
+await shippingCase("VIP reward claimed 2 days ago", { record: { assignedAt: undefined, claimedAt: daysAgo(2) }, expect: true });
+await shippingCase(`VIP reward claimed 20 days ago (${graceOpen ? "grace period" : "expired"})`, { record: { assignedAt: undefined, claimedAt: daysAgo(20) }, expect: graceOpen });
+await shippingCase(`old record with only createdAt 30 days ago (${graceOpen ? "grace period" : "expired"})`, { record: { assignedAt: undefined, createdAt: daysAgo(30) }, expect: graceOpen });
+await shippingCase("assigned 20 days ago but claimed recently: assignedAt counts", { record: { assignedAt: daysAgo(20), claimedAt: daysAgo(1) }, expect: graceOpen });
 
 // ======================= 3. VIP reward claim =======================
 const vipRecord = (uid) => ({
