@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { applicationDefault, getApps, initializeApp } from "firebase-admin/app";
 import { FieldPath, FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
-import { getDatabase } from "firebase-admin/database";
 import { getStorage } from "firebase-admin/storage";
 import { logger } from "firebase-functions";
 import { setGlobalOptions } from "firebase-functions/v2";
@@ -1908,11 +1907,23 @@ async function monitorRoomId(requested) {
   return live.docs[0]?.id || "";
 }
 
+// Plain REST reads with a time limit: the Admin SDK's database connection hung in
+// production (every call ran into the 60 s timeout), and a hung read must never hold
+// up a monitor report.
+const PRESENCE_READ_TIMEOUT_MS = 15 * 1000;
 async function readPresence(roomId) {
-  const database = getDatabase(getApps()[0], PRESENCE_DATABASE_URL);
-  const [online, sessions, rounds] = await Promise.all(["online", "sessions", "rounds"].map(
-    (part) => database.ref(`${part}/${roomId}`).get().then((snapshot) => snapshot.val() || {}),
-  ));
+  const emulatorHost = process.env.FIREBASE_DATABASE_EMULATOR_HOST;
+  const base = emulatorHost ? `http://${emulatorHost}` : PRESENCE_DATABASE_URL;
+  const query = emulatorHost ? "?ns=livedraw-7e3c2-default-rtdb" : "";
+  const token = emulatorHost ? "owner" : (await applicationDefault().getAccessToken()).access_token;
+  const [online, sessions, rounds] = await Promise.all(["online", "sessions", "rounds"].map(async (part) => {
+    const response = await fetch(`${base}/${part}/${encodeURIComponent(roomId)}.json${query}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(PRESENCE_READ_TIMEOUT_MS),
+    });
+    if (!response.ok) throw new Error(`Presence read ${part} failed: HTTP ${response.status} ${(await response.text()).slice(0, 200)}`);
+    return (await response.json()) || {};
+  }));
   return { online, sessions, rounds };
 }
 
