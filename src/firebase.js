@@ -11,7 +11,7 @@ import {
   persistentMultipleTabManager,
 } from "firebase/firestore";
 import { connectFunctionsEmulator, getFunctions } from "firebase/functions";
-import { IS_BETA } from "./appVariant.js";
+import { IS_ADMIN_SITE } from "./appVariant.js";
 
 const firebaseConfig = {
   apiKey:
@@ -143,8 +143,10 @@ if (typeof document !== "undefined") {
   window.addEventListener("pageshow", (event) => { if (event.persisted) reconnectFirestore(); });
 }
 
+// Google Analytics for the public site only: admin activity and local test runs
+// are left out of the visitor figures.
 export const analyticsPromise = new Promise((resolve) => {
-  if (IS_BETA) {
+  if (IS_ADMIN_SITE || import.meta.env.DEV) {
     resolve(null);
     return;
   }
