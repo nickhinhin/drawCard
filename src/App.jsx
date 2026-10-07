@@ -230,6 +230,8 @@ const CHAT_COOLDOWN_SECONDS = 3;
 const SLOW_MODE_SECONDS = 10;
 const SLOW_MODE_ON_AT = 500;
 const SLOW_MODE_OFF_BELOW = 400;
+// 直播監察: how long to wait for the audience data before warning that it is blocked.
+const PRESENCE_TIMEOUT_MS = 15000;
 
 function roomChatCooldownSeconds(room) {
   const seconds = Number(room?.chatCooldownSeconds);
@@ -7819,6 +7821,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const [healthError, setHealthError] = useState("");
   const [now, setNow] = useState(Date.now());
   const [presence, setPresence] = useState({ online: {}, sessions: {}, rounds: {} });
+  const [presenceStatus, setPresenceStatus] = useState({ state: "loading", detail: "" });
   const [onlineUsernames, setOnlineUsernames] = useState({});
 
   useEffect(() => {
@@ -7836,21 +7839,44 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   // Who is in the room now, every visit's enter / leave time and members per round.
   useEffect(() => {
     setPresence({ online: {}, sessions: {}, rounds: {} });
+    setPresenceStatus({ state: "loading", detail: "" });
     if (!liveRoom?.id) return undefined;
     let stopped = false;
     const stops = [];
+    const loaded = new Set();
+    let connected = false;
+    // A blocked connection (browser extension, content blocker, VPN) raises no error:
+    // the SDK just keeps retrying, so a timeout is the only sign. Failures are shown
+    // on the page and sent to the error log instead of showing a misleading 0.
+    const fail = (state, error, where) => {
+      if (stopped) return;
+      setPresenceStatus({ state, detail: String(error?.code || error?.message || error || "").slice(0, 120) });
+      console.error(`Monitor ${where} failed.`, error);
+      reportClientError(error, `monitor:presence:${where}`);
+    };
+    const timer = window.setTimeout(() => {
+      if (loaded.size < 3) {
+        fail("timeout", new Error(`Presence data not loaded after ${PRESENCE_TIMEOUT_MS / 1000}s (connected: ${connected}, loaded: ${[...loaded].join(",") || "none"})`), "timeout");
+      }
+    }, PRESENCE_TIMEOUT_MS);
     getRealtimeDb().then(({ database, ref, onValue }) => {
       if (stopped) return;
+      stops.push(onValue(ref(database, ".info/connected"), (snapshot) => { connected = snapshot.val() === true; }));
       for (const part of ["online", "sessions", "rounds"]) {
         stops.push(onValue(
           ref(database, `${part}/${liveRoom.id}`),
-          (snapshot) => setPresence((current) => ({ ...current, [part]: snapshot.val() || {} })),
-          (error) => console.error(`Monitor ${part} listener failed.`, error),
+          (snapshot) => {
+            setPresence((current) => ({ ...current, [part]: snapshot.val() || {} }));
+            loaded.add(part);
+            if (loaded.size === 3) setPresenceStatus({ state: "ready", detail: "" });
+          },
+          (error) => fail("error", error, part),
         ));
       }
-    }).catch((error) => console.error("Monitor presence listener failed.", error));
+    }).catch((error) => fail("error", error, "load"));
     return () => {
       stopped = true;
+      window.clearTimeout(timer);
       stops.forEach((stop) => stop());
     };
   }, [liveRoom?.id]);
@@ -7932,6 +7958,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   );
   const onlineKeys = Object.keys(presence.online);
   const onlineTotal = onlineKeys.length;
+  const audienceReady = presenceStatus.state === "ready";
   const chatCooldown = roomChatCooldownSeconds(liveRoom);
   const slowModeOn = chatCooldown > CHAT_COOLDOWN_SECONDS;
   const [slowModeSaving, setSlowModeSaving] = useState(false);
@@ -8020,11 +8047,18 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
           <div><span>待安排配送</span><strong>{shippingQueue.length}</strong></div>
         </div>
         <h3 className="monitor-audience-title">觀眾（直播房）</h3>
+        {liveRoom && presenceStatus.state === "loading" && <p className="muted">觀眾資料載入中…</p>}
+        {liveRoom && presenceStatus.state === "error" && (
+          <p className="monitor-audience-warning">⚠️ 未能讀取觀眾資料（{presenceStatus.detail || "未知錯誤"}），人數暫時無法顯示。請重新整理頁面或重新登入。</p>
+        )}
+        {liveRoom && presenceStatus.state === "timeout" && (
+          <p className="monitor-audience-warning">⚠️ 未能連接觀眾資料庫（可能被瀏覽器擴充功能、廣告封鎖、VPN 或網絡封鎖），人數暫時無法顯示。請改用其他瀏覽器或網絡，或暫停相關擴充功能後重新整理。</p>
+        )}
         <div className="affiliate-summary monitor-kpis">
-          <div><span>目前在線（總數）</span><strong>{onlineTotal}</strong></div>
-          <div><span>高峰在線</span><strong>{audience.peak}{audience.peakAt ? ` · ${formatClock(audience.peakAt)}` : ""}</strong></div>
-          <div><span>獨立人次</span><strong>{audience.unique}</strong></div>
-          <div><span>會員／訪客</span><strong>{audience.members} / {audience.guests}</strong></div>
+          <div><span>目前在線（總數）</span><strong>{audienceReady ? onlineTotal : "--"}</strong></div>
+          <div><span>高峰在線</span><strong>{audienceReady ? `${audience.peak}${audience.peakAt ? ` · ${formatClock(audience.peakAt)}` : ""}` : "--"}</strong></div>
+          <div><span>獨立人次</span><strong>{audienceReady ? audience.unique : "--"}</strong></div>
+          <div><span>會員／訪客</span><strong>{audienceReady ? `${audience.members} / ${audience.guests}` : "--"}</strong></div>
         </div>
         <div className="monitor-slow-mode">
           <p>

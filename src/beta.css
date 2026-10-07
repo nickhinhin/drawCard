@@ -6660,6 +6660,16 @@
   margin: 16px 0 8px;
 }
 
+.beta-mode .monitor-audience-warning {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid #8a5a00;
+  border-radius: 3px;
+  background: #2a1f08;
+  color: #ffcf70;
+  font-size: 13px;
+}
+
 .beta-mode .monitor-audience-rounds {
   margin-top: 8px;
 }
