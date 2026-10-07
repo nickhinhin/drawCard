@@ -1341,27 +1341,6 @@
   opacity: .68;
 }
 
-.beta-mode .token-request-methods legend {
-  color: var(--beta-white);
-}
-
-.beta-mode .token-request-methods button {
-  border-color: #34343b;
-  border-radius: 3px;
-  background: #141419;
-  color: var(--beta-white);
-}
-
-.beta-mode .token-request-methods button:hover,
-.beta-mode .token-request-methods button.selected {
-  border-color: var(--beta-red);
-  background: #1b1418;
-}
-
-.beta-mode .token-request-methods button small {
-  color: #b8b8c1;
-}
-
 .beta-mode .token-package span,
 .beta-mode .token-package strong,
 .beta-mode .token-preview strong,

@@ -4014,71 +4014,21 @@ textarea:focus {
   gap: 10px;
 }
 
-.token-request-methods {
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-
-.token-request-methods legend {
-  margin-bottom: 10px;
-  color: var(--zinc-900);
-  font-weight: 900;
-}
-
-.token-request-methods > div {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.token-request-methods button {
-  display: flex;
-  min-width: 0;
-  min-height: 82px;
+.token-method-link {
+  display: inline-flex;
   align-items: center;
-  gap: 12px;
-  padding: 15px;
-  border: 2px solid var(--line);
-  border-radius: var(--radius-md);
-  background: #fff;
-  color: var(--zinc-900);
-  text-align: left;
-}
-
-.token-request-methods button:hover,
-.token-request-methods button.selected {
-  border-color: var(--brand);
-  background: var(--red-50);
-}
-
-.token-request-methods button > svg {
-  flex: 0 0 auto;
+  justify-content: center;
+  gap: 7px;
+  justify-self: center;
+  padding: 4px 8px;
+  border: 0;
+  background: none;
   color: var(--brand);
+  font-weight: 800;
+  cursor: pointer;
 }
 
-.token-request-methods button > span {
-  display: grid;
-  min-width: 0;
-  gap: 3px;
-}
-
-.token-request-methods button strong,
-.token-request-methods button small {
-  overflow-wrap: anywhere;
-}
-
-.token-request-methods button small {
-  color: var(--muted);
-  line-height: 1.35;
-}
-
-@media (max-width: 620px) {
-  .token-request-methods > div {
-    grid-template-columns: 1fr;
-  }
-}
+.token-method-link:hover { text-decoration: underline; }
 
 .token-page {
   display: grid;

@@ -5556,10 +5556,6 @@ function TokenRequest({ profile }) {
   async function submitRequest(event) {
     event.preventDefault();
 
-    if (!requestMethod) {
-      alert("請先選擇付款購買代幣，或推廣活動兌換代幣。");
-      return;
-    }
     if (requestMethod === "payment" && (!Number.isSafeInteger(hkdAmount) || hkdAmount < MIN_CUSTOM_PAYMENT_HKD || hkdAmount > 1000000 || tokenAmount < 1 || tokenAmount > 1000000)) {
       alert(`請選擇套餐，或輸入最少 HK$${MIN_CUSTOM_PAYMENT_HKD} 的自訂金額。`);
       return;

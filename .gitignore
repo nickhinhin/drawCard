@@ -1,6 +1,7 @@
 node_modules
 dist
 dist-admin
+local-preview/
 .DS_Store
 .env
 .env.local
