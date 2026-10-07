@@ -210,9 +210,9 @@ export function buildMonitorReport({ startMs, endMs, records = [], requests = []
   };
 }
 
-// Audience figures for a monitor report. The admin page computes them from Realtime
-// Database presence (src/liveAudience.js) and sends them with "stop"; only bounded,
-// well-formed values are stored.
+// Audience figures for a monitor report. The server computes them from Realtime Database
+// presence (live-audience.js); the figures the admin page sends with "stop" are a fallback
+// for when that read fails. Only bounded, well-formed values are stored.
 const AUDIENCE_TIMELINE_MAX = 720; // 6 hours of 30-second points
 const count = (value) => (Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000 ? value : 0);
 const isoOrNull = (value) => (typeof value === "string" && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : null);

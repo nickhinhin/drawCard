@@ -468,7 +468,8 @@ try {
   await check("Authenticated username directory enumeration", false, () => getDocs(collection(db, "usernames")));
   await signOut(auth);
   await check("Anonymous draw overview remains readable", true, () => getDoc(doc(db, "draws/room")));
-  await check("Anonymous slot ownership metadata", false, () => getDoc(doc(db, "draws/room/rounds/round-001/slots/1")));
+  // Guests see the live number board (who took each number is already public in the chat).
+  await check("Anonymous live number board is readable", true, () => getDoc(doc(db, "draws/room/rounds/round-001/slots/1")));
   if (results.some((item) => !item.safe)) process.exitCode = 1;
   console.log(`SUMMARY ${results.filter((item) => item.safe).length}/${results.length} passed; ${results.filter((item) => !item.safe).length} unsafe actions accepted.`);
 } finally {

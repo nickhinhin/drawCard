@@ -1,7 +1,7 @@
 // Tests for the callables that read Cloud Logging (live monitor, audit analysis). In the
 // emulator those functions call http://127.0.0.1:9399 instead of Google, so this script
 // starts a stand-in log service there with canned entries. Run with:
-//   firebase emulators:exec --project livedraw-7e3c2 --only auth,firestore,functions "node scripts/verify-logging-flows.mjs"
+//   firebase emulators:exec --project livedraw-7e3c2 --only auth,firestore,database,functions "node scripts/verify-logging-flows.mjs"
 import http from "node:http";
 
 const P = "livedraw-7e3c2";
@@ -108,8 +108,42 @@ const doc = await fetch(`${FS}/monitorSessions/${started.data?.sessionId}`, { he
 const report = doc.fields?.report?.mapValue?.fields || {};
 check("monitor: session completed", doc.fields?.status?.stringValue === "completed", doc.fields?.status?.stringValue);
 check("monitor: report has the purchase, errors, audit and audience", Number(report.tokens?.integerValue || report.totalTokens?.integerValue || 0) >= 0
-  && Boolean(report.errors) && Boolean(report.audit) && report.audience?.mapValue?.fields?.unique?.integerValue === "3", Object.keys(report).join(","));
+  && Boolean(report.errors) && Boolean(report.audit) && Boolean(report.audience?.mapValue), Object.keys(report).join(","));
 expect("monitor: stop the same session again", await call("adminMonitorSession", { action: "stop", sessionId: started.data?.sessionId }), "FAILED_PRECONDITION");
+// Other suites may leave live rooms behind; with none, the page's figures are kept.
+check("monitor: audience read by the server, or the page's when there is no live room", ["server", "admin-page"].includes(report.audience?.mapValue?.fields?.source?.stringValue), JSON.stringify(report.audience));
+
+// ---- audience read by the server (admin pages that cannot reach the presence database) ----
+const RTDB = `http://127.0.0.1:${process.env.FIREBASE_DATABASE_EMULATOR_HOST?.split(":").at(-1) || 9000}`;
+const room = "log-flow-room";
+const putPresence = (path, value) => fetch(`${RTDB}/${path}.json?ns=livedraw-7e3c2-default-rtdb`, { method: "PUT", headers: owner, body: JSON.stringify(value) });
+expect("live audience: no running monitor", await call("adminLiveAudience", { drawId: room }), "FAILED_PRECONDITION");
+await fetch(`${FS}/draws/${room}`, { method: "PATCH", headers: owner, body: JSON.stringify({ fields: { status: { stringValue: "live" }, title: { stringValue: "Flow live" } } }) });
+const second = expect("monitor: start again", await call("adminMonitorSession", { action: "start", drawTitle: "Flow live" }), "OK");
+// Visits after the monitor started (earlier ones are outside the report).
+await new Promise((resolve) => setTimeout(resolve, 1500));
+const at = Date.now();
+await putPresence(`online/${room}`, { p1: { at }, p2: { at }, g_aaaaaaaaaaaaaaaaaaaaaaaa: { at } });
+await putPresence(`sessions/${room}`, {
+  p1: { v1: { in: at - 1000 } },
+  p2: { v1: { in: at - 900 } },
+  p3: { v1: { in: at - 800, out: at - 300 } },
+  g_aaaaaaaaaaaaaaaaaaaaaaaa: { v1: { in: at - 700 } },
+  p4: { v1: { in: at - 60 * 60 * 1000, out: at - 30 * 60 * 1000 } }, // left before the monitor started
+});
+await putPresence(`rounds/${room}`, { "round-001": { p1: true, p2: true, p3: true } });
+const live = expect("live audience: read by the server", await call("adminLiveAudience", { drawId: room }), "OK");
+check("live audience: online now (2 members + 1 guest) and every visitor (4)", live.data?.onlineTotal === 3 && live.data?.onlineGuests === 1
+  && live.data?.onlineMembers?.join() === "p1,p2" && live.data?.audience?.unique === 4 && live.data?.audience?.members === 3, JSON.stringify(live.data));
+check("live audience: round members", live.data?.audience?.byRound?.[0]?.unique === 3, JSON.stringify(live.data?.audience?.byRound));
+const fallbackRoom = (await call("adminLiveAudience", { drawId: "a.b#c" })).data?.roomId;
+check("live audience: a bad room id falls back to a live room", Boolean(fallbackRoom) && fallbackRoom !== "a.b#c", String(fallbackRoom));
+// The page could not read presence (audience null): the report still has the real figures.
+expect("monitor: stop without the page's audience", await call("adminMonitorSession", { action: "stop", sessionId: second.data?.sessionId, drawId: room, audience: null }), "OK");
+const secondDoc = await fetch(`${FS}/monitorSessions/${second.data?.sessionId}`, { headers: owner }).then((r) => r.json());
+const stored = secondDoc.fields?.report?.mapValue?.fields?.audience?.mapValue?.fields || {};
+check("monitor: report audience read by the server", stored.source?.stringValue === "server" && stored.unique?.integerValue === "4"
+  && stored.members?.integerValue === "3" && stored.roomId?.stringValue === room, JSON.stringify(stored).slice(0, 300));
 
 server.close();
 const failed = results.filter((line) => !line.startsWith("PASS"));

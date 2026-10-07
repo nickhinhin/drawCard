@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { applicationDefault, getApps, initializeApp } from "firebase-admin/app";
 import { FieldPath, FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
+import { getDatabase } from "firebase-admin/database";
 import { getStorage } from "firebase-admin/storage";
 import { logger } from "firebase-functions";
 import { setGlobalOptions } from "firebase-functions/v2";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { analyzeAuditEntries } from "./audit-analysis.js";
 import { analyticsDayRange, summarizeAdminDay } from "./admin-analytics.js";
+import { isGuestKey, summarizeLiveSessions } from "./live-audience.js";
 import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeAudience, sanitizeClientError } from "./monitor.js";
 
 // Least-privilege runtime identity: Firestore, this project's bucket, App Check and logging only.
@@ -1888,6 +1890,65 @@ async function errorSummary(sinceIso, untilIso) {
   };
 }
 
+// ---- Live audience from Realtime Database presence ----
+// The admin page normally reads presence itself. Some admin computers cannot reach
+// *.firebasedatabase.app (browser extensions, VPNs), so the server also reads it: for
+// those pages (adminLiveAudience) and for every monitor report (stop), so the report
+// no longer depends on which computer pressed stop.
+const PRESENCE_DATABASE_URL = "https://livedraw-7e3c2-default-rtdb.asia-southeast1.firebasedatabase.app";
+const AUDIENCE_CACHE_MS = 15 * 1000;
+const audienceCache = new Map();
+
+// The room the monitor watches: the one the admin page shows, else the first live room
+// (the page picks the same one).
+async function monitorRoomId(requested) {
+  const id = String(requested || "").trim();
+  if (id && id.length <= 180 && !/[/.#$[\]]/.test(id) && (await db.collection("draws").doc(id).get()).exists) return id;
+  const live = await db.collection("draws").where("status", "==", "live").limit(1).get();
+  return live.docs[0]?.id || "";
+}
+
+async function readPresence(roomId) {
+  const database = getDatabase(getApps()[0], PRESENCE_DATABASE_URL);
+  const [online, sessions, rounds] = await Promise.all(["online", "sessions", "rounds"].map(
+    (part) => database.ref(`${part}/${roomId}`).get().then((snapshot) => snapshot.val() || {}),
+  ));
+  return { online, sessions, rounds };
+}
+
+// Figures for a running session, shared by every admin page for 15 s.
+async function cachedLiveAudience(roomId, startMs) {
+  const key = `${roomId}|${startMs}`;
+  const cached = audienceCache.get(key);
+  if (cached && Date.now() - cached.at < AUDIENCE_CACHE_MS) return cached.result;
+  const result = readPresence(roomId).then(({ online, sessions, rounds }) => {
+    const keys = Object.keys(online);
+    const onlineMembers = keys.filter((item) => !isGuestKey(item)).sort();
+    return {
+      checkedAt: new Date().toISOString(),
+      roomId,
+      onlineTotal: keys.length,
+      onlineGuests: keys.length - onlineMembers.length,
+      onlineMembers: onlineMembers.slice(0, 1000),
+      audience: summarizeLiveSessions(sessions, rounds, startMs, Math.max(Date.now(), startMs)),
+    };
+  });
+  audienceCache.clear();
+  audienceCache.set(key, { at: Date.now(), result });
+  result.catch(() => audienceCache.delete(key));
+  return result;
+}
+
+export const adminLiveAudience = onCall({ ...adminCallableOptions, maxInstances: 2 }, async (request) => {
+  assertAdmin(request);
+  const active = await db.collection("monitorSessions").where("status", "in", ["active", "stopping"]).limit(1).get();
+  const startedAt = active.docs[0]?.data().startedAt;
+  if (!startedAt) throw new HttpsError("failed-precondition", "目前沒有進行中的監察。");
+  const roomId = await monitorRoomId(request.data?.drawId);
+  if (!roomId) throw new HttpsError("failed-precondition", "目前沒有直播中的直播房。");
+  return cachedLiveAudience(roomId, startedAt.toMillis());
+});
+
 // Live event health: grouped browser errors and server errors since the session started.
 export const adminLiveHealth = onCall({ ...adminCallableOptions, timeoutSeconds: 60 }, async (request) => {
   assertAdmin(request);
@@ -1963,10 +2024,23 @@ export const adminMonitorSession = onCall({ ...adminHeavyCallableOptions, timeou
       })().catch(() => null),
     ]);
     const audit = auditEntries ? analyzeAuditEntries(auditEntries) : null;
+    // Audience from Realtime Database presence, read here; the figures the admin page
+    // sent are used only if that read fails.
+    const roomId = await monitorRoomId(request.data?.drawId).catch(() => "");
+    const serverAudience = roomId
+      ? await readPresence(roomId)
+        .then(({ sessions, rounds }) => summarizeLiveSessions(sessions, rounds, start.getTime(), end.getTime()))
+        .catch((error) => {
+          logger.warn("Monitor report: presence read failed.", { roomId, error: String(error?.message || error) });
+          return null;
+        })
+      : null;
+    const pageAudience = sanitizeAudience(request.data?.audience);
     const stored = {
       ...report,
-      // Computed by the admin page from Realtime Database presence; see sanitizeAudience.
-      audience: sanitizeAudience(request.data?.audience),
+      audience: serverAudience
+        ? { ...sanitizeAudience(serverAudience), source: "server", roomId }
+        : pageAudience && { ...pageAudience, source: "admin-page" },
       errors,
       audit: audit ? { summary: audit.summary, entryCount: audit.entryCount, findings: audit.findings.slice(0, 50) } : { unavailable: true },
     };

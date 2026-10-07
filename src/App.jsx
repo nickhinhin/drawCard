@@ -7664,6 +7664,8 @@ function AuditLogExporter() {
 
 const MONITOR_PENDING_ALERT_MS = 10 * 60 * 1000;
 const MONITOR_HEALTH_REFRESH_MS = 60 * 1000;
+// When this computer cannot reach the presence database, the server reads it instead.
+const SERVER_AUDIENCE_REFRESH_MS = 30 * 1000;
 
 function formatAgo(ms) {
   if (!Number.isFinite(ms) || ms < 0) return "--";
@@ -7822,6 +7824,8 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const [now, setNow] = useState(Date.now());
   const [presence, setPresence] = useState({ online: {}, sessions: {}, rounds: {} });
   const [presenceStatus, setPresenceStatus] = useState({ state: "loading", detail: "" });
+  const [serverAudience, setServerAudience] = useState(null);
+  const [serverAudienceError, setServerAudienceError] = useState("");
   const [onlineUsernames, setOnlineUsernames] = useState({});
 
   useEffect(() => {
@@ -7880,6 +7884,32 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
       stops.forEach((stop) => stop());
     };
   }, [liveRoom?.id]);
+
+  // Fallback when the direct connection fails: the server reads presence every 30 s.
+  const presenceFailed = presenceStatus.state === "error" || presenceStatus.state === "timeout";
+  useEffect(() => {
+    setServerAudience(null);
+    setServerAudienceError("");
+    if (!presenceFailed || !liveRoom?.id) return undefined;
+    let cancelled = false;
+    async function loadServerAudience() {
+      try {
+        const { data } = await httpsCallable(functions, "adminLiveAudience")({ drawId: liveRoom.id });
+        if (!cancelled) {
+          setServerAudience(data);
+          setServerAudienceError("");
+        }
+      } catch (error) {
+        if (!cancelled) setServerAudienceError(getSafeErrorMessage(error, "未能經伺服器讀取觀眾資料。"));
+      }
+    }
+    loadServerAudience();
+    const timer = window.setInterval(loadServerAudience, SERVER_AUDIENCE_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [presenceFailed, liveRoom?.id]);
 
   useEffect(() => {
     if (!liveRoom?.id || !currentRoundId) {
@@ -7952,13 +7982,17 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   const buyingStopped = Boolean(liveRoom && isRoundBuyingBlocked(liveRoom, currentRoundId));
 
   // Recomputed every 5 s (the `now` tick); the chart has one point per 30 s.
-  const audience = useMemo(
+  const pageAudience = useMemo(
     () => summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Math.max(now, sessionStartMs)),
     [presence.sessions, presence.rounds, sessionStartMs, now],
   );
+  // Figures read directly by this page, or the server's copy when the page cannot connect.
+  const presenceReady = presenceStatus.state === "ready";
+  const fromServer = !presenceReady && Boolean(serverAudience);
+  const audienceReady = presenceReady || fromServer;
+  const audience = fromServer ? serverAudience.audience : pageAudience;
   const onlineKeys = Object.keys(presence.online);
-  const onlineTotal = onlineKeys.length;
-  const audienceReady = presenceStatus.state === "ready";
+  const onlineTotal = fromServer ? serverAudience.onlineTotal : onlineKeys.length;
   const chatCooldown = roomChatCooldownSeconds(liveRoom);
   const slowModeOn = chatCooldown > CHAT_COOLDOWN_SECONDS;
   const [slowModeSaving, setSlowModeSaving] = useState(false);
@@ -7983,14 +8017,14 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
   // Busy room: switch slow mode on at 500 online, and off again below 400 only if it
   // was switched on automatically (a manual setting is left alone).
   useEffect(() => {
-    if (!liveRoom?.id || slowModeSaving) return;
+    if (!liveRoom?.id || slowModeSaving || !audienceReady) return;
     if (!slowModeOn && onlineTotal >= SLOW_MODE_ON_AT) setSlowMode(true, true);
     else if (slowModeOn && liveRoom.chatSlowModeAuto && onlineTotal < SLOW_MODE_OFF_BELOW) setSlowMode(false, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveRoom?.id, liveRoom?.chatSlowModeAuto, slowModeOn, onlineTotal]);
-  const onlineMemberIds = onlineKeys.filter((key) => !isGuestKey(key)).sort();
+  }, [liveRoom?.id, liveRoom?.chatSlowModeAuto, slowModeOn, onlineTotal, audienceReady]);
+  const onlineMemberIds = fromServer ? serverAudience.onlineMembers : onlineKeys.filter((key) => !isGuestKey(key)).sort();
   const onlineMemberKey = onlineMemberIds.join("|");
-  const onlineGuestCount = onlineKeys.length - onlineMemberIds.length;
+  const onlineGuestCount = fromServer ? serverAudience.onlineGuests : onlineKeys.length - onlineMemberIds.length;
 
   // Watch only the profiles currently in the room so username changes appear immediately.
   useEffect(() => {
@@ -8025,7 +8059,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
               {" · "}已監察 {formatAgo(now - sessionStartMs)}（由 {formatClock(new Date(sessionStartMs))} 開始）
             </p>
           </div>
-          <button className="primary-btn monitor-stop" type="button" disabled={stopping} onClick={() => onStop(summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Date.now()))}>
+          <button className="primary-btn monitor-stop" type="button" disabled={stopping} onClick={() => onStop({ drawId: liveRoom?.id || "", audience: presenceReady ? summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Date.now()) : null })}>
             {stopping ? "正在產生報告..." : "停止監察並產生報告"}
           </button>
         </div>
@@ -8048,11 +8082,14 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
         </div>
         <h3 className="monitor-audience-title">觀眾（直播房）</h3>
         {liveRoom && presenceStatus.state === "loading" && <p className="muted">觀眾資料載入中…</p>}
-        {liveRoom && presenceStatus.state === "error" && (
-          <p className="monitor-audience-warning">⚠️ 未能讀取觀眾資料（{presenceStatus.detail || "未知錯誤"}），人數暫時無法顯示。請重新整理頁面或重新登入。</p>
+        {liveRoom && fromServer && (
+          <p className="muted">此電腦未能直接連接觀眾資料庫（可能被瀏覽器擴充功能、VPN 或網絡封鎖），已改由伺服器每 30 秒更新 · 最後更新 {formatClock(serverAudience.checkedAt)}</p>
         )}
-        {liveRoom && presenceStatus.state === "timeout" && (
-          <p className="monitor-audience-warning">⚠️ 未能連接觀眾資料庫（可能被瀏覽器擴充功能、廣告封鎖、VPN 或網絡封鎖），人數暫時無法顯示。請改用其他瀏覽器或網絡，或暫停相關擴充功能後重新整理。</p>
+        {liveRoom && presenceFailed && !fromServer && (
+          <p className="monitor-audience-warning">
+            ⚠️ 未能連接觀眾資料庫（{presenceStatus.state === "error" ? presenceStatus.detail || "未知錯誤" : "可能被瀏覽器擴充功能、VPN 或網絡封鎖"}），
+            {serverAudienceError ? `改由伺服器讀取亦失敗：${serverAudienceError}` : "正在改由伺服器讀取…"}
+          </p>
         )}
         <div className="affiliate-summary monitor-kpis">
           <div><span>目前在線（總數）</span><strong>{audienceReady ? onlineTotal : "--"}</strong></div>
@@ -8283,11 +8320,12 @@ function LiveMonitor() {
     }
   }
 
-  async function stopMonitor(audience) {
+  // The server reads the audience itself; the page's own figures are only a fallback.
+  async function stopMonitor({ drawId, audience }) {
     if (!window.confirm("確認停止監察並產生報告？")) return;
     setBusy(true);
     try {
-      const { data } = await httpsCallable(functions, "adminMonitorSession")({ action: "stop", sessionId: activeSession.id, audience });
+      const { data } = await httpsCallable(functions, "adminMonitorSession")({ action: "stop", sessionId: activeSession.id, drawId, audience });
       setViewingId(data.sessionId);
     } catch (error) {
       showSafeError(error, "未能停止監察，請再試一次。");

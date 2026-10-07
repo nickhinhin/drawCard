@@ -69,7 +69,7 @@ const ADMIN_CALLABLES = [
   "adminReviewTokenRequest", "adminAdjustMember", "adminSetShippingStatus", "adminEnsureDrawSlots",
   "adminRecalculateCardPrices", "adminRenameCardCategory", "adminPublishCardShowcase", "adminDeleteDraw",
   "adminCancelScheduledDraw", "adminUploadImage", "adminAuditAnalyze", "adminUpdateSupportMessage",
-  "adminLiveHealth", "adminMonitorSession",
+  "adminLiveHealth", "adminLiveAudience", "adminMonitorSession",
 ];
 // Every exported admin* callable must be in the list above, so a new one cannot be missed.
 const { readFileSync } = await import("node:fs");
