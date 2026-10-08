@@ -8633,7 +8633,11 @@ function AdminAnalytics() {
           </tr></thead><tbody>{rows.map((item) => <tr key={item.id}>
             {view === "users" ? <>
               <td><strong>{item.username || item.displayName || "未命名"}</strong><small>{item.id}</small></td>
-              <td>{displayEmail(item.email) || item.phoneNumber || "--"}</td><td>{formatAnalyticsTime(item.createdAt)}</td>
+              <td>
+                {displayEmail(item.email) && <span className="analytics-contact">{displayEmail(item.email)}</span>}
+                {item.phoneNumber && <span className="analytics-contact">{item.phoneNumber}</span>}
+                {!displayEmail(item.email) && !item.phoneNumber && "--"}
+              </td><td>{formatAnalyticsTime(item.createdAt)}</td>
               <td>{formatTokenNumber(item.tokens)}</td><td>HK${formatTokenNumber(item.totalDeposits)}</td>
             </> : view === "purchases" ? <>
               <td>{formatAnalyticsTime(item.createdAt)}</td><td><strong>{item.username || item.uid || "--"}</strong><small>{item.id}</small></td>
