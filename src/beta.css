@@ -5787,14 +5787,46 @@
   .beta-mode .pool-card-grid {
     grid-auto-flow: row;
     grid-auto-columns: auto;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     max-height: min(64vh, 620px);
     overflow-x: hidden;
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
     padding: 0 4px 8px 0;
+    gap: 5px;
     scroll-snap-type: none;
+  }
+
+  /* Four cards per row on phones: half-size cards, so less scrolling and less space. */
+  .beta-mode .pool-card {
+    gap: 3px;
+    padding: 4px;
+  }
+
+  .beta-mode .pool-card strong {
+    font-size: 10px;
+    line-height: 1.2;
+  }
+
+  .beta-mode .pool-card small {
+    font-size: 9px;
+    -webkit-line-clamp: 1;
+  }
+
+  .beta-mode .pool-card .token-amount {
+    gap: 3px;
+    font-size: 10px;
+  }
+
+  .beta-mode .pool-card .token-lightning {
+    width: 14px;
+    height: 14px;
+  }
+
+  .beta-mode .pool-card .token-lightning svg {
+    width: 9px;
+    height: 9px;
   }
 
   .beta-mode .announcement-editor-row {
@@ -6905,3 +6937,72 @@
 .beta-mode .member-adjust-gift > div { display: grid; gap: 4px; flex: 1 1 260px; }
 .beta-mode .member-adjust-gift small { color: #b9b9c2; }
 .beta-mode .member-adjust-gift input { width: 120px; min-height: 40px; padding: 0 10px; border: 1px solid #3a3a42; border-radius: 3px; background: #0b0b0f; color: #fff; font: inherit; }
+
+/* Phones: a mini number usage grid above the card list, so players can see which
+   numbers are taken before choosing a card. */
+@media (max-width: 760px) {
+  .beta-mode .draw-layout.purchase-step-1 {
+    grid-template-areas:
+      "stream"
+      "rounds"
+      "occupancy"
+      "step";
+  }
+
+  .beta-mode .desktop-number-occupancy {
+    display: grid;
+    gap: 7px;
+    padding: 8px;
+  }
+
+  .beta-mode .desktop-number-occupancy > header {
+    align-items: center;
+  }
+
+  .beta-mode .desktop-number-occupancy > header > div {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+
+  .beta-mode .desktop-number-occupancy > header strong {
+    font-size: 13px;
+  }
+
+  .beta-mode .desktop-number-grid {
+    grid-template-columns: repeat(10, minmax(0, 1fr));
+    gap: 3px;
+  }
+
+  .beta-mode .desktop-number-grid button {
+    min-height: 30px;
+    padding: 2px 0;
+  }
+
+  .beta-mode .desktop-number-grid strong {
+    font-size: 12px;
+  }
+
+  /* styles.css sets this label with !important. */
+  .beta-mode .desktop-number-grid .number-slot-outcome {
+    font-size: 10px !important;
+  }
+
+  .beta-mode .desktop-number-grid .number-slot-outcome i {
+    display: none;
+  }
+
+  .beta-mode .desktop-number-grid small {
+    display: none;
+  }
+
+  .beta-mode .desktop-number-grid .number-taken-cross {
+    width: 14px;
+    height: 14px;
+  }
+
+  .beta-mode .desktop-number-legend {
+    gap: 8px;
+    font-size: 9px;
+  }
+}
