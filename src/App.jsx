@@ -94,7 +94,7 @@ import { reportClientError } from "./errorReporting.js";
 import { TERMS_LAST_UPDATED, TERMS_OF_SERVICE } from "./termsOfService.js";
 import { getToken as getAppCheckToken } from "firebase/app-check";
 import { appCheck, auth, db, functions, getRealtimeDb, googleProvider } from "./firebase";
-import { isGuestKey, summarizeLiveSessions } from "./liveAudience.js";
+import { isGuestKey, RECENT_VISITOR_MS, summarizeLiveSessions, summarizeVisitors } from "./liveAudience.js";
 import PurchaseOverlayExporter from "./PurchaseOverlayExporter.jsx";
 
 const PENDING_AFFILIATE_CODE_KEY = "livedraw-pending-affiliate-code";
@@ -4975,7 +4975,11 @@ function getVisitorId() {
 // under online/{room}. Each visit is written once with its enter time; when the browser
 // disconnects the server itself removes the entry and stores the leave time, so there are
 // no repeated heartbeat writes. Members are also marked once per round they watch.
+// A failed write or a connection that never opens is sent to the error log (at most once
+// per page for the timeout), so browsers that are missing from the audience show up there.
+const PRESENCE_CONNECT_TIMEOUT_MS = 15 * 1000;
 const markedRounds = new Set();
+let presenceTimeoutReported = false;
 function useLivePresence(room, uid, visible) {
   const roomId = room?.status === "live" ? room.id : "";
   const liveRound = room?.status === "live" ? toRoundId(getRoomCurrentRound(room)) : "";
@@ -4984,7 +4988,13 @@ function useLivePresence(room, uid, visible) {
     const key = uid || (/^[0-9a-f]{24}$/.test(visitorId) ? `g_${visitorId}` : "");
     if (!roomId || !visible || !key) return undefined;
     let stopped = false;
+    let connected = false;
     let cleanup = () => {};
+    const timer = window.setTimeout(() => {
+      if (stopped || connected || presenceTimeoutReported) return;
+      presenceTimeoutReported = true;
+      reportClientError(new Error(`Presence not connected after ${PRESENCE_CONNECT_TIMEOUT_MS / 1000}s (${uid ? "member" : "guest"})`), "presence:timeout");
+    }, PRESENCE_CONNECT_TIMEOUT_MS);
     getRealtimeDb().then(({ database, ref, push, set, update, remove, onValue, onDisconnect, serverTimestamp: rtdbNow }) => {
       if (stopped) return;
       const onlineRef = ref(database, `online/${roomId}/${key}`);
@@ -4992,14 +5002,16 @@ function useLivePresence(room, uid, visible) {
       // Runs on the first connection and again after every reconnect.
       const stopListening = onValue(ref(database, ".info/connected"), async (snapshot) => {
         if (snapshot.val() !== true || stopped) return;
+        connected = true;
         try {
           sessionRef = push(ref(database, `sessions/${roomId}/${key}`));
           await set(sessionRef, { in: rtdbNow() });
           await onDisconnect(sessionRef).update({ out: rtdbNow() });
           await onDisconnect(onlineRef).remove();
           await set(onlineRef, { m: Boolean(uid), at: rtdbNow() });
-        } catch {
+        } catch (error) {
           // Presence only feeds the admin audience figures; never disturb the player.
+          reportClientError(error, "presence:write");
         }
       });
       cleanup = () => {
@@ -5011,9 +5023,10 @@ function useLivePresence(room, uid, visible) {
           update(sessionRef, { out: rtdbNow() }).catch(() => {});
         }
       };
-    }).catch(() => {});
+    }).catch((error) => reportClientError(error, "presence:load"));
     return () => {
       stopped = true;
+      window.clearTimeout(timer);
       cleanup();
     };
   }, [roomId, uid, visible]);
@@ -5024,7 +5037,10 @@ function useLivePresence(room, uid, visible) {
     markedRounds.add(roundKey);
     getRealtimeDb()
       .then(({ database, ref, set }) => set(ref(database, `rounds/${roundKey}`), true))
-      .catch(() => markedRounds.delete(roundKey));
+      .catch((error) => {
+        markedRounds.delete(roundKey);
+        reportClientError(error, "presence:round");
+      });
   }, [roomId, liveRound, uid, visible]);
 }
 
@@ -7735,6 +7751,8 @@ const MONITOR_PENDING_ALERT_MS = 10 * 60 * 1000;
 const MONITOR_HEALTH_REFRESH_MS = 60 * 1000;
 // When this computer cannot reach the presence database, the server reads it instead.
 const SERVER_AUDIENCE_REFRESH_MS = 30 * 1000;
+// Members seen during the session, most recent first; the rest are only counted.
+const MONITOR_MEMBER_LIST_LIMIT = 200;
 
 function formatAgo(ms) {
   if (!Number.isFinite(ms) || ms < 0) return "--";
@@ -7751,6 +7769,8 @@ function formatClock(value) {
 
 // Plain-language guess at what kind of problem an error is and what to do about it.
 const MONITOR_ERROR_KINDS = [
+  { test: /Presence (data )?not (loaded|connected)/i,
+    label: "觀眾資料未能連接", hint: "此瀏覽器未能連接觀眾資料庫（多數是瀏覽器擴充功能、VPN 或網絡封鎖），此玩家不會計入在線人數。偶爾出現無須處理；如大量出現，請交給工程師檢查。" },
   { test: /before initialization|is not defined|is not a function|Cannot read propert|Cannot set propert|undefined is not|null is not|TypeError|ReferenceError|SyntaxError/i,
     label: "程式錯誤", hint: "網站程式出錯，需要修正程式。請按「複製錯誤資料」並交給工程師。", fix: true },
   { test: /ChunkLoadError|Loading chunk|dynamically imported module|Importing a module script failed/i,
@@ -8052,14 +8072,19 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
 
   // Recomputed every 5 s (the `now` tick); the chart has one point per 30 s.
   const pageAudience = useMemo(
-    () => summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Math.max(now, sessionStartMs)),
-    [presence.sessions, presence.rounds, sessionStartMs, now],
+    () => summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Math.max(now, sessionStartMs), presence.online),
+    [presence.sessions, presence.rounds, presence.online, sessionStartMs, now],
+  );
+  const pageVisitors = useMemo(
+    () => summarizeVisitors(presence.sessions, presence.online, sessionStartMs, Math.max(now, sessionStartMs)),
+    [presence.sessions, presence.online, sessionStartMs, now],
   );
   // Figures read directly by this page, or the server's copy when the page cannot connect.
   const presenceReady = presenceStatus.state === "ready";
   const fromServer = !presenceReady && Boolean(serverAudience);
   const audienceReady = presenceReady || fromServer;
   const audience = fromServer ? serverAudience.audience : pageAudience;
+  const visitors = fromServer ? serverAudience.visitors || null : pageVisitors;
   const onlineKeys = Object.keys(presence.online);
   const onlineTotal = fromServer ? serverAudience.onlineTotal : onlineKeys.length;
   const chatCooldown = roomChatCooldownSeconds(liveRoom);
@@ -8092,19 +8117,19 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveRoom?.id, liveRoom?.chatSlowModeAuto, slowModeOn, onlineTotal, audienceReady]);
   const onlineMemberIds = fromServer ? serverAudience.onlineMembers : onlineKeys.filter((key) => !isGuestKey(key)).sort();
-  const onlineMemberKey = onlineMemberIds.join("|");
-  const onlineGuestCount = fromServer ? serverAudience.onlineGuests : onlineKeys.length - onlineMemberIds.length;
+  const listedMembers = (visitors?.members || []).slice(0, MONITOR_MEMBER_LIST_LIMIT);
+  const listedMemberKey = [...new Set([...onlineMemberIds, ...listedMembers.map((member) => member.uid)])].sort().join("|");
 
-  // Watch only the profiles currently in the room so username changes appear immediately.
+  // Watch the profiles of the members listed below so username changes appear immediately.
   useEffect(() => {
-    if (!onlineMemberKey) return undefined;
-    const unsubscribes = onlineMemberKey.split("|").map((uid) => onSnapshot(
+    if (!listedMemberKey) return undefined;
+    const unsubscribes = listedMemberKey.split("|").map((uid) => onSnapshot(
       doc(db, "users", uid),
       (snapshot) => setOnlineUsernames((current) => ({ ...current, [uid]: snapshot.data()?.username || "" })),
       (error) => console.error("Monitor online username listener failed.", error),
     ));
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
-  }, [onlineMemberKey]);
+  }, [listedMemberKey]);
 
   const alerts = [];
   if (!liveRoom) alerts.push({ level: "medium", text: "目前沒有直播中的房間。" });
@@ -8128,7 +8153,7 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
               {" · "}已監察 {formatAgo(now - sessionStartMs)}（由 {formatClock(new Date(sessionStartMs))} 開始）
             </p>
           </div>
-          <button className="primary-btn monitor-stop" type="button" disabled={stopping} onClick={() => onStop({ drawId: liveRoom?.id || "", audience: presenceReady ? summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Date.now()) : null })}>
+          <button className="primary-btn monitor-stop" type="button" disabled={stopping} onClick={() => onStop({ drawId: liveRoom?.id || "", audience: presenceReady ? summarizeLiveSessions(presence.sessions, presence.rounds, sessionStartMs, Date.now(), presence.online) : null })}>
             {stopping ? "正在產生報告..." : "停止監察並產生報告"}
           </button>
         </div>
@@ -8175,17 +8200,31 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
             {slowModeSaving ? "更新中..." : slowModeOn ? "關閉慢速模式" : `開啟慢速模式（${SLOW_MODE_SECONDS} 秒）`}
           </button>
         </div>
-        <div className="monitor-online-users">
-          <strong>在線會員（{onlineMemberIds.length}）</strong>
-          {onlineMemberIds.length ? (
-            <ul>
-              {onlineMemberIds.map((uid) => (
-                <li key={uid}>{onlineUsernames[uid] || (uid in onlineUsernames ? "未設定用戶名" : "讀取中...")}</li>
-              ))}
-            </ul>
-          ) : <p className="muted">目前沒有會員在線。</p>}
-          {onlineGuestCount > 0 && <p className="muted">另有 {onlineGuestCount} 位未登入訪客在線。</p>}
-        </div>
+        {audienceReady && visitors ? (
+          <div className="monitor-visitors">
+            <div className="affiliate-summary monitor-kpis">
+              <div><span>登入會員（監察期間）</span><strong>{visitors.memberTotal} 人 · 在線 {visitors.memberOnline}</strong></div>
+              <div><span>未登入訪客（監察期間）</span><strong>{visitors.guestTotal} 人 · 在線 {visitors.guestOnline}</strong></div>
+              <div><span>訪客（最近 {RECENT_VISITOR_MS / 60000} 分鐘）</span><strong>{visitors.guestRecent} 人</strong></div>
+            </div>
+            {listedMembers.length ? (
+              <div className="monitor-visitor-table" role="table" aria-label="監察期間會員">
+                <div className="monitor-visitor-row head" role="row">
+                  <span role="columnheader">會員</span><span role="columnheader">最後見到</span><span role="columnheader">進入次數</span><span role="columnheader">總停留</span>
+                </div>
+                {listedMembers.map((member) => (
+                  <div className={`monitor-visitor-row ${member.online ? "online" : ""}`} role="row" key={member.uid}>
+                    <span role="cell">{onlineUsernames[member.uid] || (member.uid in onlineUsernames ? "未設定用戶名" : "讀取中...")}</span>
+                    <span role="cell">{member.online ? "● 在線中" : `${formatAgo(now - member.lastSeen)}前 · ${formatClock(new Date(member.lastSeen))}`}</span>
+                    <span role="cell">{member.visits}</span>
+                    <span role="cell">{formatAgo(member.totalMs)}</span>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="muted">監察期間未有會員進入直播房。</p>}
+            {visitors.memberTotal > listedMembers.length && <p className="muted">只顯示最近 {listedMembers.length} 位，共 {visitors.memberTotal} 位。</p>}
+          </div>
+        ) : null}
         <AudienceTimeline points={audience.timeline} stepSeconds={audience.stepSeconds} title="人流走勢（監察期間）" />
         {audience.byRound.length > 0 && (
           <p className="muted monitor-audience-rounds">
@@ -9081,6 +9120,7 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
   const [saving, setSaving] = useState(false);
   const [legacySyncMessage, setLegacySyncMessage] = useState("");
   const legacySyncKeyRef = useRef("");
+  const draftSessionKeyRef = useRef("");
   const purchaseRecords = useMemo(
     () => records.filter((record) => record.uid && record.number).sort(compareRoomRoundRecords),
     [records],
@@ -9203,8 +9243,12 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
   const hellCount = numberList.filter((number) => draftSides[number] === "hell").length;
   const unselectedCount = numberList.length - heavenCount - hellCount;
 
+  // The purchase and room listeners update often during a live (every purchase, every
+  // room change). Only choosing another round starts the draft again; any other update
+  // keeps the unsaved choices and only takes the results that have been assigned since.
   useEffect(() => {
     if (!selectedSession) {
+      draftSessionKeyRef.current = "";
       setDraftSides({});
       return;
     }
@@ -9214,9 +9258,14 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
         .filter((record) => ["heaven", "hell"].includes(record.resultSide))
         .map((record) => [Number(record.number), record.resultSide]),
     );
-    setDraftSides({ ...savedSides, ...recordSides });
-    setPreviewOpen(false);
-  }, [selectedSessionKey, selectedDraw?.roundResultSides, selectedSession, sessionRecords]);
+    if (draftSessionKeyRef.current !== selectedSession.key) {
+      draftSessionKeyRef.current = selectedSession.key;
+      setDraftSides({ ...savedSides, ...recordSides });
+      setPreviewOpen(false);
+      return;
+    }
+    setDraftSides((current) => ({ ...savedSides, ...current, ...recordSides }));
+  }, [selectedDraw?.roundResultSides, selectedSession, sessionRecords]);
 
   function chooseSide(number, side) {
     const record = recordsByNumber.get(number);
@@ -9249,16 +9298,20 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
     return { heavenCard, resultCard, resultSide };
   }
 
-  function openFullTablePreview() {
-    if (unselectedCount > 0) {
-      alert(`尚有 ${unselectedCount} 個號碼未標記天堂或地獄。`);
-      return;
-    }
+  // Why the round cannot be assigned yet, or "" when it can.
+  function roundAssignmentProblem() {
+    if (unselectedCount > 0) return `尚有 ${unselectedCount} 個號碼未標記天堂或地獄。`;
     const missingCardRecord = sessionRecords
       .filter((record) => !record.cardId)
       .find((record) => !resolveRecordResult(record).resultCard);
-    if (missingCardRecord) {
-      alert(`#${missingCardRecord.number} 未設定可派發卡牌，請先到卡牌庫設定天堂卡及地獄對應卡。`);
+    if (missingCardRecord) return `#${missingCardRecord.number} 未設定可派發卡牌，請先到卡牌庫設定天堂卡及地獄對應卡。`;
+    return "";
+  }
+
+  function openFullTablePreview() {
+    const problem = roundAssignmentProblem();
+    if (problem) {
+      alert(problem);
       return;
     }
     setPreviewOpen(true);
@@ -9266,6 +9319,14 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
 
   async function confirmRoundAssignment() {
     if (!selectedSession || saving) return;
+    // A number may have been sold while the preview was open; it must be marked first,
+    // or it would be assigned without a chosen side.
+    const problem = roundAssignmentProblem();
+    if (problem) {
+      setPreviewOpen(false);
+      alert(`預覽期間有新的變更：${problem}`);
+      return;
+    }
     setSaving(true);
     try {
       const batch = adminWriteBatch();
@@ -9415,7 +9476,7 @@ function AdminRoundResultConfirmModal({ drawTitle, roundId, numberList, recordsB
             return (
               <div className={side} key={number}>
                 <strong>#{number}</strong>
-                <span>{side === "heaven" ? "天堂" : "地獄"}</span>
+                <span>{side === "heaven" ? "天堂" : side === "hell" ? "地獄" : "未標記"}</span>
                 <small>{record.username || "已售"}</small>
                 <em title={record.targetCardName || "未記錄所選卡牌"}>所選：{record.targetCardName || "未記錄"}</em>
               </div>

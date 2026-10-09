@@ -7,7 +7,7 @@ import { setGlobalOptions } from "firebase-functions/v2";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { analyzeAuditEntries } from "./audit-analysis.js";
 import { analyticsDayRange, summarizeAdminDay } from "./admin-analytics.js";
-import { isGuestKey, summarizeLiveSessions } from "./live-audience.js";
+import { isGuestKey, summarizeLiveSessions, summarizeVisitors } from "./live-audience.js";
 import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeAudience, sanitizeClientError } from "./monitor.js";
 
 // Least-privilege runtime identity: Firestore, this project's bucket, App Check and logging only.
@@ -1935,13 +1935,15 @@ async function cachedLiveAudience(roomId, startMs) {
   const result = readPresence(roomId).then(({ online, sessions, rounds }) => {
     const keys = Object.keys(online);
     const onlineMembers = keys.filter((item) => !isGuestKey(item)).sort();
+    const endMs = Math.max(Date.now(), startMs);
     return {
       checkedAt: new Date().toISOString(),
       roomId,
       onlineTotal: keys.length,
       onlineGuests: keys.length - onlineMembers.length,
       onlineMembers: onlineMembers.slice(0, 1000),
-      audience: summarizeLiveSessions(sessions, rounds, startMs, Math.max(Date.now(), startMs)),
+      audience: summarizeLiveSessions(sessions, rounds, startMs, endMs, online),
+      visitors: summarizeVisitors(sessions, online, startMs, endMs),
     };
   });
   audienceCache.clear();
@@ -2040,7 +2042,7 @@ export const adminMonitorSession = onCall({ ...adminHeavyCallableOptions, timeou
     const roomId = await monitorRoomId(request.data?.drawId).catch(() => "");
     const serverAudience = roomId
       ? await readPresence(roomId)
-        .then(({ sessions, rounds }) => summarizeLiveSessions(sessions, rounds, start.getTime(), end.getTime()))
+        .then(({ sessions, rounds, online }) => summarizeLiveSessions(sessions, rounds, start.getTime(), end.getTime(), online))
         .catch((error) => {
           logger.warn("Monitor report: presence read failed.", { roomId, error: String(error?.message || error) });
           return null;
