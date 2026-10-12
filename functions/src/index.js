@@ -315,6 +315,13 @@ export function signupBonusClaimId(phoneNumber) {
   return createHash("sha256").update(`signup-bonus:${phoneNumber}`).digest("hex");
 }
 
+// Same as the player site's normalizeUsername: spaces become "_", other characters are
+// dropped; a valid name has 3–24 letters, digits or "_".
+export function normalizeUsername(value) {
+  const name = String(value || "").trim().replace(/\s+/g, "_").replace(/[^A-Za-z0-9_]/g, "").slice(0, 24);
+  return name.length >= 3 ? name : "";
+}
+
 export const ensureAffiliateAccount = onCall(userCallableOptions, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "請先登入會員帳戶。");
   // Passwords exist only as a second factor-free login for verified phone accounts;
@@ -327,6 +334,10 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
   const displayName = String(request.data?.displayName || request.auth.token.name || "").trim().slice(0, 80);
   const phoneNumber = String(request.data?.phoneNumber || request.auth.token.phone_number || "").trim().slice(0, 24);
   const ageConfirmed = request.data?.ageConfirmed === true;
+  // The player name typed at registration is claimed here, with the profile, so no
+  // second writer (the browser) claims it at the same time; a taken or invalid name is
+  // left empty and the player chooses another one.
+  const requestedUsername = normalizeUsername(request.data?.username);
   const userRef = db.collection("users").doc(uid);
 
   const result = await db.runTransaction(async (transaction) => {
@@ -375,11 +386,14 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
     const giftSettings = bonusAlreadyClaimed ? null : await transaction.get(signupBonusSettingsRef());
     const signupBonusTokens = bonusAlreadyClaimed ? 0 : signupBonusAmount(giftSettings.exists ? giftSettings.data() : null);
 
+    const usernameRef = requestedUsername ? db.collection("usernames").doc(requestedUsername.toLowerCase()) : null;
+    const username = usernameRef && !(await transaction.get(usernameRef)).exists ? requestedUsername : "";
+
     const email = String(request.auth.token.email || "").slice(0, 320);
     const photoURL = String(request.auth.token.picture || "").slice(0, 500);
     transaction.create(userRef, {
       // Users cannot create their own profile; the gift (if any) is added here.
-      uid, email, displayName, photoURL, phoneNumber, username: "", tokens: signupBonusTokens, role: "user",
+      uid, email, displayName, photoURL, phoneNumber, username, tokens: signupBonusTokens, role: "user",
       ...(signupBonusTokens ? { signupBonusTokens, signupBonusAt: FieldValue.serverTimestamp() } : {}),
       affiliateStatus: "none",
       referredByUid: referrerUid,
@@ -388,6 +402,9 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
       ...(ageConfirmed ? { ageConfirmed: true, ageConfirmedAt: FieldValue.serverTimestamp() } : {}),
       createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp(),
     });
+    if (username) {
+      transaction.create(usernameRef, { uid, username, createdAt: FieldValue.serverTimestamp() });
+    }
     if (signupBonusTokens) {
       transaction.create(bonusClaimRef, { uid, tokens: signupBonusTokens, createdAt: FieldValue.serverTimestamp() });
     }
@@ -402,7 +419,7 @@ export const ensureAffiliateAccount = onCall(userCallableOptions, async (request
         createdAt: FieldValue.serverTimestamp(),
       });
     }
-    return { affiliateCode: "", affiliateStatus: "none", referredByUid: referrerUid, created: true, signupBonusTokens };
+    return { affiliateCode: "", affiliateStatus: "none", referredByUid: referrerUid, created: true, signupBonusTokens, username };
   });
   return { ok: true, ...result };
 });
@@ -1264,8 +1281,9 @@ export const adminRecalculateCardPrices = onCall(adminCallableOptions, async (re
   if (!Number.isFinite(marginRate) || marginRate <= 0 || marginRate > 10) {
     throw new HttpsError("invalid-argument", "毛利率必須大過 0 並且不多於 10。");
   }
+  // Finished rooms keep the prices they were played at; only open rooms are repriced.
   const [cardsSnapshot, drawsSnapshot] = await Promise.all([
-    db.collection("cards").get(), db.collection("draws").get(),
+    db.collection("cards").get(), db.collection("draws").where("status", "in", ["live", "scheduled", "draft"]).get(),
   ]);
   const cards = new Map(cardsSnapshot.docs.map((item) => [item.id, item.data()]));
   const prices = new Map();

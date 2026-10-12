@@ -7006,3 +7006,9 @@
     font-size: 9px;
   }
 }
+
+.beta-mode .admin-load-more {
+  display: flex;
+  justify-content: center;
+  margin: 14px 0 4px;
+}

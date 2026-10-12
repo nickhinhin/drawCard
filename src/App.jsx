@@ -191,6 +191,12 @@ const CARD_THUMB_COMPRESSION = {
 };
 
 const LIVE_SNAPSHOT_OPTIONS = { includeMetadataChanges: true };
+// Rooms that are not finished yet; card price changes still apply to them.
+const OPEN_ROOM_STATUSES = ["live", "scheduled", "draft"];
+// The admin page loads the newest finished rooms and purchase records a page at a time,
+// so opening it stays fast as the history grows ("載入更早" loads the next page).
+const ADMIN_ROOM_PAGE_SIZE = 30;
+const ADMIN_RECORD_PAGE_SIZE = 1000;
 // Set once the new-member gift pop-up has been shown in this browser.
 const SIGNUP_PROMO_SEEN_KEY = "livedraw-signup-promo-seen";
 // A guest's room / card / round / number kept while they log in (see rememberGuestSelection).
@@ -711,6 +717,8 @@ function App() {
       try {
         const accountData = {
           referralCode: captureAffiliateCode(),
+          // The registration form's name becomes the player name, claimed by the server.
+          username: normalizeUsername(pendingRegistration.displayName || ""),
           displayName: pendingRegistration.displayName || authUser.displayName || "",
           phoneNumber: pendingRegistration.phoneNumber || authUser.phoneNumber || "",
           ageConfirmed: pendingRegistration.ageConfirmed === true,
@@ -1517,22 +1525,21 @@ function AuthDialog({ authError, isBeta = false, notice = "", initialAction = ""
         throw new Error("此手機號碼尚未註冊，請返回選擇「註冊」。");
       }
       if (isBeta && isRegistration) {
-        const username = normalizeUsername(displayName);
         // The phone sign-in credential is new; wait for its ID token before account bootstrap.
+        // The server creates the profile and claims the player name in one step, so the
+        // name screen never shows while a second claim is still running.
         await credential.user.getIdToken();
         await httpsCallable(functions, "ensureAffiliateAccount", {
           limitedUseAppCheckTokens: true,
         })({
           referralCode: captureAffiliateCode(),
+          username: normalizeUsername(displayName),
           displayName: displayName.trim().slice(0, 80),
           phoneNumber: credential.user.phoneNumber || normalizePhoneNumber(phoneCountry, phoneNumber),
           ageConfirmed: true,
         });
         window.localStorage.removeItem(PENDING_AFFILIATE_CODE_KEY);
         window.sessionStorage.removeItem(PENDING_REGISTRATION_KEY);
-        if (username.length >= 3) {
-          await ensureUsernameClaim(credential.user.uid, username);
-        }
       }
       onClose();
     } catch (error) {
@@ -8711,6 +8718,10 @@ function LiveDrawAdminPanel({ profile }) {
   const [cards, setCards] = useState([]);
   const [records, setRecords] = useState([]);
   const [recordsError, setRecordsError] = useState("");
+  const [roomLimit, setRoomLimit] = useState(ADMIN_ROOM_PAGE_SIZE);
+  const [roomsHaveMore, setRoomsHaveMore] = useState(false);
+  const [recordLimit, setRecordLimit] = useState(ADMIN_RECORD_PAGE_SIZE);
+  const [recordsHaveMore, setRecordsHaveMore] = useState(false);
   const [adminLoading, setAdminLoading] = useState({
     requests: true,
     draws: true,
@@ -8739,18 +8750,34 @@ function LiveDrawAdminPanel({ profile }) {
     adminSections.find((section) => section.id === activeAdminSection) || adminSections[0];
   const ActiveIcon = activeSection.icon;
 
+  // Every open room (live, scheduled, draft) plus the newest rooms, a page at a time.
   useEffect(() => {
-    const drawsQuery = query(collection(db, "draws"), orderBy("createdAt", "desc"));
-    const stopDraws = onSnapshot(drawsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
-      setDraws(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-      if (isSnapshotReady(snapshot)) {
-        setAdminLoading((current) => ({ ...current, draws: false }));
-      }
+    const parts = { open: null, recent: null };
+    const publish = () => {
+      if (!parts.open || !parts.recent) return;
+      const byId = new Map([...parts.recent, ...parts.open].map((room) => [room.id, room]));
+      setDraws([...byId.values()].sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt)));
+      setAdminLoading((current) => ({ ...current, draws: false }));
+    };
+    const listen = (part, roomsQuery) => onSnapshot(roomsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+      if (!isSnapshotReady(snapshot) && !parts[part]) return;
+      parts[part] = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      if (part === "recent") setRoomsHaveMore(snapshot.size >= roomLimit);
+      publish();
     }, (error) => {
       console.error("Admin room listener failed.", error);
-      setAdminLoading((current) => ({ ...current, draws: false }));
+      parts[part] = parts[part] || [];
+      publish();
     });
+    const stopOpen = listen("open", query(collection(db, "draws"), where("status", "in", OPEN_ROOM_STATUSES)));
+    const stopRecent = listen("recent", query(collection(db, "draws"), orderBy("createdAt", "desc"), limit(roomLimit)));
+    return () => {
+      stopOpen();
+      stopRecent();
+    };
+  }, [roomLimit]);
 
+  useEffect(() => {
     const cardsQuery = query(collection(db, "cards"), orderBy("createdAt", "desc"));
     const stopCards = onSnapshot(cardsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setCards(snapshot.docs
@@ -8764,10 +8791,7 @@ function LiveDrawAdminPanel({ profile }) {
       setAdminLoading((current) => ({ ...current, cards: false }));
     });
 
-    return () => {
-      stopDraws();
-      stopCards();
-    };
+    return () => stopCards();
   }, []);
 
   // Only load the full request history while its admin section is open.
@@ -8821,9 +8845,18 @@ function LiveDrawAdminPanel({ profile }) {
 
     setAdminLoading((current) => ({ ...current, records: true }));
     setRecordsError("");
-    const recordsQuery = query(collection(db, "drawRecords"), orderBy("createdAt", "desc"));
+    // Each section reads only what it shows: every card in delivery, the newest
+    // conversions, or the newest purchases; older pages load on request.
+    const recordsRef = collection(db, "drawRecords");
+    const paged = activeAdminSection !== "shipping";
+    const recordsQuery = activeAdminSection === "shipping"
+      ? query(recordsRef, where("collectionStatus", "in", ["shipping", "shipped"]))
+      : activeAdminSection === "conversions"
+        ? query(recordsRef, where("collectionStatus", "==", "converted"), orderBy("convertedAt", "desc"), limit(recordLimit))
+        : query(recordsRef, orderBy("createdAt", "desc"), limit(recordLimit));
     return onSnapshot(recordsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      setRecordsHaveMore(paged && snapshot.size >= recordLimit);
       setRecordsError("");
       if (isSnapshotReady(snapshot)) {
         setAdminLoading((current) => ({ ...current, records: false }));
@@ -8833,7 +8866,7 @@ function LiveDrawAdminPanel({ profile }) {
       setRecordsError(getSafeErrorMessage(error, "未能載入卡牌紀錄。"));
       setAdminLoading((current) => ({ ...current, records: false }));
     });
-  }, [activeAdminSection]);
+  }, [activeAdminSection, recordLimit]);
 
   // Reviews run server-side so token grants, VIP rewards and the audit log commit together.
   async function reviewTokenRequest(payload) {
@@ -9042,6 +9075,9 @@ function LiveDrawAdminPanel({ profile }) {
             loading={adminLoading.draws || adminLoading.cards}
             profile={profile}
           />
+          {roomsHaveMore && (
+            <AdminLoadMore label="載入更早的直播" onClick={() => setRoomLimit((current) => current + ADMIN_ROOM_PAGE_SIZE)} />
+          )}
         </section>
       )}
       {activeAdminSection === "records" && (
@@ -9062,6 +9098,9 @@ function LiveDrawAdminPanel({ profile }) {
               loading={adminLoading.cards || adminLoading.records}
             />
           )}
+          {recordsHaveMore && (
+            <AdminLoadMore label={`載入更早的購買紀錄（目前顯示最新 ${records.length} 筆）`} onClick={() => setRecordLimit((current) => current + ADMIN_RECORD_PAGE_SIZE)} />
+          )}
         </div>
       )}
       {activeAdminSection === "shipping" && (
@@ -9072,8 +9111,19 @@ function LiveDrawAdminPanel({ profile }) {
       {activeAdminSection === "conversions" && (
         <div className="admin-section">
           <AdminCardConversionRecords records={records} loading={adminLoading.records} error={recordsError} />
+          {recordsHaveMore && (
+            <AdminLoadMore label={`載入更早的轉幣紀錄（目前顯示最新 ${records.length} 筆）`} onClick={() => setRecordLimit((current) => current + ADMIN_RECORD_PAGE_SIZE)} />
+          )}
         </div>
       )}
+    </div>
+  );
+}
+
+function AdminLoadMore({ label, onClick }) {
+  return (
+    <div className="admin-load-more">
+      <button className="small-btn" type="button" onClick={onClick}>{label}</button>
     </div>
   );
 }
@@ -9219,7 +9269,20 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
   }, [selectedSessionKey, sessions]);
 
   const selectedSession = sessions.find((session) => session.key === selectedSessionKey) || null;
-  const selectedDraw = draws.find((draw) => draw.id === selectedSession?.drawId) || null;
+  // The page holds only the newest rooms; an older round's room is read on its own.
+  const listedDraw = draws.find((draw) => draw.id === selectedSession?.drawId) || null;
+  const [olderDraw, setOlderDraw] = useState(null);
+  const missingDrawId = selectedSession && !listedDraw && selectedSession.drawId !== "unknown" ? selectedSession.drawId : "";
+  useEffect(() => {
+    setOlderDraw(null);
+    if (!missingDrawId) return undefined;
+    return onSnapshot(
+      doc(db, "draws", missingDrawId),
+      (snapshot) => setOlderDraw(snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null),
+      (error) => console.error("Older room listener failed.", error),
+    );
+  }, [missingDrawId]);
+  const selectedDraw = listedDraw || (olderDraw?.id === selectedSession?.drawId ? olderDraw : null);
   const sessionRecords = useMemo(
     () => purchaseRecords.filter((record) =>
       (record.drawId || record.roomSlug || "unknown") === selectedSession?.drawId
@@ -9693,7 +9756,6 @@ function ShippingRequestManager({ records, loading = false }) {
       )}
       {auditUser && (
         <UserRecordAuditModal
-          records={records}
           user={auditUser}
           onClose={() => setAuditUser(null)}
         />
@@ -9702,18 +9764,25 @@ function ShippingRequestManager({ records, loading = false }) {
   );
 }
 
-function UserRecordAuditModal({ records, user, onClose }) {
+function UserRecordAuditModal({ user, onClose }) {
   const [slotChecks, setSlotChecks] = useState({});
   const [checking, setChecking] = useState(true);
   const [accountSummary, setAccountSummary] = useState(null);
   const [depositRecords, setDepositRecords] = useState([]);
   const [selectedProof, setSelectedProof] = useState(null);
-  const userRecords = useMemo(
-    () => records
-      .filter((record) => record.uid === user.uid)
-      .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt)),
-    [records, user.uid],
-  );
+  // The member's complete history, read here: the page around it holds only a section's records.
+  const [userRecords, setUserRecords] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    getDocs(query(collection(db, "drawRecords"), where("uid", "==", user.uid)))
+      .then((snapshot) => {
+        if (!cancelled) setUserRecords(snapshot.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .sort((left, right) => toMillis(right.createdAt) - toMillis(left.createdAt)));
+      })
+      .catch((error) => console.error("Member record read failed.", error));
+    return () => { cancelled = true; };
+  }, [user.uid]);
   const totalSpend = userRecords.reduce((sum, record) => sum + Number(record.tokenCost || 0), 0);
   const assignedCount = userRecords.filter((record) => record.cardId).length;
   const shippingCount = userRecords.filter((record) => record.shippingRequested).length;
@@ -11695,10 +11764,12 @@ function CreateCardForm({ cards, profile }) {
   }
 
   // Reprice every paired card together so changing a hell card or the margin cannot leave stale prices behind.
+  // Only rooms that are not finished take the new prices: a finished room keeps the prices
+  // it was played at, and the number of rewritten rooms no longer grows with the history.
   async function recalculateAllCardPrices(rate, saveSetting = false) {
     const [cardSnapshot, roomSnapshot, showcaseSnapshot] = await Promise.all([
       getDocs(collection(db, "cards")),
-      getDocs(collection(db, "draws")),
+      getDocs(query(collection(db, "draws"), where("status", "in", OPEN_ROOM_STATUSES))),
       getDocs(collection(db, "publicCardShowcase")),
     ]);
     const allCards = cardSnapshot.docs
