@@ -6,11 +6,13 @@ import { functions, recoverFromCorruptLocalCache } from "./firebase.js";
 // Each message is sent at most once a minute and a page sends at most 30 reports.
 const MAX_REPORTS_PER_PAGE = 30;
 const REPEAT_WINDOW_MS = 60 * 1000;
-// The last pattern covers scripts that in-app browsers (Instagram, Facebook,
-// Android WebViews) inject into the page; they are not LiveDraw errors.
+// The last two patterns cover in-app browsers (Instagram, Facebook, Android WebViews):
+// scripts they inject into the page, and their broken IndexedDB, which Firebase reads
+// in the background without affecting the page. Neither is a LiveDraw error.
 const IGNORED = [
   /ResizeObserver loop/i, /chrome-extension:\/\//i, /Script error\.?$/i,
   /webkit\.messageHandlers|_pcmBridgeCallbackHandler|Java object is gone/i,
+  /Object store cannot be found in the database/i,
 ];
 const lastSent = new Map();
 let reportsSent = 0;

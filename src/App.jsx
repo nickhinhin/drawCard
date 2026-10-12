@@ -5006,12 +5006,19 @@ function useLivePresence(room, uid, visible) {
         try {
           sessionRef = push(ref(database, `sessions/${roomId}/${key}`));
           await set(sessionRef, { in: rtdbNow() });
+          // The page can leave the room while a write is in flight (in-app browsers hide
+          // the page for a moment as they open). Cleanup has then closed this visit, so
+          // stop: the rules refuse a second leave time, and a later online entry would
+          // stay behind with nothing to remove it.
+          if (stopped) return;
           await onDisconnect(sessionRef).update({ out: rtdbNow() });
+          if (stopped) return;
           await onDisconnect(onlineRef).remove();
+          if (stopped) return;
           await set(onlineRef, { m: Boolean(uid), at: rtdbNow() });
         } catch (error) {
           // Presence only feeds the admin audience figures; never disturb the player.
-          reportClientError(error, "presence:write");
+          if (!stopped) reportClientError(error, "presence:write");
         }
       });
       cleanup = () => {
