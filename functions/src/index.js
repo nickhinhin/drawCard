@@ -8,6 +8,10 @@ import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { analyzeAuditEntries } from "./audit-analysis.js";
 import { analyticsDayRange, summarizeAdminDay } from "./admin-analytics.js";
 import { isGuestKey, summarizeLiveSessions, summarizeVisitors } from "./live-audience.js";
+import {
+  INSTANT_SHARE_MODES, MAX_INSTANT_DAILY_LIMIT, MAX_INSTANT_POOL_CARDS, cardPrice, cardShareModes, dailyLimit,
+  drawSide, hongKongDay, isDrawableCard, poolCardSnapshot, spentToday, validNumbers,
+} from "./instant-draw.js";
 import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeAudience, sanitizeClientError } from "./monitor.js";
 
 // Least-privilege runtime identity: Firestore, this project's bucket, App Check and logging only.
@@ -77,6 +81,8 @@ const AFFILIATE_CODE_PATTERN = /^AFF[A-F0-9]{20}$/;
 const DEFAULT_SIGNUP_BONUS_TOKENS = 50;
 const MAX_SIGNUP_BONUS_TOKENS = 10000;
 const signupBonusSettingsRef = () => db.collection("publicSiteSettings").doc("signupBonus");
+// 自助抽卡 settings: on / off, the card pool (with a copy of each card's prices) and the daily limit.
+const instantDrawSettingsRef = () => db.collection("publicSiteSettings").doc("instantDraw");
 
 export function signupBonusAmount(settings) {
   const tokens = settings ? Number(settings.tokens) : DEFAULT_SIGNUP_BONUS_TOKENS;
@@ -740,7 +746,7 @@ export const adminAnalytics = onCall(adminCallableOptions, async (request) => {
       db.collection("users").count().get(),
       db.collection("users").where("createdAt", ">=", start).where("createdAt", "<", end).count().get(),
       db.collection("drawRecords").where("createdAt", ">=", start).where("createdAt", "<", end)
-        .select("uid", "tokenCost", "cardId", "cardValue", "cardConversionValue").get(),
+        .select("uid", "tokenCost", "cardId", "cardValue", "cardConversionValue", "source", "resultSide").get(),
       db.collection("tokenRequests").where("reviewedAt", ">=", start).where("reviewedAt", "<", end)
         .select("status", "proofMode", "verifiedHkdAmount").get(),
     ]);
@@ -1096,7 +1102,9 @@ export const adminAdjustMember = onCall(adminCallableOptions, async (request) =>
 
   if (action === "tokens") {
     const uid = assertIdentifier(request.data?.uid, "會員 ID");
-    if (uid === actor.uid) throw new HttpsError("permission-denied", "不可調整自己帳戶的代幣。");
+    // Admins may adjust their own tokens (e.g. to test 自助抽卡); such changes are marked
+    // selfAdjustment in 會員調整 and the audit log. Giving cards to oneself stays refused.
+    const selfAdjustment = uid === actor.uid;
     const delta = Number(request.data?.delta);
     if (!Number.isSafeInteger(delta) || delta === 0 || Math.abs(delta) > MEMBER_ADJUSTMENT_MAX_TOKENS) {
       throw new HttpsError("invalid-argument", "調整數量必須為非零整數，上限 1,000,000。");
@@ -1109,9 +1117,9 @@ export const adminAdjustMember = onCall(adminCallableOptions, async (request) =>
       const after = before + delta;
       if (after < 0) throw new HttpsError("failed-precondition", `會員目前只有 ${before} 代幣，不可扣減至負數。`);
       transaction.update(userRef, { tokens: after, lastAdminAdjustmentId: adjustmentRef.id, updatedAt: FieldValue.serverTimestamp() });
-      const entry = { ...base, type: "tokens", uid, username: String(snapshot.data().username || ""), delta, before, after };
+      const entry = { ...base, type: "tokens", uid, username: String(snapshot.data().username || ""), delta, before, after, selfAdjustment };
       transaction.create(adjustmentRef, entry);
-      transaction.set(db.collection("adminAuditLogs").doc(), auditRecord(actor, "member:tokens", "users", uid, { tokens: before }, { tokens: after, delta, reason }, request));
+      transaction.set(db.collection("adminAuditLogs").doc(), auditRecord(actor, "member:tokens", "users", uid, { tokens: before }, { tokens: after, delta, reason, selfAdjustment }, request));
       return { before, after };
     });
     return { ok: true, adjustmentId: adjustmentRef.id, ...result };
@@ -1336,6 +1344,15 @@ export const adminRecalculateCardPrices = onCall(adminCallableOptions, async (re
     }
     writes.push((batch) => batch.set(item.ref, update, { merge: true }));
   });
+  // The 自助抽卡 pool shows a copy of each card's prices; keep it in step.
+  const instantSettings = (await instantDrawSettingsRef().get()).data();
+  if (Array.isArray(instantSettings?.cards) && instantSettings.cards.some((card) => prices.has(String(card?.id || "")))) {
+    const cards = instantSettings.cards.map((card) => {
+      const modePrices = prices.get(String(card?.id || ""));
+      return modePrices ? { ...card, tokenValue: modePrices.half, modePrices } : card;
+    });
+    writes.push((batch) => batch.set(instantDrawSettingsRef(), { cards }, { merge: true }));
+  }
   for (let start = 0; start < writes.length; start += 400) {
     const batch = db.batch();
     writes.slice(start, start + 400).forEach((write) => write(batch));
@@ -1671,6 +1688,153 @@ export const submitTokenPaymentRequest = onCall(tokenProofCallableOptions, async
   return { ok: true, requestId: requestRef.id };
 });
 
+// ---- 自助抽卡 (instant draws) ----
+// Admins switch it on in the admin site; a player's draw is decided and paid for in one
+// transaction here, so the page can only show (animate) a result it cannot change.
+const allowInstantDraw = createRateLimiter(1, 1500);
+
+// off: nobody; admin: only admins (testing on the live site, players do not see it); all: everyone.
+const INSTANT_DRAW_MODES = new Set(["off", "admin", "all"]);
+function instantDrawMode(settings) {
+  if (INSTANT_DRAW_MODES.has(settings?.mode)) return settings.mode;
+  return settings?.enabled === true ? "all" : "off";
+}
+
+export const adminSaveInstantDraw = onCall(adminCallableOptions, async (request) => {
+  const actor = assertAdmin(request);
+  const mode = String(request.data?.mode || "");
+  if (!INSTANT_DRAW_MODES.has(mode)) throw new HttpsError("invalid-argument", "開放狀態不正確。");
+  const enabled = mode !== "off";
+  const dailyTokenLimit = Number(request.data?.dailyTokenLimit);
+  if (!Number.isSafeInteger(dailyTokenLimit) || dailyTokenLimit < 0 || dailyTokenLimit > MAX_INSTANT_DAILY_LIMIT) {
+    throw new HttpsError("invalid-argument", "每日上限必須為 0 至 10,000,000 的整數（0 代表不設上限）。");
+  }
+  if (!Array.isArray(request.data?.cardIds) || request.data.cardIds.length > MAX_INSTANT_POOL_CARDS) {
+    throw new HttpsError("invalid-argument", "卡池資料不正確。");
+  }
+  const cardIds = [...new Set(request.data.cardIds.map((id) => assertIdentifier(id, "卡牌 ID")))];
+  const cardSnapshots = cardIds.length ? await db.getAll(...cardIds.map((id) => db.collection("cards").doc(id))) : [];
+  const hellIds = [...new Set(cardSnapshots.map((item) => String(item.data()?.hellCardId || "")).filter(Boolean))];
+  const hellSnapshots = hellIds.length ? await db.getAll(...hellIds.map((id) => db.collection("cards").doc(id))) : [];
+  const hellById = new Map(hellSnapshots.filter((item) => item.exists).map((item) => [item.id, item.data()]));
+  const cards = [];
+  const skipped = [];
+  cardSnapshots.forEach((item) => {
+    const card = item.exists ? item.data() : null;
+    if (isDrawableCard(card, hellById.get(String(card?.hellCardId || "")))) cards.push(poolCardSnapshot(item.id, card));
+    else skipped.push(String(card?.name || item.id));
+  });
+  if (enabled && !cards.length) {
+    throw new HttpsError("failed-precondition", "請最少選擇一張已設定地獄對應卡及售價的卡牌。");
+  }
+  const ref = instantDrawSettingsRef();
+  const before = (await ref.get()).data() || null;
+  // Anyone can read this document, so it holds no admin details; the audit log records who saved it.
+  const after = {
+    mode, enabled, dailyTokenLimit, cardIds: cards.map((card) => card.id), cards,
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  await ref.set(after);
+  await db.collection("adminAuditLogs").add(auditRecord(
+    actor, "instant-draw:settings", "publicSiteSettings", "instantDraw",
+    before && { mode: instantDrawMode(before), dailyTokenLimit: before.dailyTokenLimit, cardIds: before.cardIds },
+    { mode, dailyTokenLimit, cardIds: after.cardIds, skipped }, request,
+  ));
+  return { ok: true, cards: cards.length, cardIds: after.cardIds, skipped };
+});
+
+export const instantDraw = onCall(userCallableOptions, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "請先登入後再抽卡。");
+  const uid = request.auth.uid;
+  const cardId = assertIdentifier(request.data?.cardId, "卡牌 ID");
+  const shareMode = String(request.data?.shareMode || "");
+  if (!INSTANT_SHARE_MODES.includes(shareMode)) throw new HttpsError("invalid-argument", "玩法不正確。");
+  const numbers = validNumbers(request.data?.numbers);
+  if (!numbers) throw new HttpsError("invalid-argument", "請選擇 1 至 20 個號碼。");
+  const expectedPrice = Number(request.data?.unitPrice);
+  if (!allowInstantDraw(uid)) throw new HttpsError("resource-exhausted", "抽卡太快，請稍等一秒再試。");
+
+  const settings = (await instantDrawSettingsRef().get()).data() || {};
+  const mode = instantDrawMode(settings);
+  if (mode === "off") throw new HttpsError("failed-precondition", "自助抽卡暫未開放。");
+  // Admin test mode: only allow-listed admins; everyone else is told it is not open.
+  if (mode === "admin") {
+    try {
+      assertAdmin(request);
+    } catch {
+      throw new HttpsError("failed-precondition", "自助抽卡暫未開放。");
+    }
+  }
+  if (!Array.isArray(settings.cardIds) || !settings.cardIds.includes(cardId)) {
+    throw new HttpsError("failed-precondition", "這張卡暫時不在自助抽卡卡池，請重新整理。");
+  }
+  const day = hongKongDay();
+  const limit = dailyLimit(settings);
+  const userRef = db.collection("users").doc(uid);
+  const cardsRef = db.collection("cards");
+
+  const result = await db.runTransaction(async (transaction) => {
+    const [userSnapshot, cardSnapshot] = await Promise.all([transaction.get(userRef), transaction.get(cardsRef.doc(cardId))]);
+    if (!userSnapshot.exists) throw new HttpsError("failed-precondition", "找不到會員帳戶，請重新登入。");
+    const user = userSnapshot.data();
+    const card = cardSnapshot.exists ? cardSnapshot.data() : null;
+    const hellId = String(card?.hellCardId || "");
+    const hellSnapshot = hellId ? await transaction.get(cardsRef.doc(hellId)) : null;
+    const hell = hellSnapshot?.exists ? hellSnapshot.data() : null;
+    const username = String(user.username || "");
+    const usernameSnapshot = username ? await transaction.get(db.collection("usernames").doc(username.toLowerCase())) : null;
+    if (!usernameSnapshot?.exists || usernameSnapshot.data().uid !== uid) {
+      throw new HttpsError("failed-precondition", "請先設定玩家名稱後再抽卡。");
+    }
+    if (!isDrawableCard(card, hell)) throw new HttpsError("failed-precondition", "這張卡暫時不能抽，請選擇其他卡牌。");
+    if (!cardShareModes(card).includes(shareMode)) throw new HttpsError("failed-precondition", "這張卡不提供此玩法。");
+    const unitPrice = cardPrice(card, shareMode);
+    if (!unitPrice) throw new HttpsError("failed-precondition", "這張卡暫時未有此玩法的售價。");
+    if (unitPrice !== expectedPrice) throw new HttpsError("failed-precondition", "售價已更新，請重新整理後再試。");
+    const total = unitPrice * numbers.length;
+    const tokens = Number(user.tokens || 0);
+    if (tokens < total) throw new HttpsError("failed-precondition", `代幣不足：需要 ${total} 代幣，你現有 ${tokens} 代幣。`);
+    const spent = spentToday(user, day);
+    if (limit > 0 && spent + total > limit) {
+      throw new HttpsError("resource-exhausted", `今日自助抽卡上限為 ${limit} 代幣，你今日尚可使用 ${Math.max(0, limit - spent)} 代幣。`);
+    }
+
+    const now = FieldValue.serverTimestamp();
+    const draws = numbers.map((number) => {
+      const resultSide = drawSide(shareMode);
+      const [prizeId, prize] = resultSide === "heaven" ? [cardId, card] : [hellId, hell];
+      const recordRef = db.collection("drawRecords").doc();
+      const record = {
+        uid, username, affiliateReferrerUid: String(user.referredByUid || ""),
+        source: "instant", drawId: "", drawTitle: "自助抽卡", round: "", number,
+        tokenCost: unitPrice, shareMode,
+        targetCardId: cardId, targetCardName: String(card.name || ""),
+        targetCardImageUrl: String(card.thumbUrl || card.imageUrl || ""), targetCardValue: unitPrice,
+        cardId: prizeId, cardName: String(prize.name || ""), cardCategory: String(prize.category || ""),
+        cardImageUrl: String(prize.thumbUrl || prize.imageUrl || ""),
+        cardValue: Number(prize.tokenValue || 0),
+        cardConversionValue: Number(prize.conversionValue ?? prize.tokenValue ?? 0),
+        resultSide, selectedHeavenCardId: cardId, collectionStatus: "pending",
+        assignedAt: now, assignedBy: "instant-draw", createdAt: now, updatedAt: now,
+      };
+      transaction.create(recordRef, record);
+      return {
+        recordId: recordRef.id, number, resultSide,
+        cardId: prizeId, cardName: record.cardName, cardImageUrl: record.cardImageUrl,
+        cardConversionValue: record.cardConversionValue,
+      };
+    });
+    transaction.update(userRef, {
+      tokens: tokens - total, instantDrawDay: day, instantDrawSpent: spent + total, updatedAt: now,
+    });
+    return { draws, tokens: tokens - total, spentToday: spent + total };
+  });
+  logger.info("Instant draw.", {
+    uid, cardId, shareMode, count: numbers.length,
+    heaven: result.draws.filter((item) => item.resultSide === "heaven").length,
+  });
+  return { ok: true, ...result, dailyLimit: limit };
+});
 
 export const __test = {
   csvSet, plainData, validatedDocumentData, serialize,

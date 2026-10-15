@@ -69,7 +69,7 @@ const ADMIN_CALLABLES = [
   "adminReviewTokenRequest", "adminAdjustMember", "adminSetShippingStatus", "adminEnsureDrawSlots",
   "adminRecalculateCardPrices", "adminRenameCardCategory", "adminPublishCardShowcase", "adminDeleteDraw",
   "adminCancelScheduledDraw", "adminUploadImage", "adminAuditAnalyze", "adminUpdateSupportMessage",
-  "adminLiveHealth", "adminLiveAudience", "adminMonitorSession",
+  "adminLiveHealth", "adminLiveAudience", "adminMonitorSession", "adminSaveInstantDraw",
 ];
 // Every exported admin* callable must be in the list above, so a new one cannot be missed.
 const { readFileSync } = await import("node:fs");
@@ -97,7 +97,10 @@ const adjust = (data) => call("adminAdjustMember", data, admin.token);
 const before = await count("memberAdjustments");
 
 expect("player calls adminAdjustMember", await call("adminAdjustMember", { action: "tokens", uid: player.uid, delta: 999, reason: "test" }, player.token), "PERMISSION_DENIED");
-expect("adjust own tokens", await adjust({ action: "tokens", uid: ADMIN_UID, delta: 500, reason: "own" }), "PERMISSION_DENIED");
+// Admins may adjust their own tokens (to test 自助抽卡); it is marked as a self adjustment.
+const ownBefore = Number((await read(`users/${ADMIN_UID}`)).tokens.integerValue);
+expect("adjust own tokens", await adjust({ action: "tokens", uid: ADMIN_UID, delta: 500, reason: "own test tokens" }), "OK");
+check("own adjustment applied", Number((await read(`users/${ADMIN_UID}`)).tokens.integerValue) === ownBefore + 500);
 expect("adjust without a reason", await adjust({ action: "tokens", uid: memberUid, delta: 5, reason: " " }), "INVALID_ARGUMENT");
 expect("adjust by 0", await adjust({ action: "tokens", uid: memberUid, delta: 0, reason: "zero" }), "INVALID_ARGUMENT");
 expect("adjust by a fraction", await adjust({ action: "tokens", uid: memberUid, delta: 1.5, reason: "fraction" }), "INVALID_ARGUMENT");
@@ -120,7 +123,7 @@ expect("void own card", await adjust({ action: "voidCard", recordId: `own-${stam
 expect("void a pending card", await adjust({ action: "voidCard", recordId: `pending-${stamp}`, reason: "wrong card" }), "OK");
 expect("void the same card again", await adjust({ action: "voidCard", recordId: `pending-${stamp}`, reason: "again" }), "FAILED_PRECONDITION");
 expect("unknown action", await adjust({ action: "deleteUser", uid: memberUid, reason: "valid reason" }), "INVALID_ARGUMENT");
-check("3 successful changes logged in memberAdjustments", (await count("memberAdjustments")) - before === 3, `${(await count("memberAdjustments")) - before} new`);
+check("4 successful changes logged in memberAdjustments (incl. own tokens)", (await count("memberAdjustments")) - before === 4, `${(await count("memberAdjustments")) - before} new`);
 
 // ---- C. converted / voided cards can never be shipped ----
 for (const id of [`converted-${stamp}`, `pending-${stamp}`]) {

@@ -24,5 +24,6 @@ test("daily margin excludes pending outcomes and promotional rewards", () => {
     totalUserCount: 12, newUserCount: 2, purchaseCount: 3, buyerCount: 2,
     salesTokens: 350, settledSalesTokens: 300, payoutTokens: 340,
     unsettledCount: 1, approvedPaymentCount: 1, approvedHkd: 500,
+    instantCount: 0, instantBuyerCount: 0, instantSalesTokens: 0, instantPayoutTokens: 0, instantHeavenCount: 0,
   });
 });

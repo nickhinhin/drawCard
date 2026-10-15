@@ -8,18 +8,22 @@ export function analyticsDayRange(day) {
 }
 
 // Purchase-day margin uses the recorded token cost and settled card conversion value.
+// 自助抽卡 draws are reported on their own (instant*), apart from live purchases.
 export function summarizeAdminDay(records, reviews, newUserCount, totalUserCount) {
-  const purchases = records.filter((record) => Number(record.tokenCost) > 0);
+  const paid = records.filter((record) => Number(record.tokenCost) > 0);
+  const purchases = paid.filter((record) => record.source !== "instant");
+  const instant = paid.filter((record) => record.source === "instant");
   const settled = purchases.filter((record) => Boolean(record.cardId));
   const approved = reviews.filter((request) => request.status === "approved" && request.proofMode !== "promo");
   const sum = (items, field) => items.reduce((total, item) => {
     const value = Number(item[field]);
     return total + (Number.isFinite(value) ? value : 0);
   }, 0);
-  const payoutTokens = settled.reduce((total, record) => {
+  const payoutOf = (items) => items.reduce((total, record) => {
     const value = record.cardConversionValue ?? Math.floor(Number(record.cardValue || record.tokenCost || 0) * 0.8);
     return total + (Number.isFinite(Number(value)) ? Math.max(0, Math.floor(Number(value))) : 0);
   }, 0);
+  const payoutTokens = payoutOf(settled);
   return {
     totalUserCount,
     newUserCount,
@@ -29,6 +33,11 @@ export function summarizeAdminDay(records, reviews, newUserCount, totalUserCount
     settledSalesTokens: sum(settled, "tokenCost"),
     payoutTokens,
     unsettledCount: purchases.length - settled.length,
+    instantCount: instant.length,
+    instantBuyerCount: new Set(instant.map((record) => record.uid).filter(Boolean)).size,
+    instantSalesTokens: sum(instant, "tokenCost"),
+    instantPayoutTokens: payoutOf(instant),
+    instantHeavenCount: instant.filter((record) => record.resultSide === "heaven").length,
     approvedPaymentCount: approved.length,
     approvedHkd: sum(approved, "verifiedHkdAmount"),
   };

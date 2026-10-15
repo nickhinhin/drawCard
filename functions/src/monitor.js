@@ -153,8 +153,8 @@ const toMs = (value) => (typeof value?.toMillis === "function" ? value.toMillis(
 
 // Summary of one monitored live session, computed when the admin stops monitoring.
 export function buildMonitorReport({ startMs, endMs, records = [], requests = [], shipping = 0 }) {
-  // VIP rewards and admin gifts are not purchases.
-  const purchases = records.filter((record) => record.source !== "vip" && record.source !== "admin");
+  // VIP rewards and admin gifts are not purchases; 自助抽卡 is reported apart from the live.
+  const purchases = records.filter((record) => !["vip", "admin", "instant"].includes(record.source));
   const buyers = new Map();
   const rounds = new Map();
   const minutes = new Map();

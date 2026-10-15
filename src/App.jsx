@@ -39,6 +39,7 @@ import {
   Search,
   Shield,
   Smartphone,
+  Sparkles,
   Send,
   Ticket,
   Trash2,
@@ -1057,7 +1058,7 @@ function App() {
               <AccountPanel authUser={authUser} profile={profile} setActiveTab={setActiveTab} />
             )}
             <section className="workspace">
-              {activeTab === "draw" && <DrawCard profile={activeProfile} />}
+              {activeTab === "draw" && <DrawCard profile={activeProfile} isAdmin={hasAdminClaim} />}
               {activeTab === "archive" && <LiveArchivePage onOpenRoom={openArchivedRoom} />}
               {activeTab === "tokens" && <TokenRequest profile={activeProfile} />}
               {activeTab === "history" && <MyRecords profile={activeProfile} />}
@@ -2494,7 +2495,13 @@ function FileUpload({ id, label, file, onChange, required = false, disabled = fa
   );
 }
 
-function DrawCard({ profile }) {
+function DrawCard({ profile, isAdmin = false }) {
+  const instantSettings = useInstantDrawSettings();
+  const instantMode = getInstantDrawMode(instantSettings);
+  // Admin test mode shows the panel to admins only; the server checks this again.
+  const instantPanel = IS_BETA && (instantMode === "all" || (instantMode === "admin" && isAdmin))
+    ? <InstantDrawPanel profile={profile} settings={instantSettings} adminTest={instantMode === "admin"} />
+    : null;
   const isBeta = IS_BETA;
   const [activeRooms, setActiveRooms] = useState([]);
   const [activeRoomsLoading, setActiveRoomsLoading] = useState(true);
@@ -3129,12 +3136,15 @@ function DrawCard({ profile }) {
 
   if (!selectedRoom) {
     return (
-      <section className="panel empty-state">
-        <Gavel size={36} />
-        <h2>{isBeta ? "暫時未有直播" : "找不到房間"}</h2>
-        <p className="muted">{roomsError || (isBeta ? "直播資料準備中，請稍後再試。" : "這個房間連結暫時沒有可用資料。")}</p>
-        {!isBeta && <button className="primary-btn" type="button" onClick={backToRooms}>返回房間列表</button>}
-      </section>
+      <>
+        {instantPanel}
+        <section className="panel empty-state">
+          <Gavel size={36} />
+          <h2>{isBeta ? "暫時未有直播" : "找不到房間"}</h2>
+          <p className="muted">{roomsError || (isBeta ? "直播資料準備中，請稍後再試。" : "這個房間連結暫時沒有可用資料。")}</p>
+          {!isBeta && <button className="primary-btn" type="button" onClick={backToRooms}>返回房間列表</button>}
+        </section>
+      </>
     );
   }
 
@@ -3197,6 +3207,7 @@ function DrawCard({ profile }) {
       {isBeta && profile?.uid && (
         <RoomRecordsDrawer currentRoomId={selectedRoom.id} profile={profile} />
       )}
+      {instantPanel}
       {!isBeta && <button className="small-btn back-link" type="button" onClick={backToRooms}>返回房間列表</button>}
       <div className={`draw-layout purchase-step-${purchaseStep}`}>
         <section className="panel room-stream-panel">
@@ -5101,6 +5112,336 @@ function requestLogin(notice) {
   window.dispatchEvent(new CustomEvent("beta-open-login", { detail: { notice } }));
 }
 
+// ---- 自助抽卡 ----
+// Admins switch it on in the admin site (publicSiteSettings/instantDraw). A player picks
+// a card, an odds mode and up to 20 numbers; the instantDraw function draws each number
+// on the server when it is paid for, and the page then only animates those results.
+const INSTANT_NUMBERS = Array.from({ length: 20 }, (_, index) => index + 1);
+const INSTANT_MODE_CHANCE = { "1/2": "50%", "1/5": "20%", "1/10": "10%" };
+
+// undefined while loading, null when 自助抽卡 has never been set up.
+function useInstantDrawSettings() {
+  const [settings, setSettings] = useState(undefined);
+  useEffect(() => onSnapshot(
+    doc(db, "publicSiteSettings", "instantDraw"),
+    (snapshot) => setSettings(snapshot.exists() ? snapshot.data() : null),
+    (error) => {
+      console.error("Instant draw settings listener failed.", error);
+      setSettings(null);
+    },
+  ), []);
+  return settings;
+}
+
+// off / admin (only admins, for testing on the live site) / all; older settings had only `enabled`.
+function getInstantDrawMode(settings) {
+  if (["off", "admin", "all"].includes(settings?.mode)) return settings.mode;
+  return settings?.enabled === true ? "all" : "off";
+}
+
+function instantCardPrice(card, shareMode) {
+  const key = shareMode === "1/10" ? "tenth" : shareMode === "1/5" ? "fifth" : "half";
+  return Number(card?.modePrices?.[key] || 0);
+}
+
+function instantCardModes(card) {
+  const modes = Array.isArray(card?.allowedShareModes) ? card.allowedShareModes : ["1/2", "1/5", "1/10"];
+  return ["1/2", "1/5", "1/10"].filter((mode) => modes.includes(mode) && instantCardPrice(card, mode) > 0);
+}
+
+// Hong Kong calendar day, as the server counts the daily limit.
+function hongKongDayKey(ms = Date.now()) {
+  return new Date(ms + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function InstantDrawPanel({ profile, settings, adminTest = false }) {
+  const cards = useMemo(() => (Array.isArray(settings?.cards) ? settings.cards : []), [settings?.cards]);
+  const [cardId, setCardId] = useState("");
+  const [shareMode, setShareMode] = useState("1/2");
+  const [numbers, setNumbers] = useState([]);
+  const [drawing, setDrawing] = useState(false);
+  const [result, setResult] = useState(null);
+  const card = cards.find((item) => item.id === cardId) || null;
+  const modes = useMemo(() => instantCardModes(card), [card]);
+
+  // A card removed from the pool, or a mode the chosen card does not offer, is cleared.
+  useEffect(() => {
+    if (cardId && !card) setCardId("");
+  }, [card, cardId]);
+  useEffect(() => {
+    if (card && !modes.includes(shareMode)) setShareMode(modes[0] || "1/2");
+  }, [card, modes, shareMode]);
+
+  const unitPrice = card ? instantCardPrice(card, shareMode) : 0;
+  const total = unitPrice * numbers.length;
+  const limit = Number.isSafeInteger(Number(settings?.dailyTokenLimit)) ? Number(settings.dailyTokenLimit) : 500;
+  const spent = profile?.instantDrawDay === hongKongDayKey() ? Number(profile.instantDrawSpent || 0) : 0;
+  const remaining = limit > 0 ? Math.max(0, limit - spent) : null;
+  const tokens = Number(profile?.tokens || 0);
+  const problem = !profile?.uid ? ""
+    : total > tokens ? `代幣不足：需要 ${formatTokenNumber(total)}，你現有 ${formatTokenNumber(tokens)}。`
+      : remaining !== null && total > remaining ? `超出今日上限：今日尚可使用 ${formatTokenNumber(remaining)} 代幣。`
+        : "";
+
+  function toggleNumber(number) {
+    setNumbers((current) => (current.includes(number)
+      ? current.filter((item) => item !== number)
+      : [...current, number].sort((left, right) => left - right)));
+  }
+
+  async function draw() {
+    if (!profile?.uid) {
+      requestLogin("請先登入或註冊，即可自助抽卡。");
+      return;
+    }
+    if (!card || !numbers.length || drawing || problem) return;
+    setDrawing(true);
+    try {
+      const { data } = await httpsCallable(functions, "instantDraw")({ cardId: card.id, shareMode, numbers, unitPrice });
+      setResult({ draws: data.draws || [], card, shareMode, total });
+      setNumbers([]);
+    } catch (error) {
+      showSafeError(error, "抽卡失敗，請稍後再試。");
+    } finally {
+      setDrawing(false);
+    }
+  }
+
+  if (!cards.length) return null;
+  return (
+    <section className="panel instant-draw-panel" id="instant-draw">
+      <div className="section-heading compact">
+        <Sparkles size={22} />
+        <div>
+          <h2>自助抽卡{adminTest && <span className="instant-admin-test">管理員測試模式 · 玩家看不到</span>}</h2>
+          <p className="muted">揀卡、揀玩法、揀號碼，付款後即時開卡。每個號碼獨立抽一次，抽中的卡即時存入「我的卡牌」。</p>
+        </div>
+      </div>
+      {profile?.uid && (
+        <p className="instant-draw-allowance">
+          現有 <TokenAmount value={tokens} />
+          {remaining !== null && <> · 今日自助抽卡尚可使用 <TokenAmount value={remaining} />（上限 {formatTokenNumber(limit)}）</>}
+        </p>
+      )}
+      <h3 className="instant-draw-step">1. 選擇卡牌</h3>
+      <div className="pool-card-grid instant-card-grid">
+        {cards.map((item) => (
+          <button
+            className={item.id === cardId ? "pool-card selected" : "pool-card"}
+            key={item.id}
+            type="button"
+            onClick={() => setCardId(item.id)}
+          >
+            {item.thumbUrl || item.imageUrl ? (
+              <img src={item.thumbUrl || item.imageUrl} alt={item.name} loading="lazy" decoding="async" />
+            ) : (
+              <div className="image-placeholder"><Package size={24} /></div>
+            )}
+            <strong>{item.name}</strong>
+            <small>{item.category || "卡牌"}</small>
+            <TokenAmount value={instantCardPrice(item, instantCardModes(item)[0] || "1/2")} />
+          </button>
+        ))}
+      </div>
+      {card && (
+        <>
+          <h3 className="instant-draw-step">2. 選擇玩法</h3>
+          <div className="instant-mode-row">
+            {modes.map((mode) => (
+              <button className={mode === shareMode ? "active" : ""} key={mode} type="button" onClick={() => setShareMode(mode)}>
+                <strong>{mode}</strong>
+                <small>天堂機率 {INSTANT_MODE_CHANCE[mode]}</small>
+                <TokenAmount value={instantCardPrice(card, mode)} suffix=" / 號碼" />
+              </button>
+            ))}
+          </div>
+          <h3 className="instant-draw-step">3. 選擇號碼（可多選）</h3>
+          <div className="instant-number-grid">
+            {INSTANT_NUMBERS.map((number) => (
+              <button
+                aria-pressed={numbers.includes(number)}
+                className={numbers.includes(number) ? "selected" : ""}
+                key={number}
+                type="button"
+                onClick={() => toggleNumber(number)}
+              >
+                {number}
+              </button>
+            ))}
+          </div>
+          <div className="instant-draw-actions">
+            <button className="small-btn" type="button" onClick={() => setNumbers(INSTANT_NUMBERS)} disabled={drawing}>全選</button>
+            <button className="small-btn" type="button" onClick={() => setNumbers([])} disabled={drawing || !numbers.length}>清除</button>
+            <span>已選 {numbers.length} 個號碼 · 合共 <TokenAmount value={total} /></span>
+          </div>
+          {problem && <p className="form-note" role="alert">{problem}</p>}
+          <button
+            className="primary-btn instant-draw-submit"
+            type="button"
+            disabled={drawing || !numbers.length || Boolean(problem)}
+            onClick={draw}
+          >
+            {drawing ? "抽卡中..." : profile?.uid ? `確定付款並開卡（${formatTokenNumber(total)} 代幣）` : "登入後開始抽卡"}
+          </button>
+        </>
+      )}
+      {result && <InstantDrawReveal result={result} onClose={() => setResult(null)} />}
+    </section>
+  );
+}
+
+// The opening show, styled like opening a trading-card booster pack (our own pack design,
+// no third-party marks). The results are already final on the server; this only reveals
+// them: the pack shakes and tears open, the cards slide out, then each one charges up and
+// turns over in turn. Heaven gets a rarity star, holo sheen and a gold burst.
+const INSTANT_PACK_MS = 1900;
+const INSTANT_DEAL_STEP_MS = 70;
+const INSTANT_CHARGE_MS = 520;
+const INSTANT_FLIP_HOLD_MS = { heaven: 1100, hell: 380 };
+const INSTANT_SPARKS = Array.from({ length: 14 }, (_, index) => index);
+const INSTANT_CONFETTI = Array.from({ length: 36 }, (_, index) => index);
+
+function prefersReducedMotion() {
+  return Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+}
+
+function InstantDrawReveal({ result, onClose }) {
+  const draws = result.draws;
+  const [packOpen, setPackOpen] = useState(() => prefersReducedMotion());
+  const [dealt, setDealt] = useState(false);
+  const [charging, setCharging] = useState(-1);
+  const [shown, setShown] = useState(() => (prefersReducedMotion() ? draws.length : 0));
+  const done = shown >= draws.length;
+  const heaven = draws.filter((item) => item.resultSide === "heaven").length;
+  const single = draws.length === 1;
+
+  // The pack opens first; the cards are dealt as they come out of it.
+  useEffect(() => {
+    if (packOpen) return undefined;
+    const timer = window.setTimeout(() => setPackOpen(true), INSTANT_PACK_MS);
+    return () => window.clearTimeout(timer);
+  }, [packOpen]);
+  useEffect(() => {
+    if (!packOpen) return undefined;
+    const timer = window.setTimeout(() => setDealt(true), 60);
+    return () => window.clearTimeout(timer);
+  }, [packOpen]);
+
+  // One card at a time: charge, then flip, then hold (longer for heaven).
+  useEffect(() => {
+    if (!dealt || done) return undefined;
+    const previous = draws[shown - 1];
+    const wait = shown === 0
+      ? 380 + draws.length * INSTANT_DEAL_STEP_MS
+      : INSTANT_FLIP_HOLD_MS[previous?.resultSide] || 380;
+    let flipTimer;
+    const chargeTimer = window.setTimeout(() => {
+      setCharging(shown);
+      flipTimer = window.setTimeout(() => {
+        setCharging(-1);
+        setShown((current) => current + 1);
+      }, INSTANT_CHARGE_MS);
+    }, wait);
+    return () => {
+      window.clearTimeout(chargeTimer);
+      window.clearTimeout(flipTimer);
+    };
+  }, [dealt, done, draws, shown]);
+
+  const [summaryReady, setSummaryReady] = useState(done);
+  useEffect(() => {
+    if (!done) return undefined;
+    const timer = window.setTimeout(() => setSummaryReady(true), prefersReducedMotion() ? 0 : 450);
+    return () => window.clearTimeout(timer);
+  }, [done]);
+
+  return (
+    <div className="modal-backdrop instant-reveal-backdrop" role="presentation">
+      <section
+        className={`modal instant-reveal-modal${single ? " single" : ""}${summaryReady && heaven ? " celebrate" : ""}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="instant-reveal-title"
+      >
+        <div className="instant-reveal-glow" aria-hidden="true" />
+        <header className="instant-reveal-header">
+          <span className="instant-reveal-kicker"><Sparkles size={15} />自助抽卡 · {result.shareMode}</span>
+          <h2 id="instant-reveal-title">{summaryReady ? (heaven ? "恭喜抽中天堂！" : "開卡完成") : "開卡中..."}</h2>
+          <p>{result.card.name} · {draws.length} 個號碼</p>
+        </header>
+        {!packOpen && (
+          <div className="instant-pack-stage" aria-hidden="true">
+            <div className="instant-pack">
+              <span className="instant-pack-top" />
+              <span className="instant-pack-body">
+                <img src="/livedraw-logo.svg" alt="" />
+                <strong>BOOSTER</strong>
+                <small>{draws.length} CARDS · {result.shareMode}</small>
+                <span className="instant-pack-sheen" />
+              </span>
+              <span className="instant-pack-burst" />
+            </div>
+          </div>
+        )}
+        <div className={`instant-reveal-grid${packOpen ? "" : " waiting"}`} style={{ "--instant-count": draws.length }}>
+          {draws.map((item, index) => {
+            const state = index < shown ? "revealed" : index === charging ? "charging" : "";
+            return (
+              <div
+                className={`instant-flip ${item.resultSide} ${dealt ? "dealt" : ""} ${state}`}
+                key={item.recordId}
+                style={{ "--deal-delay": `${index * INSTANT_DEAL_STEP_MS}ms` }}
+              >
+                <div className="instant-flip-inner">
+                  <div className="instant-flip-face instant-flip-back">
+                    <span className="instant-flip-number">#{item.number}</span>
+                    <img className="instant-flip-logo" src="/livedraw-logo.svg" alt="" />
+                    <span className="instant-flip-shine" />
+                  </div>
+                  <div className="instant-flip-face instant-flip-front">
+                    {item.cardImageUrl ? <img src={item.cardImageUrl} alt={item.cardName} /> : <Package size={30} />}
+                    <span className="instant-flip-foil" />
+                    {item.resultSide === "heaven" && <span className="instant-flip-rarity">★</span>}
+                    <em>{item.resultSide === "heaven" ? "天堂" : "地獄"}</em>
+                    <small>#{item.number} · {item.cardName}</small>
+                  </div>
+                </div>
+                {item.resultSide === "heaven" && index < shown && (
+                  <span className="instant-sparks" aria-hidden="true">
+                    {INSTANT_SPARKS.map((spark) => <i key={spark} style={{ "--spark": spark }} />)}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        {summaryReady && (
+          <div className="instant-reveal-summary">
+            <span className="heaven"><strong>{heaven}</strong>天堂</span>
+            <span className="hell"><strong>{draws.length - heaven}</strong>地獄</span>
+            <span><strong>{formatTokenNumber(result.total)}</strong>代幣</span>
+          </div>
+        )}
+        {summaryReady && heaven > 0 && (
+          <div className="instant-confetti" aria-hidden="true">
+            {INSTANT_CONFETTI.map((piece) => <i key={piece} style={{ "--piece": piece }} />)}
+          </div>
+        )}
+        <div className="instant-reveal-actions">
+          {!done && (
+            <button className="small-btn" type="button" onClick={() => { setPackOpen(true); setDealt(true); setShown(draws.length); }}>
+              略過動畫
+            </button>
+          )}
+          <button className="primary-btn" type="button" onClick={onClose} disabled={!summaryReady}>
+            {summaryReady ? "完成，卡牌已存入「我的卡牌」" : "開卡中..."}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 // True while the page is in the foreground (players often switch to the stream app).
 function usePageVisible() {
   const [visible, setVisible] = useState(() => document.visibilityState !== "hidden");
@@ -6747,7 +7088,7 @@ function CollectionPage({ profile }) {
                   {isBeta ? (
                     <>
                       <span className="collection-room-meta">
-                        {record.drawTitle || record.roomSlug || "抽卡房"}{isPurchaseRecord(record) ? ` · ${formatRoundLabel(record.round)}` : ""}
+                        {record.drawTitle || record.roomSlug || "抽卡房"}{isPurchaseRecord(record) && record.source !== "instant" ? ` · ${formatRoundLabel(record.round)}` : ""}
                       </span>
                       <span className="record-acquired-time">取得時間：{formatRecordAcquiredTime(record)}</span>
                       {isPurchaseRecord(record) && (
@@ -7472,7 +7813,7 @@ function AdminMemberAdjustments({ cards }) {
         <UserRoundPlus size={22} />
         <div>
           <h2>會員調整</h2>
-          <p className="muted">增減會員代幣、送卡或作廢卡牌。每項修改都必須填寫原因，並會記錄於下方修改紀錄及審計紀錄。不可調整自己的帳戶。</p>
+          <p className="muted">增減會員代幣、送卡或作廢卡牌。每項修改都必須填寫原因，並會記錄於下方修改紀錄及審計紀錄。可調整自己帳戶的代幣（會標示為「自己帳戶」）；不可送卡給自己。</p>
         </div>
       </div>
       <form className="member-adjust-gift" onSubmit={saveSignupGift}>
@@ -7534,7 +7875,7 @@ function AdminMemberAdjustments({ cards }) {
                 const voidable = record.collectionStatus === "pending" || (!record.collectionStatus && !record.convertedToTokens);
                 return (
                   <div key={record.id} className={record.collectionStatus === "void" ? "voided" : ""}>
-                    <span><strong>{record.cardName || record.cardId}</strong><small>{record.drawTitle || "--"}{isPurchaseRecord(record) ? ` · ${formatRoundLabel(record.round)}` : ""} · 兌換值 {formatTokenNumber(record.cardConversionValue ?? record.cardValue ?? 0)}</small></span>
+                    <span><strong>{record.cardName || record.cardId}</strong><small>{record.drawTitle || "--"}{isPurchaseRecord(record) && record.source !== "instant" ? ` · ${formatRoundLabel(record.round)}` : ""} · 兌換值 {formatTokenNumber(record.cardConversionValue ?? record.cardValue ?? 0)}</small></span>
                     <em>{getCollectionDeliveryLabel(record)}</em>
                     {voidable && <button className="small-btn" type="button" disabled={busy === "voidCard"} onClick={() => voidCard(record)}>作廢</button>}
                   </div>
@@ -7553,7 +7894,7 @@ function AdminMemberAdjustments({ cards }) {
           <tr key={item.id}>
             <td>{formatAnalyticsTime(toMillis(item.createdAt))}</td>
             <td><strong>{item.username || "--"}</strong><small>{item.uid}</small></td>
-            <td>{MEMBER_ADJUSTMENT_LABELS[item.type] || item.type}</td>
+            <td>{MEMBER_ADJUSTMENT_LABELS[item.type] || item.type}{item.selfAdjustment && <small className="member-self-adjustment">自己帳戶</small>}</td>
             <td>{item.type === "tokens"
               ? `${item.delta > 0 ? "+" : ""}${formatTokenNumber(item.delta)}（${formatTokenNumber(item.before)} → ${formatTokenNumber(item.after)}）`
               : `${item.cardName || item.cardId}（兌換值 ${formatTokenNumber(item.cardValue || 0)}）`}</td>
@@ -8028,7 +8369,9 @@ function LiveMonitorDashboard({ session, onStop, stopping }) {
 
   useEffect(() => onSnapshot(
       query(collection(db, "drawRecords"), where("createdAt", ">=", Timestamp.fromMillis(sessionStartMs)), orderBy("createdAt", "desc")),
-      (snapshot) => setTodayRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).filter(isPurchaseRecord)),
+      // Live sales only; 自助抽卡 is reported on its own page.
+      (snapshot) => setTodayRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
+        .filter((record) => isPurchaseRecord(record) && record.source !== "instant")),
       (error) => console.error("Monitor records listener failed.", error),
   ), [sessionStartMs]);
 
@@ -8646,6 +8989,14 @@ function AdminAnalytics() {
     ["未結算購買", formatTokenNumber(summary.unsettledCount), "筆"],
     ["當日批准入金", `HK$${formatTokenNumber(summary.approvedHkd)}`, `${summary.approvedPaymentCount} 筆`],
   ] : [];
+  // 自助抽卡 is counted apart from the live purchases above.
+  const instantCards = summary && Number.isFinite(summary.instantCount) ? [
+    ["自助抽卡次數", formatTokenNumber(summary.instantCount), `${summary.instantBuyerCount} 人`],
+    ["自助抽卡銷售", formatTokenNumber(summary.instantSalesTokens), "代幣"],
+    ["自助抽卡派出兌換值", formatTokenNumber(summary.instantPayoutTokens), "代幣"],
+    ["自助抽卡毛利估算", formatTokenNumber(summary.instantSalesTokens - summary.instantPayoutTokens), "代幣"],
+    ["自助抽卡天堂", formatTokenNumber(summary.instantHeavenCount), summary.instantCount ? `${Math.round((summary.instantHeavenCount / summary.instantCount) * 100)}%` : "--"],
+  ] : [];
   return (
     <div className="admin-analytics">
       <section className="panel">
@@ -8660,6 +9011,10 @@ function AdminAnalytics() {
         {!summary && !summaryError && <InlineLoading label="正在計算當日數據..." />}
         {summary && <>
           <div className="analytics-cards">{cards.map(([label, value, unit]) => <div key={label}><small>{label}</small><strong>{value}</strong><span>{unit}</span></div>)}</div>
+          {instantCards.length > 0 && <>
+            <h3 className="analytics-subheading">自助抽卡（不計入上面直播數字）</h3>
+            <div className="analytics-cards">{instantCards.map(([label, value, unit]) => <div key={label}><small>{label}</small><strong>{value}</strong><span>{unit}</span></div>)}</div>
+          </>}
           <p className="muted analytics-note">毛利估算＝當日購買中已分配結果的銷售代幣 − 其卡牌兌換值；未結算購買不計入。此數字不包含商品成本、運費或手續費，並非港幣淨利。入金按審批日期計，購買按下單日期計。</p>
           <p className="muted analytics-note">更新時間：{formatAnalyticsTime(summary.calculatedAt)}</p>
         </>}
@@ -8736,6 +9091,7 @@ function LiveDrawAdminPanel({ profile }) {
         ADMIN_SECTIONS[0],
         { id: "monitor", label: "直播監察", eyebrow: "Live monitor", icon: Bell },
         { id: "live", label: "直播管理", eyebrow: "Live", icon: Gavel },
+        { id: "instant", label: "自助抽卡", eyebrow: "Instant draw", icon: Sparkles },
         BETA_BANNER_SECTION,
         BETA_ANNOUNCEMENTS_SECTION,
         ...ADMIN_SECTIONS.filter((section) => !["analytics", "rooms", "create-room"].includes(section.id)),
@@ -9103,6 +9459,11 @@ function LiveDrawAdminPanel({ profile }) {
           )}
         </div>
       )}
+      {activeAdminSection === "instant" && (
+        <div className="admin-section">
+          <AdminInstantDrawPanel cards={cards} loading={adminLoading.cards} />
+        </div>
+      )}
       {activeAdminSection === "shipping" && (
         <div className="admin-section">
           <ShippingRequestManager records={records} loading={adminLoading.records} />
@@ -9117,6 +9478,174 @@ function LiveDrawAdminPanel({ profile }) {
         </div>
       )}
     </div>
+  );
+}
+
+// 自助抽卡 settings and its own figures (kept apart from live sales).
+const ADMIN_INSTANT_RECORD_LIMIT = 100;
+const INSTANT_MODE_LABELS = { off: "關閉", admin: "只限管理員測試", all: "開放給所有玩家" };
+const INSTANT_MODE_HINTS = {
+  off: "所有人都看不到自助抽卡。",
+  admin: "只有管理員帳戶登入玩家網站時看到及可以抽（用真代幣）；玩家看不到。",
+  all: "所有玩家都可以抽。",
+};
+
+function AdminInstantDrawPanel({ cards, loading }) {
+  const settings = useInstantDrawSettings();
+  const [mode, setMode] = useState("off");
+  const [dailyTokenLimit, setDailyTokenLimit] = useState("500");
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [loadedSettings, setLoadedSettings] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [cardSearch, setCardSearch] = useState("");
+  const [records, setRecords] = useState([]);
+  const [todayRecords, setTodayRecords] = useState([]);
+  const [recordsError, setRecordsError] = useState("");
+  const today = hongKongDayKey();
+
+  // The form starts from the saved settings once; later saves come from this form.
+  useEffect(() => {
+    if (loadedSettings || settings === undefined) return;
+    if (settings) {
+      setMode(getInstantDrawMode(settings));
+      setDailyTokenLimit(String(settings.dailyTokenLimit ?? 500));
+      setSelectedIds(Array.isArray(settings.cardIds) ? settings.cardIds : []);
+    }
+    setLoadedSettings(true);
+  }, [loadedSettings, settings]);
+
+  // The newest draws for the list, and every draw of today (Hong Kong) for the figures.
+  useEffect(() => onSnapshot(
+    query(collection(db, "drawRecords"), where("source", "==", "instant"), orderBy("createdAt", "desc"), limit(ADMIN_INSTANT_RECORD_LIMIT)),
+    (snapshot) => {
+      setRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      setRecordsError("");
+    },
+    (error) => setRecordsError(getSafeErrorMessage(error, "未能載入自助抽卡紀錄。")),
+  ), []);
+  useEffect(() => onSnapshot(
+    query(
+      collection(db, "drawRecords"),
+      where("source", "==", "instant"),
+      where("createdAt", ">=", Timestamp.fromDate(new Date(`${today}T00:00:00+08:00`))),
+      orderBy("createdAt", "desc"),
+    ),
+    (snapshot) => setTodayRecords(snapshot.docs.map((item) => item.data())),
+    (error) => setRecordsError(getSafeErrorMessage(error, "未能載入今日自助抽卡數據。")),
+  ), [today]);
+
+  const cardsById = useMemo(() => new Map(cards.map((card) => [card.id, card])), [cards]);
+  const drawable = (card) => Boolean(card.hellCardId && cardsById.has(card.hellCardId));
+  const visibleCards = cards
+    .filter((card) => !cardSearch.trim() || `${card.name} ${getCardCategory(card)}`.toLowerCase().includes(cardSearch.trim().toLowerCase()))
+    .sort((left, right) => Number(selectedIds.includes(right.id)) - Number(selectedIds.includes(left.id))
+      || Number(right.tokenValue || 0) - Number(left.tokenValue || 0));
+
+  function toggleCard(cardId) {
+    setSelectedIds((current) => (current.includes(cardId) ? current.filter((id) => id !== cardId) : [...current, cardId]));
+  }
+
+  async function save() {
+    const limitValue = Number(dailyTokenLimit);
+    if (!Number.isSafeInteger(limitValue) || limitValue < 0) {
+      alert("每日上限必須為 0 或以上的整數（0 代表不設上限）。");
+      return;
+    }
+    if (mode !== "off" && !selectedIds.length) {
+      alert("開放自助抽卡前，請最少選擇一張卡牌。");
+      return;
+    }
+    setSaving(true);
+    try {
+      const { data } = await httpsCallable(functions, "adminSaveInstantDraw")({ mode, dailyTokenLimit: limitValue, cardIds: selectedIds });
+      setSelectedIds(Array.isArray(data.cardIds) ? data.cardIds : selectedIds);
+      alert(`已儲存：自助抽卡${INSTANT_MODE_LABELS[mode]}，卡池 ${data.cards} 張卡。${data.skipped?.length ? `\n以下卡牌未設定地獄對應卡或售價，未有加入：${data.skipped.join("、")}` : ""}`);
+    } catch (error) {
+      showSafeError(error, "未能儲存自助抽卡設定。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const stats = (items) => {
+    const sales = items.reduce((sum, record) => sum + Number(record.tokenCost || 0), 0);
+    const payout = items.reduce((sum, record) => sum + Number(record.cardConversionValue || 0), 0);
+    const heaven = items.filter((record) => record.resultSide === "heaven").length;
+    return { count: items.length, sales, payout, heaven, players: new Set(items.map((record) => record.uid)).size };
+  };
+  const todayStats = stats(todayRecords);
+  const recentStats = stats(records);
+
+  if (loading || !loadedSettings) return <section className="panel"><InlineLoading label="正在載入自助抽卡設定..." /></section>;
+  return (
+    <>
+      <section className="panel admin-instant-settings">
+        <div className="section-heading compact">
+          <Sparkles size={22} />
+          <div>
+            <h2>自助抽卡</h2>
+            <p className="muted">開啟後，玩家可在直播大廳自行揀卡、揀玩法及號碼，付款後即時抽出天堂或地獄（1/2：50%、1/5：20%、1/10：10%）。售價跟卡牌庫。</p>
+          </div>
+        </div>
+        <div className="admin-instant-modes" role="radiogroup" aria-label="開放狀態">
+          {Object.entries(INSTANT_MODE_LABELS).map(([value, label]) => (
+            <label className={mode === value ? "active" : ""} key={value}>
+              <input type="radio" name="instant-mode" value={value} checked={mode === value} onChange={() => setMode(value)} />
+              <strong>{label}</strong>
+              <small>{INSTANT_MODE_HINTS[value]}</small>
+            </label>
+          ))}
+        </div>
+        <p className="muted">儲存後生效。</p>
+        <label className="admin-instant-limit">
+          <span>每位玩家每日上限（代幣，0 代表不設上限）</span>
+          <input inputMode="numeric" value={dailyTokenLimit} onChange={(event) => setDailyTokenLimit(event.target.value.replace(/[^0-9]/g, ""))} />
+        </label>
+        <div className="admin-instant-pool-head">
+          <strong>卡池（已選 {selectedIds.length} 張）</strong>
+          <input type="search" placeholder="搜尋卡名或分類" value={cardSearch} onChange={(event) => setCardSearch(event.target.value)} />
+        </div>
+        <div className="admin-instant-pool">
+          {visibleCards.map((card) => {
+            const ok = drawable(card);
+            const prices = getCardModePrices(card);
+            return (
+              <label className={`admin-instant-card${selectedIds.includes(card.id) ? " selected" : ""}${ok ? "" : " disabled"}`} key={card.id}>
+                <input type="checkbox" checked={selectedIds.includes(card.id)} disabled={!ok && !selectedIds.includes(card.id)} onChange={() => toggleCard(card.id)} />
+                {getCardThumbUrl(card) ? <img src={getCardThumbUrl(card)} alt="" loading="lazy" /> : <Package size={20} />}
+                <span>
+                  <strong>{card.name}</strong>
+                  <small>{ok ? `1/2 ${formatTokenNumber(prices.half)} · 1/5 ${formatTokenNumber(prices.fifth)} · 1/10 ${formatTokenNumber(prices.tenth)}` : "未設定地獄對應卡，不能加入"}</small>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        <button className="primary-btn" type="button" disabled={saving} onClick={save}>{saving ? "儲存中..." : "儲存自助抽卡設定"}</button>
+      </section>
+      <section className="panel">
+        <h3>自助抽卡數據（不計入直播）</h3>
+        {recordsError && <p className="error-note" role="alert">{recordsError}</p>}
+        <div className="affiliate-summary monitor-kpis">
+          <div><span>今日抽卡</span><strong>{todayStats.count} 次 · {todayStats.players} 人</strong></div>
+          <div><span>今日銷售</span><strong>{formatTokenNumber(todayStats.sales)}</strong></div>
+          <div><span>今日派出兌換值</span><strong>{formatTokenNumber(todayStats.payout)}</strong></div>
+          <div><span>今日毛利估算</span><strong>{formatTokenNumber(todayStats.sales - todayStats.payout)}</strong></div>
+          <div><span>今日天堂</span><strong>{todayStats.heaven}{todayStats.count ? `（${Math.round((todayStats.heaven / todayStats.count) * 100)}%）` : ""}</strong></div>
+          <div><span>最近 {recentStats.count} 次毛利</span><strong>{formatTokenNumber(recentStats.sales - recentStats.payout)}</strong></div>
+        </div>
+        {records.length ? (
+          <div className="admin-instant-records">
+            {records.map((record) => (
+              <p key={record.id}>
+                <b>{formatAnalyticsTime(toMillis(record.createdAt))}</b> {record.username || record.uid} · {record.targetCardName} · {record.shareMode} #{record.number} ·
+                <span className={record.resultSide === "heaven" ? "heaven" : "hell"}> {record.resultSide === "heaven" ? "天堂" : "地獄"}</span> → {record.cardName} · ⚡{formatTokenNumber(record.tokenCost)}
+              </p>
+            ))}
+          </div>
+        ) : <p className="muted">暫時未有自助抽卡紀錄。</p>}
+      </section>
+    </>
   );
 }
 
@@ -9179,7 +9708,8 @@ function AdminRoundResultAssignmentPanel({ cards, draws, records, profile, loadi
   const legacySyncKeyRef = useRef("");
   const draftSessionKeyRef = useRef("");
   const purchaseRecords = useMemo(
-    () => records.filter((record) => record.uid && record.number).sort(compareRoomRoundRecords),
+    // 自助抽卡 draws are settled at once and belong to no room round.
+    () => records.filter((record) => record.uid && record.number && record.source !== "instant").sort(compareRoomRoundRecords),
     [records],
   );
 
@@ -9660,7 +10190,7 @@ function ShippingRequestManager({ records, loading = false }) {
             <article className="shipping-request-card" key={record.id}>
               <div className="shipping-card-summary">
                 <strong>{record.cardName || "未命名卡牌"}</strong>
-                <span>{record.drawTitle || record.roomSlug || "抽卡房"} · {formatRoundLabel(record.round)}</span>
+                <span>{record.drawTitle || record.roomSlug || "抽卡房"}{record.source === "instant" ? "" : ` · ${formatRoundLabel(record.round)}`}</span>
                 <button
                   className="shipping-user-link"
                   type="button"
@@ -9831,6 +10361,9 @@ function UserRecordAuditModal({ user, onClose }) {
     async function checkSlots() {
       setChecking(true);
       const checkedEntries = await Promise.all(userRecords.map(async (record) => {
+        if (record.source === "instant") {
+          return [record.id, { status: "system", message: "自助抽卡紀錄（即時抽出，沒有房間號碼）" }];
+        }
         if (!record.drawId || !record.slotId || !record.round) {
           return [record.id, record.number
             ? { status: "warning", message: "購買紀錄缺少房間、場次或號碼 ID" }
@@ -11295,7 +11828,7 @@ function AdminRoomRecordsPanel({ cards, records, profile, loading = false }) {
   const [assigningId, setAssigningId] = useState("");
   const [pendingAssignment, setPendingAssignment] = useState(null);
   const purchaseRecords = records
-    .filter((record) => record.uid && record.number)
+    .filter((record) => record.uid && record.number && record.source !== "instant")
     .sort(compareRoomRoundRecords);
   const rooms = Array.from(
     new Map(
@@ -11767,10 +12300,11 @@ function CreateCardForm({ cards, profile }) {
   // Only rooms that are not finished take the new prices: a finished room keeps the prices
   // it was played at, and the number of rewritten rooms no longer grows with the history.
   async function recalculateAllCardPrices(rate, saveSetting = false) {
-    const [cardSnapshot, roomSnapshot, showcaseSnapshot] = await Promise.all([
+    const [cardSnapshot, roomSnapshot, showcaseSnapshot, instantSnapshot] = await Promise.all([
       getDocs(collection(db, "cards")),
       getDocs(query(collection(db, "draws"), where("status", "in", OPEN_ROOM_STATUSES))),
       getDocs(collection(db, "publicCardShowcase")),
+      getDoc(doc(db, "publicSiteSettings", "instantDraw")),
     ]);
     const allCards = cardSnapshot.docs
       .map((item) => ({ id: item.id, ...item.data() }))
@@ -11834,6 +12368,15 @@ function CreateCardForm({ cards, profile }) {
       }
       writes.push((batch) => batch.update(roomDoc.ref, roomUpdates));
     });
+    // The 自助抽卡 pool shows a copy of each card's prices; keep it in step.
+    const instantCards = instantSnapshot.data()?.cards;
+    if (Array.isArray(instantCards) && instantCards.some((card) => pricesById.has(String(card?.id || "")))) {
+      const cards = instantCards.map((card) => {
+        const prices = pricesById.get(String(card?.id || ""));
+        return prices ? { ...card, tokenValue: prices.half, modePrices: prices } : card;
+      });
+      writes.push((batch) => batch.set(doc(db, "publicSiteSettings", "instantDraw"), { cards }, { merge: true }));
+    }
     showcaseSnapshot.docs.forEach((showcaseDoc) => {
       const prices = pricesById.get(showcaseDoc.id);
       if (prices) writes.push((batch) => batch.set(showcaseDoc.ref, {

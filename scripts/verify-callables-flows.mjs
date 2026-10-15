@@ -379,10 +379,15 @@ check("account: age confirmation added on a later sign-in", (await read(`users/$
 await seed("cards/pool-hell", { name: "Pool hell", tokenValue: 50, conversionValue: 50 });
 await seed("cards/pool-heaven", { name: "Pool heaven", tokenValue: 2000, conversionValue: 2000, hellCardId: "pool-hell" });
 const poolRoom = unique("pool");
-await seed(`draws/${poolRoom}`, { title: "Pool room", poolCardIds: ["pool-heaven", "other"], poolCardValues: { "pool-heaven": 1, other: 5 }, poolCards: [{ id: "pool-heaven", name: "Pool heaven", tokenValue: 1 }, { id: "other", tokenValue: 5 }] });
+await seed(`draws/${poolRoom}`, { title: "Pool room", status: "live", poolCardIds: ["pool-heaven", "other"], poolCardValues: { "pool-heaven": 1, other: 5 }, poolCards: [{ id: "pool-heaven", name: "Pool heaven", tokenValue: 1 }, { id: "other", tokenValue: 5 }] });
+// A finished room keeps the prices it was played at.
+const finishedPoolRoom = unique("poolroomdone");
+await seed(`draws/${finishedPoolRoom}`, { title: "Finished pool room", status: "completed", poolCardIds: ["pool-heaven"], poolCardValues: { "pool-heaven": 1 }, poolCards: [{ id: "pool-heaven", name: "Pool heaven", tokenValue: 1 }] });
 expect("prices: recalculate with a room using the card", await adminCall("adminRecalculateCardPrices", { marginRate: 1.3 }), "OK");
 const pool = await read(`draws/${poolRoom}`);
 check("prices: room pool price follows the card", pool?.poolCards?.[0]?.tokenValue > 1 && pool?.poolCards?.[1]?.tokenValue === 5, JSON.stringify(pool?.poolCards));
+const finishedPool = await read(`draws/${finishedPoolRoom}`);
+check("prices: finished room keeps its price", finishedPool?.poolCards?.[0]?.tokenValue === 1 && finishedPool?.poolCardValues?.["pool-heaven"] === 1, JSON.stringify(finishedPool?.poolCards));
 // Deleting an admin audit log (only possible with server credentials) fires the tamper trigger.
 const auditLogs = (await fetch(`${FS}/adminAuditLogs?pageSize=1`, { headers: owner }).then((r) => r.json())).documents || [];
 if (auditLogs[0]) await fetch(`${FS.replace(/\/documents$/, "")}/documents/${auditLogs[0].name.split("/documents/")[1]}`, { method: "DELETE", headers: owner });
