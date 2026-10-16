@@ -1,13 +1,17 @@
-// 自助抽卡: a player picks a card, an odds mode and up to 20 numbers; each number is
-// one independent draw, decided on the server the moment it is paid for. The
+// 自助抽卡: a player picks a card, an odds mode and up to 20 numbers. Like a live
+// round, each purchase uses a fresh board of 20 numbers holding a fixed number of
+// heavens for the mode (1/2: 10, 1/5: 4, 1/10: 2), shuffled on the server the moment it
+// is paid for; the chosen numbers are revealed. Buying all 20 always gives that exact
+// split. Every purchase gets its own new board, so earlier results tell nothing about
+// the next one (no counting). The
 // settings (on / off, card pool, daily limit) live in publicSiteSettings/instantDraw
 // so guests can see the pool; prices always come from the card library.
 import { randomInt } from "node:crypto";
 
 export const INSTANT_SHARE_MODES = ["1/2", "1/5", "1/10"];
-// Chance of heaven for each odds mode.
-export const INSTANT_HEAVEN_CHANCE = { "1/2": 1 / 2, "1/5": 1 / 5, "1/10": 1 / 10 };
 export const INSTANT_NUMBER_COUNT = 20;
+// Heavens on each 20-number board (chance per number: 50%, 20%, 10%).
+export const INSTANT_HEAVEN_COUNT = { "1/2": 10, "1/5": 4, "1/10": 2 };
 export const DEFAULT_INSTANT_DAILY_LIMIT = 500;
 export const MAX_INSTANT_DAILY_LIMIT = 10_000_000;
 export const MAX_INSTANT_POOL_CARDS = 200;
@@ -76,9 +80,15 @@ export function validNumbers(value) {
   return numbers.sort((left, right) => left - right);
 }
 
-// One independent draw: heaven with the mode's chance, using a cryptographic RNG.
-export function drawSide(shareMode, random = randomInt) {
-  const chance = INSTANT_HEAVEN_CHANCE[shareMode];
-  if (!chance) throw new Error(`Unknown share mode ${shareMode}`);
-  return random(0, 1_000_000) < Math.round(chance * 1_000_000) ? "heaven" : "hell";
+// A new board: index n - 1 holds the side of number n. Fisher–Yates with a
+// cryptographic RNG, so every arrangement is equally likely.
+export function drawBoard(shareMode, random = randomInt) {
+  const heavens = INSTANT_HEAVEN_COUNT[shareMode];
+  if (!heavens) throw new Error(`Unknown share mode ${shareMode}`);
+  const board = Array.from({ length: INSTANT_NUMBER_COUNT }, (_, index) => (index < heavens ? "heaven" : "hell"));
+  for (let index = board.length - 1; index > 0; index -= 1) {
+    const other = random(0, index + 1);
+    [board[index], board[other]] = [board[other], board[index]];
+  }
+  return board;
 }

@@ -10,7 +10,7 @@ import { analyticsDayRange, summarizeAdminDay } from "./admin-analytics.js";
 import { isGuestKey, summarizeLiveSessions, summarizeVisitors } from "./live-audience.js";
 import {
   INSTANT_SHARE_MODES, MAX_INSTANT_DAILY_LIMIT, MAX_INSTANT_POOL_CARDS, cardPrice, cardShareModes, dailyLimit,
-  drawSide, hongKongDay, isDrawableCard, poolCardSnapshot, spentToday, validNumbers,
+  drawBoard, hongKongDay, isDrawableCard, poolCardSnapshot, spentToday, validNumbers,
 } from "./instant-draw.js";
 import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeAudience, sanitizeClientError } from "./monitor.js";
 
@@ -1800,8 +1800,10 @@ export const instantDraw = onCall(userCallableOptions, async (request) => {
     }
 
     const now = FieldValue.serverTimestamp();
+    // A fresh board for this purchase; the chosen numbers are revealed from it.
+    const board = drawBoard(shareMode);
     const draws = numbers.map((number) => {
-      const resultSide = drawSide(shareMode);
+      const resultSide = board[number - 1];
       const [prizeId, prize] = resultSide === "heaven" ? [cardId, card] : [hellId, hell];
       const recordRef = db.collection("drawRecords").doc();
       const record = {

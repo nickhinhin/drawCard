@@ -110,21 +110,21 @@ const adminDraw = await call("instantDraw", { cardId: "inst-A", shareMode: "1/2"
 check("admin test mode: admin draws with real tokens", adminDraw.result?.draws?.length === 2 && (await read(`users/${ADMIN_UID}`)).tokens === 800, JSON.stringify(adminDraw.error || adminDraw.result?.tokens));
 await sleep(1600);
 
-// ---- odds over many draws (no limit) ----
+// ---- fixed split: buying all 20 numbers gives exactly the mode's heavens ----
 await call("adminSaveInstantDraw", { mode: "all", dailyTokenLimit: 0, cardIds: ["inst-A", "inst-C"] }, admin);
 await sleep(1600);
-const counts = { "1/2": [0, 0], "1/10": [0, 0] };
+const all20 = Array.from({ length: 20 }, (_, k) => k + 1);
+const splits = { "1/2": [], "1/10": [] };
 for (const [mode, price] of [["1/2", 100], ["1/10", 20]]) {
   for (let i = 0; i < 15; i++) {
-    const r = await call("instantDraw", { cardId: "inst-A", shareMode: mode, numbers: Array.from({ length: 20 }, (_, k) => k + 1), unitPrice: price }, rich.token);
-    if (!r.result) { console.log("odds call failed", JSON.stringify(r.error)); break; }
-    r.result.draws.forEach((x) => { counts[mode][0]++; if (x.resultSide === "heaven") counts[mode][1]++; });
+    const r = await call("instantDraw", { cardId: "inst-A", shareMode: mode, numbers: all20, unitPrice: price }, rich.token);
+    if (!r.result) { console.log("draw failed", JSON.stringify(r.error)); break; }
+    splits[mode].push(r.result.draws.filter((x) => x.resultSide === "heaven").length);
     await sleep(1550);
   }
 }
-const rate = (m) => counts[m][1] / counts[m][0];
-check(`1/2 heaven rate near 50% (${(rate("1/2") * 100).toFixed(1)}% of ${counts["1/2"][0]})`, Math.abs(rate("1/2") - 0.5) < 0.1);
-check(`1/10 heaven rate near 10% (${(rate("1/10") * 100).toFixed(1)}% of ${counts["1/10"][0]})`, Math.abs(rate("1/10") - 0.1) < 0.06);
+check(`1/2, all 20 numbers: always 10 heaven (${splits["1/2"].join(",")})`, splits["1/2"].length === 15 && splits["1/2"].every((n) => n === 10));
+check(`1/10, all 20 numbers: always 2 heaven (${splits["1/10"].join(",")})`, splits["1/10"].length === 15 && splits["1/10"].every((n) => n === 2));
 const ur = await read(`users/${rich.uid}`);
 check("no daily limit when set to 0; balance exact", ur.tokens === 100000 - 15 * 20 * 100 - 15 * 20 * 20, `tokens=${ur.tokens}`);
 console.log(`SUMMARY ${ok}/${ok + bad} passed`);

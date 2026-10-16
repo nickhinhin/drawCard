@@ -1,21 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  cardPrice, cardShareModes, dailyLimit, drawSide, hongKongDay, isDrawableCard, poolCardSnapshot, spentToday, validNumbers,
+  cardPrice, cardShareModes, dailyLimit, drawBoard, hongKongDay, isDrawableCard, poolCardSnapshot, spentToday, validNumbers,
 } from "../src/instant-draw.js";
 import { summarizeAdminDay } from "../src/admin-analytics.js";
 
-test("each mode gives heaven with its own chance", () => {
-  const trials = 200_000;
-  for (const [mode, chance] of [["1/2", 0.5], ["1/5", 0.2], ["1/10", 0.1]]) {
-    let heaven = 0;
-    for (let i = 0; i < trials; i += 1) if (drawSide(mode) === "heaven") heaven += 1;
-    assert.ok(Math.abs(heaven / trials - chance) < 0.005, `${mode}: ${heaven / trials}`);
+test("every board holds the mode's exact number of heavens", () => {
+  for (const [mode, heavens] of [["1/2", 10], ["1/5", 4], ["1/10", 2]]) {
+    for (let i = 0; i < 2000; i += 1) {
+      const board = drawBoard(mode);
+      assert.equal(board.length, 20);
+      assert.equal(board.filter((side) => side === "heaven").length, heavens);
+      assert.equal(board.filter((side) => side === "hell").length, 20 - heavens);
+    }
   }
-  // The cut-off is exact: below it is heaven, at it is hell.
-  assert.equal(drawSide("1/10", () => 99_999), "heaven");
-  assert.equal(drawSide("1/10", () => 100_000), "hell");
-  assert.throws(() => drawSide("1/3"));
+  assert.throws(() => drawBoard("1/3"));
+});
+
+test("each number is heaven with the mode's chance, wherever it is", () => {
+  const trials = 40_000;
+  for (const [mode, chance] of [["1/2", 0.5], ["1/5", 0.2], ["1/10", 0.1]]) {
+    const heavenAt = Array(20).fill(0);
+    for (let i = 0; i < trials; i += 1) drawBoard(mode).forEach((side, index) => { if (side === "heaven") heavenAt[index] += 1; });
+    for (const count of heavenAt) assert.ok(Math.abs(count / trials - chance) < 0.015, `${mode}: ${count / trials}`);
+  }
 });
 
 test("numbers must be 1–20, distinct, at least one", () => {

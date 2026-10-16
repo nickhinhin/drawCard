@@ -5117,7 +5117,8 @@ function requestLogin(notice) {
 // a card, an odds mode and up to 20 numbers; the instantDraw function draws each number
 // on the server when it is paid for, and the page then only animates those results.
 const INSTANT_NUMBERS = Array.from({ length: 20 }, (_, index) => index + 1);
-const INSTANT_MODE_CHANCE = { "1/2": "50%", "1/5": "20%", "1/10": "10%" };
+// Heavens on each purchase's 20-number board (same as the server's INSTANT_HEAVEN_COUNT).
+const INSTANT_MODE_HEAVENS = { "1/2": 10, "1/5": 4, "1/10": 2 };
 
 // undefined while loading, null when 自助抽卡 has never been set up.
 function useInstantDrawSettings() {
@@ -5214,7 +5215,7 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
         <Sparkles size={22} />
         <div>
           <h2>自助抽卡{adminTest && <span className="instant-admin-test">管理員測試模式 · 玩家看不到</span>}</h2>
-          <p className="muted">揀卡、揀玩法、揀號碼，付款後即時開卡。每個號碼獨立抽一次，抽中的卡即時存入「我的卡牌」。</p>
+          <p className="muted">揀卡、揀玩法、揀號碼，付款後即時開卡。每次購買都是一張新的 20 號碼板，天堂數目固定（1/2 有 10 個、1/5 有 4 個、1/10 有 2 個），買滿 20 個號碼必定是這個比例。抽中的卡即時存入「我的卡牌」。</p>
         </div>
       </div>
       {profile?.uid && (
@@ -5250,7 +5251,7 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
             {modes.map((mode) => (
               <button className={mode === shareMode ? "active" : ""} key={mode} type="button" onClick={() => setShareMode(mode)}>
                 <strong>{mode}</strong>
-                <small>天堂機率 {INSTANT_MODE_CHANCE[mode]}</small>
+                <small>20 個號碼中 {INSTANT_MODE_HEAVENS[mode]} 個天堂</small>
                 <TokenAmount value={instantCardPrice(card, mode)} suffix=" / 號碼" />
               </button>
             ))}
@@ -9584,7 +9585,7 @@ function AdminInstantDrawPanel({ cards, loading }) {
           <Sparkles size={22} />
           <div>
             <h2>自助抽卡</h2>
-            <p className="muted">開啟後，玩家可在直播大廳自行揀卡、揀玩法及號碼，付款後即時抽出天堂或地獄（1/2：50%、1/5：20%、1/10：10%）。售價跟卡牌庫。</p>
+            <p className="muted">開啟後，玩家可在直播大廳自行揀卡、揀玩法及號碼，付款後即時開出天堂或地獄。每次購買都是一張新的 20 號碼板，天堂數目固定：1/2 有 10 個、1/5 有 4 個、1/10 有 2 個（買滿 20 個號碼必定是這個比例）。售價跟卡牌庫。</p>
           </div>
         </div>
         <div className="admin-instant-modes" role="radiogroup" aria-label="開放狀態">
