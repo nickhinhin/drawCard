@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App.jsx";
 import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
 import { installGlobalErrorReporting } from "./errorReporting.js";
+import { installDomGuards } from "./domGuards.js";
 import "./styles.css";
 import "./beta.css";
 
@@ -36,6 +37,8 @@ if (IS_ADMIN_SITE) {
 }
 
 installGlobalErrorReporting();
+// Before the first render: keep browser translation from crashing React.
+installDomGuards();
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
