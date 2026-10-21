@@ -5,6 +5,7 @@ import { getStorage } from "firebase-admin/storage";
 import { logger } from "firebase-functions";
 import { setGlobalOptions } from "firebase-functions/v2";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
+import { onDocumentUpdated } from "firebase-functions/v2/firestore";
 import { syncAllPrices, syncAdminPriceWrites } from "./price-sync.js";
 import { purchaseLiveSlot } from "./live-purchase.js";
 import { analyzeAuditEntries } from "./audit-analysis.js";
@@ -1771,6 +1772,15 @@ export const instantDraw = onCall(userCallableOptions, async (request) => {
       throw new HttpsError("failed-precondition", "自助抽卡暫未開放。");
     }
   }
+  // Paused while the live monitor runs; a page opened before the show cannot draw either.
+  // Admins may still test.
+  if (settings.pausedForLive === true) {
+    try {
+      assertAdmin(request);
+    } catch {
+      throw new HttpsError("failed-precondition", "直播進行中，自助抽卡暫停，直播結束後會重新開放。");
+    }
+  }
   if (!Array.isArray(settings.cardIds) || !settings.cardIds.includes(cardId)) {
     throw new HttpsError("failed-precondition", "這張卡暫時不在自助抽卡卡池，請重新整理。");
   }
@@ -2190,6 +2200,33 @@ export const adminMonitorSession = onCall({ ...adminHeavyCallableOptions, timeou
   if (action !== "stop") throw new HttpsError("invalid-argument", "操作不正確。");
 
   const sessionRef = sessions.doc(assertIdentifier(request.data?.sessionId, "監察 ID"));
+  await stopMonitorSession(sessionRef, actor, request);
+  return { ok: true, sessionId: sessionRef.id };
+});
+
+// Stops the live monitor once the final round's result photo is up: that photo is
+// the last thing posted in a show. Admin-page uploads all save through adminWrite,
+// so watching the room catches every way of posting it.
+export const autoStopMonitorOnFinalResult = onDocumentUpdated({
+  document: "draws/{drawId}", region: "asia-east2", cpu: 1, memory: "512MiB", timeoutSeconds: 300, maxInstances: 1,
+}, async (event) => {
+  const before = event.data?.before.data() || {};
+  const after = event.data?.after.data() || {};
+  const totalRounds = Math.max(1, Math.min(100, Math.round(Number(after.totalRounds) || 1)));
+  const finalRoundId = `round-${String(totalRounds).padStart(3, "0")}`;
+  if (!after.roundResultImages?.[finalRoundId] || before.roundResultImages?.[finalRoundId]) return;
+  const active = await db.collection("monitorSessions").where("status", "==", "active").limit(1).get();
+  if (active.empty) return;
+  try {
+    await stopMonitorSession(active.docs[0].ref, { uid: "system:final-result", email: "" }, { data: { drawId: event.params.drawId } });
+    logger.info("Monitor stopped after the final result photo.", { drawId: event.params.drawId, sessionId: active.docs[0].id });
+  } catch (error) {
+    // An admin stopping at the same moment has already finished it.
+    if (error?.code !== "failed-precondition") throw error;
+  }
+});
+
+async function stopMonitorSession(sessionRef, actor, request) {
   // Claim the stop first so a double press cannot build two reports.
   const snapshot = await db.runTransaction(async (transaction) => {
     const current = await transaction.get(sessionRef);
@@ -2269,5 +2306,4 @@ export const adminMonitorSession = onCall({ ...adminHeavyCallableOptions, timeou
     throw error;
   }
   await db.collection("adminAuditLogs").add(auditRecord(actor, "monitor:stop", "monitorSessions", sessionRef.id, null, { durationMinutes: Math.round((Date.now() - snapshot.data().startedAt.toMillis()) / 60000) }, request));
-  return { ok: true, sessionId: sessionRef.id };
-});
+}

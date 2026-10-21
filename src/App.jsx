@@ -8741,7 +8741,7 @@ function LiveMonitor() {
           <Bell size={22} />
           <div>
             <h2>直播監察</h2>
-            <p className="muted">直播開始時按「開始監察」，期間會即時顯示銷售、待處理申請及錯誤；直播結束後按「停止」即會產生報告。</p>
+            <p className="muted">直播開始時按「開始監察」，期間會即時顯示銷售、待處理申請及錯誤，並暫停自助抽卡。上載最後一場的賽果相片後會自動停止並產生報告，亦可隨時按「停止」；停止後自助抽卡會重新開放。</p>
           </div>
         </div>
         <button className="primary-btn" type="button" disabled={busy} onClick={startMonitor}>
@@ -9520,7 +9520,7 @@ function AdminInstantDrawPanel({ cards, loading }) {
           </div>
         </div>
         {settings?.pausedForLive === true && (
-          <p className="monitor-alert medium">直播監察進行中：玩家網站已自動隱藏自助抽卡。停止直播監察後會自動按下面的開放狀態再次顯示。</p>
+          <p className="monitor-alert medium">直播監察進行中：玩家網站已自動隱藏並暫停自助抽卡（管理員仍可測試）。停止直播監察後會自動按下面的開放狀態再次開放。</p>
         )}
         <div className="admin-instant-modes" role="radiogroup" aria-label="開放狀態">
           {Object.entries(INSTANT_MODE_LABELS).map(([value, label]) => (

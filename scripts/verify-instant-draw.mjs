@@ -111,7 +111,7 @@ check("admin test mode: admin draws with real tokens", adminDraw.result?.draws?.
 await sleep(1600);
 
 // ---- going live (starting the live monitor) hides 自助抽卡 on the page; stopping shows it ----
-// Only the page hides it (pausedForLive); the function itself is not blocked during live.
+// The function also refuses players during live, so a page opened earlier cannot draw.
 await call("adminSaveInstantDraw", { mode: "all", dailyTokenLimit: 0, cardIds: ["inst-A"] }, admin);
 const started = await call("adminMonitorSession", { action: "start", drawTitle: "測試直播" }, admin);
 check("monitor started", Boolean(started.result?.sessionId), JSON.stringify(started.error));
@@ -119,6 +119,12 @@ const pausedDoc = await read("publicSiteSettings/instantDraw");
 check("starting the monitor sets the live flag, mode kept", pausedDoc.pausedForLive === true && pausedDoc.mode === "all", JSON.stringify({ paused: pausedDoc.pausedForLive, mode: pausedDoc.mode }));
 await call("adminSaveInstantDraw", { mode: "all", dailyTokenLimit: 0, cardIds: ["inst-A", "inst-C"] }, admin);
 check("saving settings during live keeps the live flag", (await read("publicSiteSettings/instantDraw")).pausedForLive === true);
+const duringLive = await call("instantDraw", { cardId: "inst-A", shareMode: "1/2", numbers: [1], unitPrice: 100 }, rich.token);
+check("during live: player refused", err(duringLive).includes("直播進行中"), JSON.stringify(duringLive));
+await sleep(1600);
+const adminDuringLive = await call("instantDraw", { cardId: "inst-A", shareMode: "1/2", numbers: [3], unitPrice: 100 }, admin);
+check("during live: admin may still test", adminDuringLive.result?.draws?.length === 1, JSON.stringify(adminDuringLive.error));
+await sleep(1600);
 const stopped = await call("adminMonitorSession", { action: "stop", sessionId: started.result.sessionId }, admin);
 check("monitor stopped", stopped.result?.ok === true, JSON.stringify(stopped.error));
 const resumedDoc = await read("publicSiteSettings/instantDraw");
@@ -127,6 +133,20 @@ await sleep(1600);
 const afterLive = await call("instantDraw", { cardId: "inst-A", shareMode: "1/2", numbers: [1], unitPrice: 100 }, rich.token);
 check("after live: player can draw", afterLive.result?.draws?.length === 1, JSON.stringify(afterLive.error));
 await sleep(1600);
+
+// ---- the final round's result photo stops the monitor by itself ----
+const room = { title: "自動停止測試", status: "live", totalRounds: 2, currentRound: 2, round: "round-002", roundResultImages: { "round-001": "", "round-002": "" }, createdAt: new Date() };
+await seed("draws/inst-auto-stop", room);
+const autoSession = await call("adminMonitorSession", { action: "start", drawTitle: room.title }, admin);
+check("second monitor started", Boolean(autoSession.result?.sessionId), JSON.stringify(autoSession.error));
+const sessionStatus = async () => (await read(`monitorSessions/${autoSession.result.sessionId}`))?.status;
+await seed("draws/inst-auto-stop", { ...room, roundResultImages: { "round-001": "https://example.test/r1.webp", "round-002": "" } });
+await sleep(4000);
+check("an earlier round's photo leaves the monitor running", await sessionStatus() === "active", await sessionStatus());
+await seed("draws/inst-auto-stop", { ...room, roundResultImages: { "round-001": "https://example.test/r1.webp", "round-002": "https://example.test/r2.webp" } });
+for (let i = 0; i < 30 && await sessionStatus() !== "completed"; i++) await sleep(1000);
+check("final round's photo stops the monitor with a report", await sessionStatus() === "completed" && Boolean((await read(`monitorSessions/${autoSession.result.sessionId}`)).report), await sessionStatus());
+check("auto stop reopens 自助抽卡", (await read("publicSiteSettings/instantDraw")).pausedForLive === false);
 
 // ---- fixed split: buying all 20 numbers gives exactly the mode's heavens ----
 await call("adminSaveInstantDraw", { mode: "all", dailyTokenLimit: 0, cardIds: ["inst-A", "inst-C"] }, admin);
