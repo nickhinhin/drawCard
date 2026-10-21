@@ -12,6 +12,8 @@ const dropBannerPreloadOnAdmin = {
 };
 
 export default defineConfig({
+  // Stamp each build so incident reports distinguish an old open tab from a new release.
+  define: { "import.meta.env.VITE_APP_VERSION": JSON.stringify(process.env.VITE_APP_VERSION || new Date().toISOString()) },
   plugins: [react(), dropBannerPreloadOnAdmin],
   build: {
     rollupOptions: {

@@ -5,6 +5,8 @@ import { getStorage } from "firebase-admin/storage";
 import { logger } from "firebase-functions";
 import { setGlobalOptions } from "firebase-functions/v2";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
+import { syncAllPrices, syncAdminPriceWrites } from "./price-sync.js";
+import { purchaseLiveSlot } from "./live-purchase.js";
 import { analyzeAuditEntries } from "./audit-analysis.js";
 import { analyticsDayRange, summarizeAdminDay } from "./admin-analytics.js";
 import { isGuestKey, summarizeLiveSessions, summarizeVisitors } from "./live-audience.js";
@@ -856,6 +858,7 @@ export const adminWrite = onCall(adminCallableOptions, async (request) => {
     const auditRef = db.collection("adminAuditLogs").doc();
     transaction.set(auditRef, auditRecord(actor, `${mode}:${collectionName}`, collectionName, documentId, before, data, request));
   });
+  await syncAdminPriceWrites(db, [{ collectionName, documentId, data, mode }]);
   return { ok: true, documentId };
 });
 
@@ -971,6 +974,7 @@ export const adminBatchWrite = onCall(adminCallableOptions, async (request) => {
       ));
     });
   });
+  await syncAdminPriceWrites(db, refs);
   return { ok: true, count: refs.length };
 });
 
@@ -1283,22 +1287,26 @@ export const adminEnsureDrawSlots = onCall(adminCallableOptions, async (request)
 
 // Reprices every formula card and every denormalized room/showcase copy in one
 // server-side operation. Promotion cards using manual prices are left intact.
-export const adminRecalculateCardPrices = onCall(adminCallableOptions, async (request) => {
+export const adminRecalculateCardPrices = onCall({ ...adminHeavyCallableOptions, timeoutSeconds: 300 }, async (request) => {
   const actor = assertAdmin(request);
   const marginRate = Number(request.data?.marginRate);
   if (!Number.isFinite(marginRate) || marginRate <= 0 || marginRate > 10) {
     throw new HttpsError("invalid-argument", "毛利率必須大過 0 並且不多於 10。");
   }
-  // Finished rooms keep the prices they were played at; only open rooms are repriced.
-  const [cardsSnapshot, drawsSnapshot] = await Promise.all([
-    db.collection("cards").get(), db.collection("draws").where("status", "in", ["live", "scheduled", "draft"]).get(),
-  ]);
+  const cardsSnapshot = await db.collection("cards").get();
   const cards = new Map(cardsSnapshot.docs.map((item) => [item.id, item.data()]));
   const prices = new Map();
   const roundPrice = (value) => Math.max(1, Math.round(value));
   cardsSnapshot.docs.forEach((item) => {
     const card = item.data();
-    if (card.archived || card.pricingMode === "manual") return;
+    if (card.archived) return;
+    if (card.pricingMode === "manual") {
+      const keys = ["half", "fifth", "tenth"];
+      const next = Object.fromEntries(keys.map((key) => [key, Math.round(Number(card.modePrices?.[key] ?? card.tokenValue))]));
+      if (Object.values(next).every((price) => Number.isSafeInteger(price) && price > 0)
+        && (card.tokenValue !== next.half || keys.some((key) => card.modePrices?.[key] !== next[key]))) prices.set(item.id, next);
+      return;
+    }
     const hell = cards.get(String(card.hellCardId || ""));
     if (!hell) return;
     const heavenValue = Number(card.conversionValue ?? card.tokenValue ?? 0);
@@ -1329,40 +1337,19 @@ export const adminRecalculateCardPrices = onCall(adminCallableOptions, async (re
       updatedBy: actor.uid,
     }, { merge: true }));
   });
-  drawsSnapshot.docs.forEach((item) => {
-    const draw = item.data();
-    const poolIds = Array.isArray(draw.poolCardIds) ? draw.poolCardIds.map(String) : [];
-    if (!poolIds.some((id) => prices.has(id))) return;
-    const poolCardValues = { ...(draw.poolCardValues || {}) };
-    prices.forEach((modePrices, cardId) => { if (poolIds.includes(cardId)) poolCardValues[cardId] = modePrices.half; });
-    const update = { poolCardValues, updatedAt: FieldValue.serverTimestamp(), updatedBy: actor.uid };
-    if (Array.isArray(draw.poolCards)) {
-      update.poolCards = draw.poolCards.map((card) => {
-        const modePrices = prices.get(String(card?.id || ""));
-        return modePrices ? { ...card, tokenValue: modePrices.half, modePrices } : card;
-      });
-    }
-    writes.push((batch) => batch.set(item.ref, update, { merge: true }));
-  });
-  // The 自助抽卡 pool shows a copy of each card's prices; keep it in step.
-  const instantSettings = (await instantDrawSettingsRef().get()).data();
-  if (Array.isArray(instantSettings?.cards) && instantSettings.cards.some((card) => prices.has(String(card?.id || "")))) {
-    const cards = instantSettings.cards.map((card) => {
-      const modePrices = prices.get(String(card?.id || ""));
-      return modePrices ? { ...card, tokenValue: modePrices.half, modePrices } : card;
-    });
-    writes.push((batch) => batch.set(instantDrawSettingsRef(), { cards }, { merge: true }));
-  }
   for (let start = 0; start < writes.length; start += 400) {
     const batch = db.batch();
     writes.slice(start, start + 400).forEach((write) => write(batch));
     await batch.commit();
   }
+  // Repair every price copy even when no formula card needed recalculation.
+  const repaired = await syncAllPrices(db);
   await db.collection("adminAuditLogs").add(auditRecord(
     actor, "cards:recalculate-prices", "settings", "cardPricing", null,
     { marginRate, updatedCards: prices.size }, request,
   ));
-  return { ok: true, updatedCards: prices.size };
+  return { ok: true, updatedCards: prices.size, repaired,
+    manual: [...cards.values()].filter((card) => card.pricingMode === "manual").length };
 });
 
 // Renames a card category everywhere it is denormalized. Historical draw
@@ -1734,13 +1721,32 @@ export const adminSaveInstantDraw = onCall(adminCallableOptions, async (request)
     mode, enabled, dailyTokenLimit, cardIds: cards.map((card) => card.id), cards,
     updatedAt: FieldValue.serverTimestamp(),
   };
-  await ref.set(after);
+  // Merge, so a live pause set by the monitor survives an admin saving the settings.
+  await ref.set(after, { merge: true });
   await db.collection("adminAuditLogs").add(auditRecord(
     actor, "instant-draw:settings", "publicSiteSettings", "instantDraw",
-    before && { mode: instantDrawMode(before), dailyTokenLimit: before.dailyTokenLimit, cardIds: before.cardIds },
+    // The document may hold only the live flag (monitor started before any settings were saved).
+    before && { mode: instantDrawMode(before), dailyTokenLimit: before.dailyTokenLimit ?? null, cardIds: before.cardIds ?? [] },
     { mode, dailyTokenLimit, cardIds: after.cardIds, skipped }, request,
   ));
   return { ok: true, cards: cards.length, cardIds: after.cardIds, skipped };
+});
+
+// Player identity, pricing and receipt creation are validated together on the server.
+export const purchaseLiveNumber = onCall({ ...userCallableOptions, invoker: "public" }, async (request) => {
+  try {
+    return await purchaseLiveSlot(db, request);
+  } catch (error) {
+    if (!(error instanceof HttpsError)) {
+      logger.error("Live purchase failed", {
+        uid: request.auth?.uid || "", drawId: String(request.data?.drawId || "").slice(0, 128),
+        roundId: String(request.data?.roundId || "").slice(0, 128),
+        requestId: String(request.data?.requestId || "").slice(0, 128),
+        code: String(error?.code || ""), message: String(error?.message || "").slice(0, 500),
+      });
+    }
+    throw error;
+  }
 });
 
 export const instantDraw = onCall(userCallableOptions, async (request) => {
@@ -2172,6 +2178,11 @@ export const adminMonitorSession = onCall({ ...adminHeavyCallableOptions, timeou
         status: "active", drawTitle, startedAt: FieldValue.serverTimestamp(),
         startedBy: actor.uid, startedByEmail: actor.email || "",
       });
+      // Going live hides 自助抽卡 on the player site (pausedForLive); stopping the monitor
+      // shows it again. Only the page hides it; the admin's chosen mode is left as it is.
+      transaction.set(instantDrawSettingsRef(), {
+        pausedForLive: true, pausedForLiveAt: FieldValue.serverTimestamp(), pausedForLiveSessionId: ref.id,
+      }, { merge: true });
     });
     await db.collection("adminAuditLogs").add(auditRecord(actor, "monitor:start", "monitorSessions", ref.id, null, { drawTitle }, request));
     return { ok: true, sessionId: ref.id };
@@ -2241,10 +2252,17 @@ export const adminMonitorSession = onCall({ ...adminHeavyCallableOptions, timeou
       errors,
       audit: audit ? { summary: audit.summary, entryCount: audit.entryCount, findings: audit.findings.slice(0, 50) } : { unavailable: true },
     };
-    await sessionRef.update({
+    // Completing the session and showing 自助抽卡 again happen together; a failed stop
+    // keeps the session active and the panel hidden.
+    const finish = db.batch();
+    finish.update(sessionRef, {
       status: "completed", endedAt: FieldValue.serverTimestamp(), endedBy: actor.uid,
       endedByEmail: actor.email || "", report: stored,
     });
+    finish.set(instantDrawSettingsRef(), {
+      pausedForLive: false, pausedForLiveAt: null, pausedForLiveSessionId: "",
+    }, { merge: true });
+    await finish.commit();
   } catch (error) {
     // Let the admin try again instead of leaving the session stuck in "stopping".
     await sessionRef.update({ status: "active" });

@@ -110,6 +110,24 @@ const adminDraw = await call("instantDraw", { cardId: "inst-A", shareMode: "1/2"
 check("admin test mode: admin draws with real tokens", adminDraw.result?.draws?.length === 2 && (await read(`users/${ADMIN_UID}`)).tokens === 800, JSON.stringify(adminDraw.error || adminDraw.result?.tokens));
 await sleep(1600);
 
+// ---- going live (starting the live monitor) hides 自助抽卡 on the page; stopping shows it ----
+// Only the page hides it (pausedForLive); the function itself is not blocked during live.
+await call("adminSaveInstantDraw", { mode: "all", dailyTokenLimit: 0, cardIds: ["inst-A"] }, admin);
+const started = await call("adminMonitorSession", { action: "start", drawTitle: "測試直播" }, admin);
+check("monitor started", Boolean(started.result?.sessionId), JSON.stringify(started.error));
+const pausedDoc = await read("publicSiteSettings/instantDraw");
+check("starting the monitor sets the live flag, mode kept", pausedDoc.pausedForLive === true && pausedDoc.mode === "all", JSON.stringify({ paused: pausedDoc.pausedForLive, mode: pausedDoc.mode }));
+await call("adminSaveInstantDraw", { mode: "all", dailyTokenLimit: 0, cardIds: ["inst-A", "inst-C"] }, admin);
+check("saving settings during live keeps the live flag", (await read("publicSiteSettings/instantDraw")).pausedForLive === true);
+const stopped = await call("adminMonitorSession", { action: "stop", sessionId: started.result.sessionId }, admin);
+check("monitor stopped", stopped.result?.ok === true, JSON.stringify(stopped.error));
+const resumedDoc = await read("publicSiteSettings/instantDraw");
+check("stopping the monitor clears the live flag, same mode", resumedDoc.pausedForLive === false && resumedDoc.mode === "all", JSON.stringify({ paused: resumedDoc.pausedForLive, mode: resumedDoc.mode }));
+await sleep(1600);
+const afterLive = await call("instantDraw", { cardId: "inst-A", shareMode: "1/2", numbers: [1], unitPrice: 100 }, rich.token);
+check("after live: player can draw", afterLive.result?.draws?.length === 1, JSON.stringify(afterLive.error));
+await sleep(1600);
+
 // ---- fixed split: buying all 20 numbers gives exactly the mode's heavens ----
 await call("adminSaveInstantDraw", { mode: "all", dailyTokenLimit: 0, cardIds: ["inst-A", "inst-C"] }, admin);
 await sleep(1600);
@@ -126,6 +144,6 @@ for (const [mode, price] of [["1/2", 100], ["1/10", 20]]) {
 check(`1/2, all 20 numbers: always 10 heaven (${splits["1/2"].join(",")})`, splits["1/2"].length === 15 && splits["1/2"].every((n) => n === 10));
 check(`1/10, all 20 numbers: always 2 heaven (${splits["1/10"].join(",")})`, splits["1/10"].length === 15 && splits["1/10"].every((n) => n === 2));
 const ur = await read(`users/${rich.uid}`);
-check("no daily limit when set to 0; balance exact", ur.tokens === 100000 - 15 * 20 * 100 - 15 * 20 * 20, `tokens=${ur.tokens}`);
+check("no daily limit when set to 0; balance exact", ur.tokens === 100000 - 100 - 15 * 20 * 100 - 15 * 20 * 20, `tokens=${ur.tokens}`);
 console.log(`SUMMARY ${ok}/${ok + bad} passed`);
 if (bad) process.exit(1);

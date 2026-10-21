@@ -228,3 +228,29 @@
 - Calls: `Intl.DateTimeFormat`.
 - Input: Firestore `Timestamp` or date value.
 - Output: short month/day/time label.
+
+### 直播購買：`purchaseLiveNumber` / `purchaseLiveSlot`
+
+- 呼叫位置：玩家直播頁 `confirmBlindBoxPurchase`。確認視窗建立時產生 `requestId`；網絡結果不明時保留原視窗和識別碼，重按確認不會再次扣款。
+- 輸入：`requestId`, `drawId`, `roundId`, `number`, `cardId`, `shareMode`, `tokenCost`（玩家確認的價格）。身份只取 Firebase Auth，前端不可指定其他會員付款。
+- 流程：`purchaseLiveNumber` 呼叫 `purchaseLiveSlot(db, request)`，交易內讀取收據、會員、房間、場次、號碼、卡牌及名稱佔用資料，再一次寫入扣款、鎖號和抽卡紀錄。名稱未被佔用時在同一交易補回，避免舊帳戶缺少名稱索引而購買失敗。
+- 輸出：`{ ok: true, recordId }`。相同會員及 requestId 重送會回傳原收據；不能用原識別碼更改號碼、卡牌、玩法或金額。不同會員不共用識別碼。
+- 價格：三種玩法一律採用卡牌庫 `modePrices`（舊卡回退 `tokenValue`）。房間 `poolCardValues` 只作顯示副本，不參與價格授權。金額或玩法改變會拒絕並要求重新確認，不會靜默加價。
+- 最新資料：玩家名稱、推薦人、房名和圖片一律由交易當下的伺服器資料建立，避免舊頁面資料引起「權限不足」。停購、售出、餘額不足、卡牌下架都有業務訊息。
+- 安全：Firestore 規則亦統一驗證卡牌庫價格，繼續檢查身份、餘額、號碼和完整扣款。舊版頁面的卡牌庫價格提交亦相容；新版本透過伺服器交易處理。
+- 驗證：`scripts/verify-live-purchase.mjs` 使用 Auth / Firestore / Functions 模擬器，測試重送、搶號、價格不一致、舊玩法、預購、停購、過期場次、餘額及資料一致性，已納入 `npm run test:security`。
+- 發佈順序：先部署購買、管理寫入及同步相關 Functions，再部署 Firestore 規則及玩家／管理網站；不能只發網站。此流程不涵蓋自助抽卡 `instantDraw`。
+
+
+### 價格同步：`price-sync.js`
+
+- `canonicalPrices(card)`：由卡牌庫輸入取得三種玩法價格；供公開副本同步使用。
+- `copyPricePatch(copy, card)`：逐玩法比較副本與卡牌庫，只回傳需更新的價格欄位；一致則回傳 null。
+- `roomPricePatch(room, cards)`：輸入房間與卡牌 Map，僅修復 live/scheduled/draft 的價格副本，保留卡牌順序及其他資料；completed/cancelled 不改。
+- `syncRoomPrices(db, ref, dryRun)`：交易內讀取最新房間和卡牌，呼叫 `roomPricePatch`；dryRun 只回傳差異數，不寫入。交易重試避免延遲事件覆蓋新價格。
+- `syncCardPrices(db, cardId, options)`：修復 publicCardShowcase 和 instantDraw 指定卡牌價格，可選擇同步相關未完結房間。保留其他卡牌、排序、暫停旗標和設定。
+- `syncAllPrices(db, dryRun)`：全面掃描未完結房間和公開副本，即使卡牌庫價格沒有再變，仍會修復舊差異。`adminRecalculateCardPrices` 完成重算後必定呼叫。
+- `syncAdminPriceWrites(db, operations)`：`adminWrite`、`adminBatchWrite` 寫入後呼叫。舊管理頁面寫入舊副本時，回傳成功前重新按卡牌庫校正。
+- `auditCards`、`auditDraws`：相關價格／卡池變更後呼叫同步。使用原本的 retryable triggers，讀取最新文件而非事件中的舊值；不另新增背景排程。
+- 管理網站重算改由 `adminRecalculateCardPrices` 處理，移除瀏覽器另一套重算及整份房間副本覆寫流程。
+- 驗證：`npm run test:purchase-incident` 涵蓋未變卡價的副本修復、歷史資料保留及 93 張歷史卡牌的 canonical-price 購買；Functions 單元測試及 callable/security 流程亦覆蓋舊管理頁面、重試、搶號與防止少付。

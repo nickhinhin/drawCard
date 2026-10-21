@@ -314,8 +314,8 @@ function cardAllowsShareMode(card, shareMode) {
 // Return the card price for the room's odds, while keeping old single-price cards compatible.
 function getCardTokenValue(card, shareMode = "1/2") {
   const key = SHARE_MODE_PRICE_KEYS[shareMode] || SHARE_MODE_PRICE_KEYS["1/2"];
-  const modeValue = Number(card?.modePrices?.[key]);
-  return modeValue > 0 ? modeValue : Number(card?.tokenValue || 0);
+  const value = Number(card?.modePrices?.[key] ?? card?.tokenValue ?? 0);
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
 // Normalize all three prices so cards created before this feature use their existing price by default.
@@ -326,11 +326,6 @@ function getCardModePrices(card) {
     fifth: Math.max(1, Number(card?.modePrices?.fifth || fallback)),
     tenth: Math.max(1, Number(card?.modePrices?.tenth || fallback)),
   };
-}
-
-function cardHasPrices(card, prices) {
-  return Number(card?.tokenValue) === prices.half
-    && ["half", "fifth", "tenth"].every((key) => Number(card?.modePrices?.[key]) === prices[key]);
 }
 
 function normalizeManualCardPrices(prices) {
@@ -2498,8 +2493,10 @@ function FileUpload({ id, label, file, onChange, required = false, disabled = fa
 function DrawCard({ profile, isAdmin = false }) {
   const instantSettings = useInstantDrawSettings();
   const instantMode = getInstantDrawMode(instantSettings);
-  // Admin test mode shows the panel to admins only; the server checks this again.
-  const instantPanel = IS_BETA && (instantMode === "all" || (instantMode === "admin" && isAdmin))
+  // Admin test mode shows the panel to admins only (the server checks this again). While
+  // the live monitor runs (on air) the panel is hidden for everyone.
+  const instantPanel = IS_BETA && instantSettings?.pausedForLive !== true
+    && (instantMode === "all" || (instantMode === "admin" && isAdmin))
     ? <InstantDrawPanel profile={profile} settings={instantSettings} adminTest={instantMode === "admin"} />
     : null;
   const isBeta = IS_BETA;
@@ -2855,6 +2852,7 @@ function DrawCard({ profile, isAdmin = false }) {
 
     setPendingPurchase({
       slot,
+      requestId: crypto.randomUUID(),
       roomId: selectedRoom.id,
       roomTitle: selectedRoom.title,
       roomSlug: selectedRoom.slug || selectedRoom.id,
@@ -2886,87 +2884,15 @@ function DrawCard({ profile, isAdmin = false }) {
     setPurchaseStage("generating");
     setBuyingNumber(purchase.slot.number);
     try {
-      const claimedUsername = await ensureUsernameClaim(profile.uid, profile.username);
-
-      await runTransaction(db, async (transaction) => {
-        const userRef = doc(db, "users", profile.uid);
-        const slotRef = doc(
-          db,
-          "draws",
-          purchase.roomId,
-          "rounds",
-          purchase.roundId,
-          "slots",
-          String(purchase.slot.number),
-        );
-        const recordRef = doc(collection(db, "drawRecords"));
-        // Read the room inside the transaction so a stop pressed while the confirm
-        // box was open shows a clear message instead of a permission error; if the
-        // admin stops buying before this commits, the transaction re-runs and stops here.
-        const roomSnap = await transaction.get(doc(db, "draws", purchase.roomId));
-        const latestRoom = roomSnap.exists() ? { id: roomSnap.id, ...roomSnap.data() } : null;
-        if (!isRoomPurchasable(latestRoom)) throw new Error("本場直播已結束，不能再購買號碼。");
-        if (getRoundSortValue(purchase.roundId) < getRoomCurrentRound(latestRoom)) {
-          throw new Error("此場次已完結，不能再購買號碼。");
-        }
-        if (isRoundBuyingBlocked(latestRoom, purchase.roundId)) throw new Error("本場已停止購買。");
-        const userSnap = await transaction.get(userRef);
-        const slotSnap = await transaction.get(slotRef);
-        // Rules require the card library's own name and image on the purchase.
-        const cardSnap = await transaction.get(doc(db, "cards", purchase.card.id));
-        if (!cardSnap.exists()) throw new Error("此卡牌已下架，請重新選擇。");
-        const libraryName = String(cardSnap.data().name || "");
-        const libraryImageUrl = String(cardSnap.data().thumbUrl || cardSnap.data().imageUrl || "");
-        const currentTokens = Number(userSnap.data()?.tokens || 0);
-        const tokenCost = purchase.tokenCost;
-
-        if (!slotSnap.exists() || slotSnap.data().status !== "available") {
-          throw new Error("這個號碼已被選走。");
-        }
-
-        if (currentTokens < tokenCost) {
-          throw new Error(`你需要 ${tokenCost} 代幣才可購買此號碼。`);
-        }
-
-        transaction.update(userRef, {
-          tokens: currentTokens - tokenCost,
-          lastPurchaseRecordId: recordRef.id,
-          updatedAt: serverTimestamp(),
-        });
-        transaction.update(slotRef, {
-          purchaseRecordId: recordRef.id,
-          status: "locked",
-          uid: profile.uid,
-          username: claimedUsername,
-          tokenCost,
-          targetCardId: purchase.card.id,
-          targetCardName: libraryName,
-          targetCardImageUrl: libraryImageUrl,
-          targetCardValue: tokenCost,
-          shareMode: purchase.shareMode,
-          round: purchase.roundId,
-          updatedAt: serverTimestamp(),
-        });
-        transaction.set(recordRef, {
-          slotId: String(purchase.slot.number),
-          uid: profile.uid,
-          affiliateReferrerUid: profile.referredByUid || "",
-          username: claimedUsername,
-          drawId: purchase.roomId,
-          drawTitle: purchase.roomTitle,
-          roomSlug: purchase.roomSlug,
-          roomLink: publicRoomLink(purchase.roomId),
-          round: purchase.roundId,
-          roundSort: getRoundSortValue(purchase.roundId),
-          number: purchase.slot.number,
-          tokenCost,
-          targetCardId: purchase.card.id,
-          targetCardName: libraryName,
-          targetCardImageUrl: libraryImageUrl,
-          targetCardValue: tokenCost,
-          shareMode: purchase.shareMode,
-          createdAt: serverTimestamp(),
-        });
+      // Retry only with the same request ID: a lost response must never charge twice.
+      await httpsCallable(functions, "purchaseLiveNumber")({
+        requestId: purchase.requestId,
+        drawId: purchase.roomId,
+        roundId: purchase.roundId,
+        number: purchase.slot.number,
+        cardId: purchase.card.id,
+        shareMode: purchase.shareMode,
+        tokenCost: purchase.tokenCost,
       });
 
       const remainingAnimation = 1700 - (Date.now() - animationStartedAt);
@@ -2977,8 +2903,13 @@ function DrawCard({ profile, isAdmin = false }) {
       setSelectedSlotNumber(null);
     } catch (error) {
       setPurchaseStage("confirm");
-      setPendingPurchase(null);
-      showSafeError(error);
+      // Unknown network outcomes keep the same confirmation and idempotency key.
+      const uncertain = /(?:unavailable|deadline-exceeded|internal|network-request-failed)$/.test(String(error?.code || ""));
+      if (!uncertain) setPendingPurchase(null);
+      if (uncertain || /permission-denied$/.test(String(error?.code || ""))) {
+        reportClientError(error, `live-purchase:${purchase.roomId}:${purchase.roundId}:${purchase.slot.number}`);
+      }
+      showSafeError(error, "購買未能確認，請再按確認重試；同一筆購買不會重複扣款。");
     } finally {
       purchaseInFlightRef.current = false;
       setBuyingNumber(null);
@@ -9488,7 +9419,7 @@ const INSTANT_MODE_LABELS = { off: "關閉", admin: "只限管理員測試", all
 const INSTANT_MODE_HINTS = {
   off: "所有人都看不到自助抽卡。",
   admin: "只有管理員帳戶登入玩家網站時看到及可以抽（用真代幣）；玩家看不到。",
-  all: "所有玩家都可以抽。",
+  all: "所有玩家都可以抽。開始直播監察時自動隱藏，停止監察後自動再次顯示。",
 };
 
 function AdminInstantDrawPanel({ cards, loading }) {
@@ -9588,6 +9519,9 @@ function AdminInstantDrawPanel({ cards, loading }) {
             <p className="muted">開啟後，玩家可在直播大廳自行揀卡、揀玩法及號碼，付款後即時開出天堂或地獄。每次購買都是一張新的 20 號碼板，天堂數目固定：1/2 有 10 個、1/5 有 4 個、1/10 有 2 個（買滿 20 個號碼必定是這個比例）。售價跟卡牌庫。</p>
           </div>
         </div>
+        {settings?.pausedForLive === true && (
+          <p className="monitor-alert medium">直播監察進行中：玩家網站已自動隱藏自助抽卡。停止直播監察後會自動按下面的開放狀態再次顯示。</p>
+        )}
         <div className="admin-instant-modes" role="radiogroup" aria-label="開放狀態">
           {Object.entries(INSTANT_MODE_LABELS).map(([value, label]) => (
             <label className={mode === value ? "active" : ""} key={value}>
@@ -12300,103 +12234,9 @@ function CreateCardForm({ cards, profile }) {
   // Reprice every paired card together so changing a hell card or the margin cannot leave stale prices behind.
   // Only rooms that are not finished take the new prices: a finished room keeps the prices
   // it was played at, and the number of rewritten rooms no longer grows with the history.
-  async function recalculateAllCardPrices(rate, saveSetting = false) {
-    const [cardSnapshot, roomSnapshot, showcaseSnapshot, instantSnapshot] = await Promise.all([
-      getDocs(collection(db, "cards")),
-      getDocs(query(collection(db, "draws"), where("status", "in", OPEN_ROOM_STATUSES))),
-      getDocs(collection(db, "publicCardShowcase")),
-      getDoc(doc(db, "publicSiteSettings", "instantDraw")),
-    ]);
-    const allCards = cardSnapshot.docs
-      .map((item) => ({ id: item.id, ...item.data() }))
-      .filter((card) => !card.archived);
-    const cardsById = new Map(allCards.map((card) => [card.id, card]));
-    const pricesById = new Map();
-
-    allCards.forEach((card) => {
-      if (card.pricingMode === "manual") {
-        // Older manual prices may carry decimals; round them to whole tokens.
-        const current = getCardModePrices(card);
-        const rounded = normalizeManualCardPrices(current);
-        if (rounded && ["half", "fifth", "tenth"].some((key) => rounded[key] !== current[key])) {
-          pricesById.set(card.id, rounded);
-        }
-        return;
-      }
-      const hellCard = cardsById.get(String(card.hellCardId || ""));
-      if (!hellCard) return;
-      const prices = calculateAutomaticCardPrices(
-        card.conversionValue ?? card.tokenValue ?? 0,
-        hellCard.conversionValue ?? hellCard.tokenValue ?? 0,
-        rate,
-      );
-      // Only cards whose price actually changes are rewritten, so saving one card
-      // does not rewrite (and re-audit) the whole library.
-      if (prices && !cardHasPrices(card, prices)) pricesById.set(card.id, prices);
-    });
-
-    const writes = [];
-    if (saveSetting) {
-      writes.push((batch) => batch.set(doc(db, "settings", "cardPricing"), {
-        marginRate: rate,
-        updatedAt: serverTimestamp(),
-        updatedBy: profile.uid,
-      }, { merge: true }));
-    }
-    pricesById.forEach((prices, cardId) => {
-      writes.push((batch) => batch.update(doc(db, "cards", cardId), {
-        tokenValue: prices.half,
-        modePrices: prices,
-        pricingMarginRate: rate,
-        updatedAt: serverTimestamp(),
-        updatedBy: profile.uid,
-      }));
-    });
-    roomSnapshot.docs.forEach((roomDoc) => {
-      const room = roomDoc.data();
-      const roomPoolIds = getRoomPoolIds(room);
-      if (!roomPoolIds.some((cardId) => pricesById.has(cardId))) return;
-      const poolCardValues = { ...(room.poolCardValues || {}) };
-      pricesById.forEach((prices, cardId) => {
-        if (roomPoolIds.includes(cardId)) poolCardValues[cardId] = prices.half;
-      });
-      const roomUpdates = { poolCardValues, updatedAt: serverTimestamp() };
-      if (Array.isArray(room.poolCards)) {
-        roomUpdates.poolCards = normalizeRoomCards(room.poolCards).map((card) => {
-          const prices = pricesById.get(card.id);
-          return prices ? { ...card, tokenValue: prices.half, modePrices: prices } : card;
-        });
-      }
-      writes.push((batch) => batch.update(roomDoc.ref, roomUpdates));
-    });
-    // The 自助抽卡 pool shows a copy of each card's prices; keep it in step.
-    const instantCards = instantSnapshot.data()?.cards;
-    if (Array.isArray(instantCards) && instantCards.some((card) => pricesById.has(String(card?.id || "")))) {
-      const cards = instantCards.map((card) => {
-        const prices = pricesById.get(String(card?.id || ""));
-        return prices ? { ...card, tokenValue: prices.half, modePrices: prices } : card;
-      });
-      writes.push((batch) => batch.set(doc(db, "publicSiteSettings", "instantDraw"), { cards }, { merge: true }));
-    }
-    showcaseSnapshot.docs.forEach((showcaseDoc) => {
-      const prices = pricesById.get(showcaseDoc.id);
-      if (prices) writes.push((batch) => batch.set(showcaseDoc.ref, {
-        tokenValue: prices.half,
-        modePrices: prices,
-        updatedAt: serverTimestamp(),
-      }, { merge: true }));
-    });
-
-    for (let start = 0; start < writes.length; start += 450) {
-      const batch = adminWriteBatch();
-      writes.slice(start, start + 450).forEach((write) => write(batch));
-      await batch.commit();
-    }
-    return {
-      updated: pricesById.size,
-      manual: allCards.filter((card) => card.pricingMode === "manual").length,
-      skipped: allCards.filter((card) => card.pricingMode !== "manual" && !pricesById.has(card.id)).length,
-    };
+  async function recalculateAllCardPrices(rate) {
+    const { data } = await httpsCallable(functions, "adminRecalculateCardPrices")({ marginRate: rate });
+    return { updated: data.updatedCards, manual: data.manual || 0, skipped: 0 };
   }
 
   async function saveMarginRate() {
@@ -12409,7 +12249,7 @@ function CreateCardForm({ cards, profile }) {
 
     setSavingMarginRate(true);
     try {
-      const result = await recalculateAllCardPrices(cleanRate, true);
+      const result = await recalculateAllCardPrices(cleanRate);
       setMarginRate(cleanRate);
       alert(`已按毛利率 ${cleanRate} 更新 ${result.updated} 張卡。${result.manual ? `${result.manual} 張自訂優惠價未有改動。` : ""}${result.skipped ? `另有 ${result.skipped} 張未設定地獄對應卡，暫時保留原價。` : ""}`);
     } catch (error) {
@@ -12685,13 +12525,7 @@ function CreateCardForm({ cards, profile }) {
         ...(updates.imageUrl ? { cardImageUrl: updates.thumbUrl || updates.imageUrl } : {}),
         updatedAt: serverTimestamp(),
       });
-      await updateRoomPoolCardsForCard(card.id, {
-        name: cleanName,
-        category: draft.category || CARD_CATEGORIES[0],
-        tokenValue: cleanModePrices.half,
-        modePrices: cleanModePrices,
-        allowedShareModes,
-      });
+
       await recalculateAllCardPrices(marginRate);
       setCardDrafts((current) => ({
         ...current,
@@ -12901,15 +12735,7 @@ function CreateCardForm({ cards, profile }) {
             ...(importedImage ? { cardImageUrl: importedImage.thumbUrl || importedImage.imageUrl } : {}),
             updatedAt: serverTimestamp(),
           });
-          await updateRoomPoolCardsForCard(matchedCard.id, {
-            name: row.name,
-            category: row.category || CARD_CATEGORIES[0],
-            tokenValue: row.tokenValue,
-            modePrices: row.modePrices,
-            pricingMode: row.pricingMode,
-            allowedShareModes: row.allowedShareModes,
-            conversionValue: row.conversionValue,
-          });
+
           updatedCount += 1;
         } else {
           const docData = {
@@ -14337,9 +14163,6 @@ function buildRoomCards(room, cards, roundId = "") {
 
   const libraryCards = new Map(cards.map((card) => [String(card.id), card]));
   const legacyCards = new Map(normalizeRoomCards(room.poolCards).map((card) => [card.id, card]));
-  const roomValues = room?.poolCardValues && typeof room.poolCardValues === "object"
-    ? room.poolCardValues
-    : {};
   const cardIds = getRoomPoolIds(room);
 
   return cardIds
@@ -14353,12 +14176,8 @@ function buildRoomCards(room, cards, roundId = "") {
         modePrices: libraryCard?.modePrices || legacyCard?.modePrices,
       };
       const availabilitySource = libraryCard || legacyCard;
-      const roomValue = Number(roomValues[cardId] || 0);
-      const tokenValue = libraryCard?.modePrices || legacyCard?.modePrices
-        ? getCardTokenValue(priceSource, getRoomShareMode(room, roundId))
-        : roomValue > 0
-          ? roomValue
-          : Number(source?.tokenValue || legacyCard?.tokenValue || 0);
+      const mode = getRoomShareMode(room, roundId);
+      const tokenValue = getCardTokenValue(priceSource, mode);
 
       if (!source) return null;
 
@@ -15295,7 +15114,7 @@ function showSafeError(error, fallback) {
   // Expected business outcomes (cooldowns, validation) are not reported as failures.
   const expected = /(resource-exhausted|failed-precondition|invalid-argument|already-exists)$/.test(String(error?.code || ""));
   if (!expected && (error?.code || /權限|失敗|未能|Failed|permission|network/i.test(message))) {
-    reportClientError({ message: `${message}${error?.message && error.message !== message ? ` | ${error.message}` : ""}`, code: error?.code }, fallback || "showSafeError");
+    reportClientError({ message: `${message}${error?.message && error.message !== message ? ` | ${error.message}` : ""}`, code: error?.code, stack: error?.stack }, fallback || "showSafeError");
   }
   alert(message);
 }
@@ -15397,32 +15216,6 @@ async function updateAssignedRecordsForCard(cardId, updates) {
     const batch = adminWriteBatch();
     recordsSnapshot.docs.slice(index, index + 450).forEach((item) => {
       batch.update(item.ref, updates);
-    });
-    await batch.commit();
-  }
-}
-
-async function updateRoomPoolCardsForCard(cardId, updates) {
-  const roomsSnapshot = await getDocs(
-    query(collection(db, "draws"), where("poolCardIds", "array-contains", cardId)),
-  );
-
-  for (let index = 0; index < roomsSnapshot.docs.length; index += 450) {
-    const batch = adminWriteBatch();
-    roomsSnapshot.docs.slice(index, index + 450).forEach((item) => {
-      const poolCards = normalizeRoomCards(item.data().poolCards)
-        .map((card) => (card.id === cardId ? { ...card, ...updates } : card))
-        .map(roomCardPayload);
-      const poolCardValues = Object.fromEntries(
-        poolCards.map((card) => [card.id, Number(card.tokenValue || 0)]),
-      );
-
-      batch.update(item.ref, {
-        poolCards,
-        poolCardIds: poolCards.map((card) => card.id),
-        poolCardValues,
-        updatedAt: serverTimestamp(),
-      });
     });
     await batch.commit();
   }

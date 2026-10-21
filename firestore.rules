@@ -334,25 +334,9 @@ service cloud.firestore {
         && request.resource.data.tokenCost is number
         && request.resource.data.tokenCost > 0
         && request.resource.data.targetCardValue == request.resource.data.tokenCost
-        && (
-          (
-            request.resource.data.shareMode == "1/2"
-            && "poolCardValues" in drawDoc(drawId).data
-            && request.resource.data.targetCardId in drawDoc(drawId).data.poolCardValues
-            && request.resource.data.tokenCost == drawDoc(drawId).data.poolCardValues[request.resource.data.targetCardId]
-          )
-          || (
-            (
-              request.resource.data.shareMode != "1/2"
-              || !("poolCardValues" in drawDoc(drawId).data)
-              || !(request.resource.data.targetCardId in drawDoc(drawId).data.poolCardValues)
-            )
-            && exists(/databases/$(database)/documents/cards/$(request.resource.data.targetCardId))
-            && request.resource.data.tokenCost == cardPriceForShareMode(
-              request.resource.data.targetCardId,
-              request.resource.data.shareMode
-            )
-          )
+        // Room prices are display copies; all three modes charge the current card price.
+        && request.resource.data.tokenCost == cardPriceForShareMode(
+          request.resource.data.targetCardId, request.resource.data.shareMode
         )
         && userDoc(request.auth.uid).data.tokens >= request.resource.data.tokenCost
         && afterUserDoc(request.auth.uid).data.tokens ==

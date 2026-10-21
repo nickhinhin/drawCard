@@ -8,5 +8,6 @@ local-preview/
 .firebase
 firebase-debug.log
 firestore-debug.log
+database-debug.log
 storage-debug.log
 functions/.env

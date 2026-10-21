@@ -40,6 +40,7 @@ export function reportClientError(error, where = "") {
       page: currentPage(),
       stack: String(error?.stack || "").slice(0, 1500),
       site: IS_ADMIN_SITE ? "admin" : "public",
+      appVersion: import.meta.env.VITE_APP_VERSION || "development",
       userAgent: navigator.userAgent,
     }).catch(() => {});
   } catch {

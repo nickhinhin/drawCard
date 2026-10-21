@@ -1,3 +1,5 @@
+import { getFirestore } from "firebase-admin/firestore";
+import { syncCardPrices, syncRoomPrices } from "./price-sync.js";
 import { logger } from "firebase-functions";
 import {
   onDocumentDeletedWithAuthContext,
@@ -103,11 +105,13 @@ export function auditContext(data) {
     .map((field) => [field, auditValue(data[field])]));
 }
 
-function auditTrigger(document) {
-  return onDocumentWrittenWithAuthContext({ ...auditOptions, document }, (event) => {
+function auditTrigger(document, synchronize) {
+  return onDocumentWrittenWithAuthContext({ ...auditOptions, document }, async (event) => {
     const entry = auditEntry(event);
     if (!Object.keys(entry.changes).length) return;
     logger.write({ severity: "NOTICE", message: `${entry.operation} ${entry.path}`, ...entry });
+    // Retryable synchronization uses current documents, never the event's old values.
+    if (synchronize) await synchronize(event, entry);
   });
 }
 
@@ -115,12 +119,20 @@ export const auditUsers = auditTrigger("users/{uid}");
 export const auditUsernames = auditTrigger("usernames/{usernameId}");
 export const auditTokenRequests = auditTrigger("tokenRequests/{requestId}");
 export const auditDrawRecords = auditTrigger("drawRecords/{recordId}");
-export const auditDraws = auditTrigger("draws/{drawId}");
+export const auditDraws = auditTrigger("draws/{drawId}", async (event, entry) => {
+  if (["status", "poolCardIds", "poolCards", "poolCardValues"].some((key) => Object.hasOwn(entry.changes, key))) {
+    await syncRoomPrices(getFirestore(), event.data.after.ref);
+  }
+});
 export const auditRounds = auditTrigger("draws/{drawId}/rounds/{roundId}");
 export const auditSlots = auditTrigger("draws/{drawId}/rounds/{roundId}/slots/{slotId}");
 export const auditLegacySlots = auditTrigger("draws/{drawId}/slots/{slotId}");
 export const auditMonitorSessions = auditTrigger("monitorSessions/{sessionId}");
-export const auditCards = auditTrigger("cards/{cardId}");
+export const auditCards = auditTrigger("cards/{cardId}", async (event, entry) => {
+  if (["tokenValue", "modePrices"].some((key) => Object.hasOwn(entry.changes, key))) {
+    await syncCardPrices(getFirestore(), event.params.cardId);
+  }
+});
 export const auditPromoCodes = auditTrigger("promoCodes/{codeId}");
 export const auditPromoRedemptions = auditTrigger("promoRedemptions/{redemptionId}");
 export const auditSettings = auditTrigger("settings/{settingId}");

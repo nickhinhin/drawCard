@@ -210,8 +210,12 @@ try {
     batch.update(userRef, { tokens: 1000099, lastConversionRecordId: "forged", lastConversionAmount: 999999 });
     await batch.commit();
   });
-  await check("Use cheaper global card price instead of room price", false, async () => {
+  await check("Canonical library price works despite stale higher room price", true, async () => {
     await seed({ "draws/room": { ...baseDraw, poolCardValues: { card: 100 } } });
+    await purchaseBatch().commit();
+  });
+  await check("Stale cheaper room price cannot underpay current library price", false, async () => {
+    await seed({ "cards/card": { name: "Card", tokenValue: 100 } });
     await purchaseBatch().commit();
   });
   await check("Attribute purchase to a forged referrer", false, async () => {
@@ -301,7 +305,7 @@ try {
     await updateDoc(doc(db, "drawRecords/assigned"), { collectionStatus: "shipping", shippingRequested: true, shippingRecipient: "Test", shippingPhone: "12345678", shippingRegion: "hong-kong", shippingMethod: "sf-door", shippingAddress: "Test address", shippingNote: "", shippingRequestedAt: serverTimestamp(), updatedAt: serverTimestamp() });
   });
   await check("Award fields rejected even on a real purchase", false, () => purchaseBatch({ extraRecord: { cardId: "fake", cardConversionValue: 999999 } }).commit());
-  await check("Full authoritative room price", true, async () => {
+  await check("Stale higher room price cannot override canonical price", false, async () => {
     await seed({ "draws/room": { ...baseDraw, poolCardValues: { card: 100 } } });
     await purchaseBatch({ cost: 100 }).commit();
   });

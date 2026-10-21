@@ -423,6 +423,18 @@ const g0linked = await phoneUser(newNumber(), g0.token);
 expect("gift setting: claim while switched off", await call("claimSignupBonus", {}, g0linked.token), "FAILED_PRECONDITION");
 expect("gift setting: back to 50", await setGift(50), "OK");
 
+// Repair stale room/public copies even when the canonical price is already correct.
+await seed("cards/sync-manual", { name: "Sync manual", pricingMode: "manual", tokenValue: 200, modePrices: { half: 200, fifth: 80, tenth: 40 } });
+await seed("draws/sync-admin-room", { title: "Preserve", status: "live", poolCardIds: ["sync-manual"], poolCardValues: { "sync-manual": 1 }, poolCards: [{ id: "sync-manual", tokenValue: 1 }] });
+expect("price sync: unchanged manual card save", await adminCall("adminBatchWrite", { operations: [{ collection: "cards", documentId: "sync-manual", mode: "update", data: { tokenValue: 200 } }] }), "OK");
+check("price sync: unchanged card still repairs stale room", (await read("draws/sync-admin-room"))?.poolCardValues?.["sync-manual"] === 200);
+expect("price sync: old admin writes stale room snapshot", await adminCall("adminWrite", { collection: "draws", documentId: "sync-admin-room", mode: "update", data: { poolCardValues: { "sync-manual": 1 } } }), "OK");
+check("price sync: old room snapshot repaired before return", (await read("draws/sync-admin-room"))?.poolCardValues?.["sync-manual"] === 200);
+expect("price sync: stale showcase write", await adminCall("adminWrite", { collection: "publicCardShowcase", documentId: "sync-manual", data: { tokenValue: 1 } }), "OK");
+check("price sync: public copy uses canonical library price", (await read("publicCardShowcase/sync-manual"))?.modePrices?.half === 200);
+expect("price sync: manual price survives formula recalc", await adminCall("adminRecalculateCardPrices", { marginRate: 1.3 }), "OK");
+check("price sync: manual price preserved", (await read("cards/sync-manual"))?.tokenValue === 200);
+
 const failed = results.filter((line) => !line.startsWith("PASS"));
 console.log(failed.length ? failed.join("\n") : "");
 console.log(`SUMMARY ${results.length - failed.length}/${results.length} passed`);
