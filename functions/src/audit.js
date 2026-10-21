@@ -1,5 +1,6 @@
 import { getFirestore } from "firebase-admin/firestore";
 import { syncCardPrices, syncRoomPrices } from "./price-sync.js";
+import { FUNCTIONS_SERVICE_ACCOUNT } from "./audit-analysis.js";
 import { logger } from "firebase-functions";
 import {
   onDocumentDeletedWithAuthContext,
@@ -37,6 +38,9 @@ const auditOptions = {
   timeoutSeconds: 30,
   // Retry on failure; the analysis removes duplicate deliveries by eventId.
   retry: true,
+  // index.js sets this globally, but its imports (this module) run first, so without
+  // it the triggers run as the default compute account, which cannot use Firestore.
+  serviceAccount: FUNCTIONS_SERVICE_ACCOUNT,
 };
 
 // Firestore values become plain JSON; long strings (e.g. image URLs) are trimmed.
