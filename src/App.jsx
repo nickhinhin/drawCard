@@ -5123,7 +5123,7 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
 
   async function draw() {
     if (!profile?.uid) {
-      requestLogin("請先登入或註冊，即可自助抽卡。");
+      requestLogin("請先登入或註冊，即可玩天堂與地獄自助抽卡。");
       return;
     }
     if (!card || !numbers.length || drawing || problem) return;
@@ -5145,17 +5145,23 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
       <div className="section-heading compact">
         <Sparkles size={22} />
         <div>
-          <h2>自助抽卡{adminTest && <span className="instant-admin-test">管理員測試模式 · 玩家看不到</span>}</h2>
-          <p className="muted">揀卡、揀玩法、揀號碼，付款後即時開卡。每次購買都是一張新的 20 號碼板，天堂數目固定（1/2 有 10 個、1/5 有 4 個、1/10 有 2 個），買滿 20 個號碼必定是這個比例。抽中的卡即時存入「我的卡牌」。</p>
+          <h2>天堂與地獄自助抽卡{adminTest && <span className="instant-admin-test">管理員測試模式 · 玩家看不到</span>}</h2>
+          <p className="muted">4步即玩天堂與地獄自助抽卡：</p>
+          <ol className="instant-draw-howto">
+            <li>選擇你想要的卡牌</li>
+            <li>選擇玩法（抽中卡牌盲盒的機率）</li>
+            <li>選擇號碼（可以多選）</li>
+            <li>即時開估天堂與地獄</li>
+          </ol>
         </div>
       </div>
       {profile?.uid && (
         <p className="instant-draw-allowance">
           現有 <TokenAmount value={tokens} />
-          {remaining !== null && <> · 今日自助抽卡尚可使用 <TokenAmount value={remaining} />（上限 {formatTokenNumber(limit)}）</>}
+          {remaining !== null && <> · 今日天堂與地獄自助抽卡尚可使用 <TokenAmount value={remaining} />（上限 {formatTokenNumber(limit)}）</>}
         </p>
       )}
-      <h3 className="instant-draw-step">1. 選擇卡牌</h3>
+      <h3 className="instant-draw-step">1. 選擇你想要的卡牌</h3>
       <div className="pool-card-grid instant-card-grid">
         {cards.map((item) => (
           <button
@@ -5177,7 +5183,7 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
       </div>
       {card && (
         <>
-          <h3 className="instant-draw-step">2. 選擇玩法</h3>
+          <h3 className="instant-draw-step">2. 選擇玩法（抽中卡牌盲盒的機率）</h3>
           <div className="instant-mode-row">
             {modes.map((mode) => (
               <button className={mode === shareMode ? "active" : ""} key={mode} type="button" onClick={() => setShareMode(mode)}>
@@ -5187,7 +5193,7 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
               </button>
             ))}
           </div>
-          <h3 className="instant-draw-step">3. 選擇號碼（可多選）</h3>
+          <h3 className="instant-draw-step">3. 選擇號碼（可以多選）</h3>
           <div className="instant-number-grid">
             {INSTANT_NUMBERS.map((number) => (
               <button
@@ -5297,7 +5303,7 @@ function InstantDrawReveal({ result, onClose }) {
       >
         <div className="instant-reveal-glow" aria-hidden="true" />
         <header className="instant-reveal-header">
-          <span className="instant-reveal-kicker"><Sparkles size={15} />自助抽卡 · {result.shareMode}</span>
+          <span className="instant-reveal-kicker"><Sparkles size={15} />天堂與地獄自助抽卡 · {result.shareMode}</span>
           <h2 id="instant-reveal-title">{summaryReady ? (heaven ? "恭喜抽中天堂！" : "開卡完成") : "開卡中..."}</h2>
           <p>{result.card.name} · {draws.length} 個號碼</p>
         </header>

@@ -7034,6 +7034,14 @@
   font-size: 13px;
 }
 
+.beta-mode .instant-draw-howto {
+  margin: 4px 0 0;
+  padding-left: 20px;
+  color: var(--beta-muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
 .beta-mode .instant-draw-step {
   margin: 16px 0 8px;
   font-size: 15px;
