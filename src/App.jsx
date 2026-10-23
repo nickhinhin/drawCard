@@ -198,6 +198,7 @@ const OPEN_ROOM_STATUSES = ["live", "scheduled", "draft"];
 // so opening it stays fast as the history grows ("載入更早" loads the next page).
 const ADMIN_ROOM_PAGE_SIZE = 30;
 const ADMIN_RECORD_PAGE_SIZE = 1000;
+const ADMIN_DELIVERED_PAGE_SIZE = 100;
 // Set once the new-member gift pop-up has been shown in this browser.
 const SIGNUP_PROMO_SEEN_KEY = "livedraw-signup-promo-seen";
 // A guest's room / card / round / number kept while they log in (see rememberGuestSelection).
@@ -9015,6 +9016,7 @@ function LiveDrawAdminPanel({ profile }) {
   const [roomsHaveMore, setRoomsHaveMore] = useState(false);
   const [recordLimit, setRecordLimit] = useState(ADMIN_RECORD_PAGE_SIZE);
   const [recordsHaveMore, setRecordsHaveMore] = useState(false);
+  const [deliveredLimit, setDeliveredLimit] = useState(ADMIN_DELIVERED_PAGE_SIZE);
   const [adminLoading, setAdminLoading] = useState({
     requests: true,
     draws: true,
@@ -9023,6 +9025,7 @@ function LiveDrawAdminPanel({ profile }) {
   });
   const [pendingShippingCount, setPendingShippingCount] = useState(0);
   const [openSupportCount, setOpenSupportCount] = useState(0);
+  const [pendingRequestCount, setPendingRequestCount] = useState(0);
   const vipTiers = useVipProgram();
   const adminSections = isBeta
     ? [
@@ -9110,18 +9113,23 @@ function LiveDrawAdminPanel({ profile }) {
 
   // Keep the menu badge live with a small filtered query instead of loading every draw record.
   useEffect(() => {
+    // Delivered cards move to "shipped", so the active queue is just "shipping".
     const pendingShippingQuery = query(
       collection(db, "drawRecords"),
-      where("shippingRequested", "==", true),
+      where("collectionStatus", "==", "shipping"),
     );
     return onSnapshot(pendingShippingQuery, (snapshot) => {
-      setPendingShippingCount(snapshot.docs.filter((item) => {
-        const record = item.data();
-        return ["shipping", "shipped"].includes(record.collectionStatus)
-          && getDeliveryStage(record) !== "delivered";
-      }).length);
+      setPendingShippingCount(snapshot.docs.filter((item) => item.data().shippingRequested === true).length);
     }, (error) => {
       console.error("Admin shipping badge listener failed.", error);
+    });
+  }, []);
+
+  // Bank deposits and promo-code redemptions both wait as "pending" until reviewed.
+  useEffect(() => {
+    const pendingRequestsQuery = query(collection(db, "tokenRequests"), where("status", "==", "pending"));
+    return onSnapshot(pendingRequestsQuery, (snapshot) => setPendingRequestCount(snapshot.size), (error) => {
+      console.error("Admin token request badge listener failed.", error);
     });
   }, []);
 
@@ -9142,15 +9150,43 @@ function LiveDrawAdminPanel({ profile }) {
     // Each section reads only what it shows: every card in delivery, the newest
     // conversions, or the newest purchases; older pages load on request.
     const recordsRef = collection(db, "drawRecords");
-    const paged = activeAdminSection !== "shipping";
-    const recordsQuery = activeAdminSection === "shipping"
-      ? query(recordsRef, where("collectionStatus", "in", ["shipping", "shipped"]))
-      : activeAdminSection === "conversions"
+    if (activeAdminSection === "shipping") {
+      // The active queue loads in full; delivered history grows forever, so it is paged.
+      const parts = { active: null, delivered: null };
+      const publish = () => {
+        if (!parts.active || !parts.delivered) return;
+        setRecords([...parts.active, ...parts.delivered]);
+        setRecordsHaveMore(parts.delivered.length >= deliveredLimit);
+        setRecordsError("");
+        setAdminLoading((current) => ({ ...current, records: false }));
+      };
+      const listen = (key, partQuery) => onSnapshot(partQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
+        if (!isSnapshotReady(snapshot) && !parts[key]) return;
+        parts[key] = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+        publish();
+      }, (error) => {
+        console.error("Admin shipping listener failed.", error);
+        setRecordsError(getSafeErrorMessage(error, "未能載入配送紀錄。"));
+        setAdminLoading((current) => ({ ...current, records: false }));
+      });
+      const stopActive = listen("active", query(recordsRef, where("collectionStatus", "==", "shipping")));
+      const stopDelivered = listen("delivered", query(
+        recordsRef,
+        where("collectionStatus", "==", "shipped"),
+        orderBy("deliveredAt", "desc"),
+        limit(deliveredLimit),
+      ));
+      return () => {
+        stopActive();
+        stopDelivered();
+      };
+    }
+    const recordsQuery = activeAdminSection === "conversions"
         ? query(recordsRef, where("collectionStatus", "==", "converted"), orderBy("convertedAt", "desc"), limit(recordLimit))
         : query(recordsRef, orderBy("createdAt", "desc"), limit(recordLimit));
     return onSnapshot(recordsQuery, LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
       setRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-      setRecordsHaveMore(paged && snapshot.size >= recordLimit);
+      setRecordsHaveMore(snapshot.size >= recordLimit);
       setRecordsError("");
       if (isSnapshotReady(snapshot)) {
         setAdminLoading((current) => ({ ...current, records: false }));
@@ -9160,7 +9196,7 @@ function LiveDrawAdminPanel({ profile }) {
       setRecordsError(getSafeErrorMessage(error, "未能載入卡牌紀錄。"));
       setAdminLoading((current) => ({ ...current, records: false }));
     });
-  }, [activeAdminSection, recordLimit]);
+  }, [activeAdminSection, recordLimit, deliveredLimit]);
 
   // Reviews run server-side so token grants, VIP rewards and the audit log commit together.
   async function reviewTokenRequest(payload) {
@@ -9252,6 +9288,9 @@ function LiveDrawAdminPanel({ profile }) {
               >
                 <SectionIcon size={20} />
                 <span>{section.label}</span>
+                {section.id === "requests" && pendingRequestCount > 0 && (
+                  <b className="admin-notification-badge">{pendingRequestCount}</b>
+                )}
                 {section.id === "shipping" && pendingShippingCount > 0 && (
                   <b className="admin-notification-badge">{pendingShippingCount}</b>
                 )}
@@ -9404,7 +9443,12 @@ function LiveDrawAdminPanel({ profile }) {
       )}
       {activeAdminSection === "shipping" && (
         <div className="admin-section">
-          <ShippingRequestManager records={records} loading={adminLoading.records} />
+          <ShippingRequestManager
+            records={records}
+            loading={adminLoading.records}
+            deliveredHaveMore={recordsHaveMore}
+            onLoadMoreDelivered={() => setDeliveredLimit((current) => current + ADMIN_DELIVERED_PAGE_SIZE)}
+          />
         </div>
       )}
       {activeAdminSection === "conversions" && (
@@ -10033,7 +10077,7 @@ function AdminRoundResultConfirmModal({ drawTitle, roundId, numberList, recordsB
   );
 }
 
-function ShippingRequestManager({ records, loading = false }) {
+function ShippingRequestManager({ records, loading = false, deliveredHaveMore = false, onLoadMoreDelivered }) {
   const [trackingNumbers, setTrackingNumbers] = useState({});
   const [savingId, setSavingId] = useState("");
   const [shippingView, setShippingView] = useState("shipping");
@@ -10113,7 +10157,7 @@ function ShippingRequestManager({ records, loading = false }) {
           type="button"
           onClick={() => setShippingView("delivered")}
         >
-          已配送 {deliveredRequests.length}
+          已配送 {deliveredRequests.length}{deliveredHaveMore ? "+" : ""}
         </button>
       </div>
       {loading ? (
@@ -10224,6 +10268,9 @@ function ShippingRequestManager({ records, loading = false }) {
         <p className="empty-state compact-empty">
           {shippingView === "delivered" ? "暫時未有已配送紀錄。" : "暫時未有配送中的需求。"}
         </p>
+      )}
+      {!loading && shippingView === "delivered" && deliveredHaveMore && (
+        <AdminLoadMore label={`載入更早的已配送紀錄（目前顯示最新 ${deliveredRequests.length} 筆）`} onClick={onLoadMoreDelivered} />
       )}
       {auditUser && (
         <UserRecordAuditModal
