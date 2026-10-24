@@ -9119,7 +9119,11 @@ function LiveDrawAdminPanel({ profile }) {
       where("collectionStatus", "==", "shipping"),
     );
     return onSnapshot(pendingShippingQuery, (snapshot) => {
-      setPendingShippingCount(snapshot.docs.filter((item) => item.data().shippingRequested === true).length);
+      // Only requests still waiting for a tracking number; in-transit cards need no action yet.
+      setPendingShippingCount(snapshot.docs.filter((item) => {
+        const record = item.data();
+        return record.shippingRequested === true && getDeliveryStage(record) === "awaiting_dispatch";
+      }).length);
     }, (error) => {
       console.error("Admin shipping badge listener failed.", error);
     });
