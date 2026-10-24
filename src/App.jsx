@@ -10080,19 +10080,29 @@ function AdminRoundResultConfirmModal({ drawTitle, roundId, numberList, recordsB
 function ShippingRequestManager({ records, loading = false, deliveredHaveMore = false, onLoadMoreDelivered }) {
   const [trackingNumbers, setTrackingNumbers] = useState({});
   const [savingId, setSavingId] = useState("");
-  const [shippingView, setShippingView] = useState("shipping");
+  const [shippingView, setShippingView] = useState("awaiting_dispatch");
   const [auditUser, setAuditUser] = useState(null);
-  const shippingRequests = records
-    .filter((record) => (
-      record.shippingRequested
-      && ["shipping", "shipped"].includes(record.collectionStatus)
-      && getDeliveryStage(record) !== "delivered"
-    ))
+  const activeRequests = records.filter((record) => (
+    record.shippingRequested
+    && ["shipping", "shipped"].includes(record.collectionStatus)
+    && getDeliveryStage(record) !== "delivered"
+  ));
+  const awaitingRequests = activeRequests
+    .filter((record) => getDeliveryStage(record) === "awaiting_dispatch")
     .sort((a, b) => toMillis(b.shippingRequestedAt) - toMillis(a.shippingRequestedAt));
+  const inTransitRequests = activeRequests
+    .filter((record) => getDeliveryStage(record) === "in_transit")
+    .sort((a, b) => toMillis(b.dispatchedAt || b.shippedAt) - toMillis(a.dispatchedAt || a.shippedAt));
   const deliveredRequests = records
     .filter((record) => getDeliveryStage(record) === "delivered" && (record.shippingRequested || record.trackingNumber))
     .sort((a, b) => toMillis(b.deliveredAt || b.updatedAt) - toMillis(a.deliveredAt || a.updatedAt));
-  const visibleRequests = shippingView === "delivered" ? deliveredRequests : shippingRequests;
+  const shippingTabs = [
+    { id: "awaiting_dispatch", label: "待安排配送", count: awaitingRequests.length, requests: awaitingRequests, empty: "暫時未有待安排配送的需求。" },
+    { id: "in_transit", label: "正在配送", count: inTransitRequests.length, requests: inTransitRequests, empty: "暫時未有正在配送的卡牌。" },
+    { id: "delivered", label: "已配送", count: `${deliveredRequests.length}${deliveredHaveMore ? "+" : ""}`, requests: deliveredRequests, empty: "暫時未有已配送紀錄。" },
+  ];
+  const activeTab = shippingTabs.find((tab) => tab.id === shippingView) || shippingTabs[0];
+  const visibleRequests = activeTab.requests;
 
   async function markInTransit(record) {
     const trackingNumber = String(trackingNumbers[record.id] || record.trackingNumber || "").trim();
@@ -10139,26 +10149,22 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
         <Bell size={22} />
         <div>
 
-          <h2>{shippingView === "delivered" ? "已配送紀錄" : "配送中"}</h2>
-          <p className="muted">「配送中」包括待安排配送及順豐正在配送；確認送達後才會移到「已配送」。</p>
+          <h2>{activeTab.label}</h2>
+          <p className="muted">輸入順豐運單號碼後移到「正在配送」；確認送達後才會移到「已配送」。</p>
         </div>
-        <strong className="shipping-request-count">{shippingRequests.length} 個配送中</strong>
+        <strong className="shipping-request-count">{awaitingRequests.length} 個待安排配送</strong>
       </div>
       <div className="collection-tabs admin-status-tabs shipping-status-tabs">
-        <button
-          className={shippingView === "shipping" ? "active" : ""}
-          type="button"
-          onClick={() => setShippingView("shipping")}
-        >
-          配送中 {shippingRequests.length}
-        </button>
-        <button
-          className={shippingView === "delivered" ? "active" : ""}
-          type="button"
-          onClick={() => setShippingView("delivered")}
-        >
-          已配送 {deliveredRequests.length}{deliveredHaveMore ? "+" : ""}
-        </button>
+        {shippingTabs.map((tab) => (
+          <button
+            key={tab.id}
+            className={activeTab.id === tab.id ? "active" : ""}
+            type="button"
+            onClick={() => setShippingView(tab.id)}
+          >
+            {tab.label} {tab.count}
+          </button>
+        ))}
       </div>
       {loading ? (
         <InlineLoading label="正在載入配送需求..." />
@@ -10266,7 +10272,7 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
         </div>
       ) : (
         <p className="empty-state compact-empty">
-          {shippingView === "delivered" ? "暫時未有已配送紀錄。" : "暫時未有配送中的需求。"}
+          {activeTab.empty}
         </p>
       )}
       {!loading && shippingView === "delivered" && deliveredHaveMore && (
