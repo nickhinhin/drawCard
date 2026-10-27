@@ -3010,6 +3010,40 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.shipping-request-actions > .small-btn.danger,
+.shipping-cancel-form {
+  grid-column: 1 / -1;
+}
+
+.shipping-cancel-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 7px;
+}
+
+.shipping-cancel-form textarea {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-height: 56px;
+  resize: vertical;
+  font: inherit;
+  font-size: 13px;
+}
+
+.shipping-cancel-reason {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.collection-card .shipping-cancel-reason,
+.record-item .shipping-cancel-reason {
+  color: var(--red-700);
+  font-weight: 700;
+}
+
 .user-audit-modal {
   width: min(1280px, 96vw);
 }

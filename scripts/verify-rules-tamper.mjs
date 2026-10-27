@@ -114,6 +114,11 @@ await conversionCase("record in shipping", { record: { collectionStatus: "shippi
 await conversionCase("record voided in 會員調整", { record: { collectionStatus: "void" } });
 await conversionCase("record already shipped (shippedAt)", { record: { shippedAt: new Date() } });
 await conversionCase("record without a card", { record: { cardId: null } });
+await conversionCase("shipping cancelled by an admin (取消配送)", {
+  record: { shippingRequested: true, shippingRequestedAt: new Date(), shippedAt: new Date(), deliveryStatus: "cancelled", shippingCancelled: true },
+  expect: true,
+});
+await conversionCase("cancelled shipping requested again", { record: { collectionStatus: "shipping", shippingRequested: true, shippingCancelled: true } });
 await conversionCase("another player's record", { otherOwner: true });
 
 // ======================= 2. shipping request =======================
@@ -147,6 +152,11 @@ for (const [label, patch] of [
   ["also marks delivered", { deliveryStatus: "delivered" }],
 ]) await shippingCase(label, { patch });
 await shippingCase("converted card", { record: { collectionStatus: "converted", convertedToTokens: true } });
+await shippingCase("re-request after an admin cancelled (取消配送)", {
+  record: { shippingRequested: true, shippingRequestedAt: new Date(), deliveryStatus: "cancelled", shippingCancelled: true },
+  expect: true,
+});
+await shippingCase("player clears their own cancellation", { patch: { shippingCancelled: false } });
 await shippingCase("voided card", { record: { collectionStatus: "void" } });
 await shippingCase("card already in shipping", { record: { collectionStatus: "shipping" } });
 await shippingCase("record without a card", { record: { cardId: null } });

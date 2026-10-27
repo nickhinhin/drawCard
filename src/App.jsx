@@ -6748,7 +6748,8 @@ function CollectionPage({ profile }) {
         }
         const latestRecord = recordSnap.data();
         if (latestRecord.convertedToTokens || (latestRecord.collectionStatus || "pending") !== "pending"
-          || latestRecord.shippingRequested || latestRecord.shippingRequestedAt || latestRecord.shippedAt) {
+          || (!latestRecord.shippingCancelled
+            && (latestRecord.shippingRequested || latestRecord.shippingRequestedAt || latestRecord.shippedAt))) {
           throw new Error("只有未申請寄送的待處理卡牌可以轉回代幣。");
         }
         const latestRefund = getCardConversionRefund(recordSnap.data());
@@ -7049,6 +7050,9 @@ function CollectionPage({ profile }) {
                   <span className={`status-badge ${getCollectionStatusBadgeClass(record)}`}>
                     {getCollectionDeliveryLabel(record)}
                   </span>
+                  {getDeliveryStage(record) === "cancelled" && record.shippingCancelReason && (
+                    <span className="shipping-cancel-reason">取消原因：{record.shippingCancelReason}</span>
+                  )}
                   {isBeta && activeStatus === "pending" && (
                     <label className="collection-select-option">
                       <input
@@ -9156,10 +9160,15 @@ function LiveDrawAdminPanel({ profile }) {
     const recordsRef = collection(db, "drawRecords");
     if (activeAdminSection === "shipping") {
       // The active queue loads in full; delivered history grows forever, so it is paged.
-      const parts = { active: null, delivered: null };
+      // Cancellations are rare and load in full; ones the player re-requested are already active.
+      const parts = { active: null, delivered: null, cancelled: null };
       const publish = () => {
-        if (!parts.active || !parts.delivered) return;
-        setRecords([...parts.active, ...parts.delivered]);
+        if (!parts.active || !parts.delivered || !parts.cancelled) return;
+        setRecords([
+          ...parts.active,
+          ...parts.delivered,
+          ...parts.cancelled.filter((record) => getDeliveryStage(record) === "cancelled"),
+        ]);
         setRecordsHaveMore(parts.delivered.length >= deliveredLimit);
         setRecordsError("");
         setAdminLoading((current) => ({ ...current, records: false }));
@@ -9180,9 +9189,11 @@ function LiveDrawAdminPanel({ profile }) {
         orderBy("deliveredAt", "desc"),
         limit(deliveredLimit),
       ));
+      const stopCancelled = listen("cancelled", query(recordsRef, where("shippingCancelled", "==", true)));
       return () => {
         stopActive();
         stopDelivered();
+        stopCancelled();
       };
     }
     const recordsQuery = activeAdminSection === "conversions"
@@ -10086,6 +10097,8 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
   const [savingId, setSavingId] = useState("");
   const [shippingView, setShippingView] = useState("awaiting_dispatch");
   const [auditUser, setAuditUser] = useState(null);
+  const [cancelFormId, setCancelFormId] = useState("");
+  const [cancelReasons, setCancelReasons] = useState({});
   const activeRequests = records.filter((record) => (
     record.shippingRequested
     && ["shipping", "shipped"].includes(record.collectionStatus)
@@ -10100,10 +10113,14 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
   const deliveredRequests = records
     .filter((record) => getDeliveryStage(record) === "delivered" && (record.shippingRequested || record.trackingNumber))
     .sort((a, b) => toMillis(b.deliveredAt || b.updatedAt) - toMillis(a.deliveredAt || a.updatedAt));
+  const cancelledRequests = records
+    .filter((record) => getDeliveryStage(record) === "cancelled")
+    .sort((a, b) => toMillis(b.shippingCancelledAt) - toMillis(a.shippingCancelledAt));
   const shippingTabs = [
     { id: "awaiting_dispatch", label: "待安排配送", count: awaitingRequests.length, requests: awaitingRequests, empty: "暫時未有待安排配送的需求。" },
     { id: "in_transit", label: "正在配送", count: inTransitRequests.length, requests: inTransitRequests, empty: "暫時未有正在配送的卡牌。" },
     { id: "delivered", label: "已配送", count: `${deliveredRequests.length}${deliveredHaveMore ? "+" : ""}`, requests: deliveredRequests, empty: "暫時未有已配送紀錄。" },
+    { id: "cancelled", label: "取消配送", count: cancelledRequests.length, requests: cancelledRequests, empty: "暫時未有取消配送紀錄。" },
   ];
   const activeTab = shippingTabs.find((tab) => tab.id === shippingView) || shippingTabs[0];
   const visibleRequests = activeTab.requests;
@@ -10131,6 +10148,69 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
     }
   }
 
+  // The card goes back to the player's 待處理: they can request shipping again or convert it.
+  async function cancelShipping(record) {
+    const reason = String(cancelReasons[record.id] || "").trim();
+    if (!reason) {
+      alert("請先填寫取消配送原因。");
+      return;
+    }
+    if (!window.confirm(`取消「${record.cardName || "未命名卡牌"}」的配送？卡牌會退回玩家的「待處理」。`)) return;
+    setSavingId(record.id);
+    try {
+      await adminUpdateDoc(doc(db, "drawRecords", record.id), {
+        collectionStatus: "pending",
+        deliveryStatus: "cancelled",
+        trackingNumber: "",
+        shippingCancelled: true,
+        shippingCancelReason: reason,
+        shippingCancelledAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      setCancelFormId("");
+    } catch (error) {
+      showSafeError(error);
+    } finally {
+      setSavingId("");
+    }
+  }
+
+  function renderCancelControls(record) {
+    if (cancelFormId !== record.id) {
+      return (
+        <button
+          className="small-btn danger"
+          type="button"
+          onClick={() => setCancelFormId(record.id)}
+          disabled={savingId === record.id}
+        >
+          <X size={15} />取消配送
+        </button>
+      );
+    }
+    return (
+      <div className="shipping-cancel-form">
+        <textarea
+          value={cancelReasons[record.id] ?? ""}
+          onChange={(event) => setCancelReasons((current) => ({
+            ...current,
+            [record.id]: event.target.value,
+          }))}
+          placeholder="取消原因（必填）"
+          maxLength={500}
+          rows={2}
+          autoFocus
+        />
+        <button className="small-btn" type="button" onClick={() => setCancelFormId("")} disabled={savingId === record.id}>
+          返回
+        </button>
+        <button className="small-btn danger" type="button" onClick={() => cancelShipping(record)} disabled={savingId === record.id}>
+          {savingId === record.id ? "處理中..." : "確認取消配送"}
+        </button>
+      </div>
+    );
+  }
+
   async function markDelivered(record) {
     setSavingId(record.id);
     try {
@@ -10154,7 +10234,7 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
         <div>
 
           <h2>{activeTab.label}</h2>
-          <p className="muted">輸入順豐運單號碼後移到「正在配送」；確認送達後才會移到「已配送」。</p>
+          <p className="muted">輸入順豐運單號碼後移到「正在配送」；確認送達後才會移到「已配送」。取消配送需填寫原因，卡牌會退回玩家的「待處理」。</p>
         </div>
         <strong className="shipping-request-count">{awaitingRequests.length} 個待安排配送</strong>
       </div>
@@ -10212,8 +10292,20 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
                 {getDeliveryStage(record) === "delivered" && (
                   <div><dt>完成配送</dt><dd>{formatDate(record.deliveredAt || record.updatedAt)}</dd></div>
                 )}
+                {getDeliveryStage(record) === "cancelled" && (
+                  <div><dt>取消時間</dt><dd>{formatDate(record.shippingCancelledAt || record.updatedAt)}</dd></div>
+                )}
               </dl>
-              {getDeliveryStage(record) === "delivered" ? (
+              {getDeliveryStage(record) === "cancelled" ? (
+                <div className="shipping-completed-details">
+                  <span className="status-badge rejected">已取消配送</span>
+                  <small>取消原因</small>
+                  <p className="shipping-cancel-reason">{record.shippingCancelReason || "--"}</p>
+                  {record.collectionStatus !== "pending" && (
+                    <small>目前狀態：{getCollectionDeliveryLabel(record)}</small>
+                  )}
+                </div>
+              ) : getDeliveryStage(record) === "delivered" ? (
                 <div className="shipping-completed-details">
                   <span className="status-badge shipped">已配送</span>
                   <small>順豐單號</small>
@@ -10249,6 +10341,7 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
                   >
                     <Check size={17} />{savingId === record.id ? "處理中..." : "標記已配送"}
                   </button>
+                  {renderCancelControls(record)}
                 </div>
               ) : (
                 <div className="shipping-request-actions">
@@ -10269,6 +10362,7 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
                   >
                     <Truck size={17} />{savingId === record.id ? "處理中..." : "標記正在配送"}
                   </button>
+                  {renderCancelControls(record)}
                 </div>
               )}
             </article>
@@ -14962,6 +15056,8 @@ function getBetaCollectionRecordStatus(record) {
 // Older "shipped" records did not distinguish transit from confirmed delivery.
 // Keep them in transit until an administrator explicitly marks them delivered.
 function getDeliveryStage(record) {
+  // 取消配送 returns the card to pending; a new request moves it back to shipping.
+  if (record?.shippingCancelled && !["shipping", "shipped"].includes(record?.collectionStatus)) return "cancelled";
   if (
     record?.collectionStatus === "shipped"
     && (record?.deliveryStatus === "delivered" || record?.deliveredAt)
@@ -14981,6 +15077,7 @@ function getCollectionDeliveryLabel(record) {
   if (record?.collectionStatus === "void") return "已作廢";
   if (record?.convertedToTokens || record?.collectionStatus === "converted") return "已轉回代幣";
   const deliveryStage = getDeliveryStage(record);
+  if (deliveryStage === "cancelled") return "已取消配送";
   if (deliveryStage === "delivered") return "已配送";
   if (deliveryStage === "in_transit") return "正在配送";
   if (record?.collectionStatus === "shipping") return "待安排配送";
@@ -14990,6 +15087,7 @@ function getCollectionDeliveryLabel(record) {
 function getCollectionStatusBadgeClass(record) {
   if (record?.convertedToTokens || record?.collectionStatus === "converted") return "converted";
   const deliveryStage = getDeliveryStage(record);
+  if (deliveryStage === "cancelled") return "rejected";
   if (deliveryStage === "delivered") return "shipped";
   if (deliveryStage === "in_transit") return "shipping in-transit";
   return record?.collectionStatus === "shipping" ? "shipping awaiting-dispatch" : "pending";

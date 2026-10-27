@@ -268,12 +268,19 @@ service cloud.firestore {
     }
 
     // Historical awards without a status are pending, unless shipping has started.
+    // A shipping request an admin cancelled (取消配送) returns the card to pending,
+    // so it can be converted again; only admins can set shippingCancelled.
     function conversionEligible(record) {
       return record.get("collectionStatus", "pending") == "pending"
         && record.get("convertedToTokens", false) == false
-        && record.get("shippingRequested", false) == false
-        && !("shippedAt" in record)
-        && !("shippingRequestedAt" in record)
+        && (
+          record.get("shippingCancelled", false) == true
+          || (
+            record.get("shippingRequested", false) == false
+            && !("shippedAt" in record)
+            && !("shippingRequestedAt" in record)
+          )
+        )
         && record.cardId is string;
     }
 
