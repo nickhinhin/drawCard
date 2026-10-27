@@ -274,7 +274,7 @@ service cloud.firestore {
       return record.get("collectionStatus", "pending") == "pending"
         && record.get("convertedToTokens", false) == false
         && (
-          record.get("shippingCancelled", false) == true
+          shippingCancelledAfterRequest(record)
           || (
             record.get("shippingRequested", false) == false
             && !("shippedAt" in record)
@@ -282,6 +282,18 @@ service cloud.firestore {
           )
         )
         && record.cardId is string;
+    }
+
+    // The cancellation counts only if it came after the latest request: a player's new
+    // request stamps shippingRequestedAt, so an old shippingCancelled flag no longer
+    // unlocks conversion. Same rule in the page (isShippingCancelled in src/App.jsx).
+    function shippingCancelledAfterRequest(record) {
+      return record.get("shippingCancelled", false) == true
+        && record.get("shippingCancelledAt", null) is timestamp
+        && (
+          !("shippingRequestedAt" in record)
+          || record.shippingCancelledAt > record.shippingRequestedAt
+        );
     }
 
     function isValidSlotPurchase(drawId, roundId, slotId) {

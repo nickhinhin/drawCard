@@ -1205,6 +1205,12 @@ export function assertShippableUpdate(collectionName, before, data) {
   if (movesToShipping && isClosedCardRecord(before)) {
     throw new HttpsError("failed-precondition", "此卡牌已作廢或已兌換代幣，不可配送。");
   }
+  // 取消配送 lets the player convert the card, so it may only cancel a request still
+  // in delivery: never a delivered card (e.g. an admin acting on a stale page).
+  if (data.shippingCancelled === true
+      && !(before.collectionStatus === "shipping" && before.shippingRequested === true)) {
+    throw new HttpsError("failed-precondition", "只可取消仍在配送中的配送申請。");
+  }
 }
 
 export const adminSetShippingStatus = onCall(adminCallableOptions, async (request) => {
@@ -1229,7 +1235,7 @@ export const adminSetShippingStatus = onCall(adminCallableOptions, async (reques
     } : {
       collectionStatus: "shipping", deliveryStatus, trackingNumber: "",
     };
-    transaction.update(ref, { ...update, updatedAt: FieldValue.serverTimestamp(), updatedBy: actor.uid });
+    transaction.update(ref, { ...update, shippingCancelled: false, updatedAt: FieldValue.serverTimestamp(), updatedBy: actor.uid });
     transaction.set(db.collection("adminAuditLogs").doc(), auditRecord(
       actor, `shipping:${deliveryStatus}`, "drawRecords", recordId, before,
       { ...update, trackingNumber: trackingNumber ? "[recorded]" : "" }, request,

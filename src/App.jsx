@@ -6748,9 +6748,9 @@ function CollectionPage({ profile }) {
         }
         const latestRecord = recordSnap.data();
         if (latestRecord.convertedToTokens || (latestRecord.collectionStatus || "pending") !== "pending"
-          || (!latestRecord.shippingCancelled
+          || (!isShippingCancelled(latestRecord)
             && (latestRecord.shippingRequested || latestRecord.shippingRequestedAt || latestRecord.shippedAt))) {
-          throw new Error("只有未申請寄送的待處理卡牌可以轉回代幣。");
+          throw new Error("只有未申請配送或已取消配送的待處理卡牌可以轉回代幣。");
         }
         const latestRefund = getCardConversionRefund(recordSnap.data());
         if (latestRefund !== refund) {
@@ -9160,7 +9160,8 @@ function LiveDrawAdminPanel({ profile }) {
     const recordsRef = collection(db, "drawRecords");
     if (activeAdminSection === "shipping") {
       // The active queue loads in full; delivered history grows forever, so it is paged.
-      // Cancellations are rare and load in full; ones the player re-requested are already active.
+      // Only cancelled cards still waiting in the player's 待處理; once converted or
+      // requested again they leave this list, so it stays small.
       const parts = { active: null, delivered: null, cancelled: null };
       const publish = () => {
         if (!parts.active || !parts.delivered || !parts.cancelled) return;
@@ -9189,7 +9190,11 @@ function LiveDrawAdminPanel({ profile }) {
         orderBy("deliveredAt", "desc"),
         limit(deliveredLimit),
       ));
-      const stopCancelled = listen("cancelled", query(recordsRef, where("shippingCancelled", "==", true)));
+      const stopCancelled = listen("cancelled", query(
+        recordsRef,
+        where("collectionStatus", "==", "pending"),
+        where("shippingCancelled", "==", true),
+      ));
       return () => {
         stopActive();
         stopDelivered();
@@ -10139,6 +10144,7 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
         trackingNumber,
         dispatchedAt: serverTimestamp(),
         shippedAt: serverTimestamp(),
+        shippingCancelled: false,
         updatedAt: serverTimestamp(),
       });
     } catch (error) {
@@ -10155,7 +10161,12 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
       alert("請先填寫取消配送原因。");
       return;
     }
-    if (!window.confirm(`取消「${record.cardName || "未命名卡牌"}」的配送？卡牌會退回玩家的「待處理」。`)) return;
+    // Once cancelled the player can convert the card to tokens straight away, so a
+    // parcel already with SF must be back in hand first.
+    const inTransitWarning = getDeliveryStage(record) === "in_transit"
+      ? `\n\n此卡牌已交順豐（單號 ${record.trackingNumber || "--"}）。請先確認包裹已退回，否則玩家可同時收到卡牌及轉回代幣。`
+      : "";
+    if (!window.confirm(`取消「${record.cardName || "未命名卡牌"}」的配送？卡牌會退回玩家的「待處理」，玩家可重新申請配送或轉回代幣。${inTransitWarning}`)) return;
     setSavingId(record.id);
     try {
       await adminUpdateDoc(doc(db, "drawRecords", record.id), {
@@ -10218,6 +10229,7 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
         collectionStatus: "shipped",
         deliveryStatus: "delivered",
         deliveredAt: serverTimestamp(),
+        shippingCancelled: false,
         updatedAt: serverTimestamp(),
       });
     } catch (error) {
@@ -10301,9 +10313,6 @@ function ShippingRequestManager({ records, loading = false, deliveredHaveMore = 
                   <span className="status-badge rejected">已取消配送</span>
                   <small>取消原因</small>
                   <p className="shipping-cancel-reason">{record.shippingCancelReason || "--"}</p>
-                  {record.collectionStatus !== "pending" && (
-                    <small>目前狀態：{getCollectionDeliveryLabel(record)}</small>
-                  )}
                 </div>
               ) : getDeliveryStage(record) === "delivered" ? (
                 <div className="shipping-completed-details">
@@ -15055,9 +15064,16 @@ function getBetaCollectionRecordStatus(record) {
 
 // Older "shipped" records did not distinguish transit from confirmed delivery.
 // Keep them in transit until an administrator explicitly marks them delivered.
+// 取消配送 counts only if it came after the latest request; a new request stamps
+// shippingRequestedAt. Same rule as shippingCancelledAfterRequest in firestore.rules.
+function isShippingCancelled(record) {
+  if (!record?.shippingCancelled || !record.shippingCancelledAt) return false;
+  return !record.shippingRequestedAt || toMillis(record.shippingCancelledAt) > toMillis(record.shippingRequestedAt);
+}
+
 function getDeliveryStage(record) {
-  // 取消配送 returns the card to pending; a new request moves it back to shipping.
-  if (record?.shippingCancelled && !["shipping", "shipped"].includes(record?.collectionStatus)) return "cancelled";
+  // 取消配送 returns the card to pending, where the player can ship it again or convert it.
+  if ((record?.collectionStatus || "pending") === "pending" && isShippingCancelled(record)) return "cancelled";
   if (
     record?.collectionStatus === "shipped"
     && (record?.deliveryStatus === "delivered" || record?.deliveredAt)
