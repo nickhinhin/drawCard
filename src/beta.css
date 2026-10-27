@@ -2472,6 +2472,15 @@
   color: #fff !important;
 }
 
+.beta-mode .collection-card .status-badge.rejected {
+  background: #fee2e2;
+  color: #b91c1c !important;
+}
+
+.beta-mode .collection-card .shipping-cancel-reason {
+  color: var(--beta-red-text) !important;
+}
+
 .beta-mode .admin-finance-summary > span,
 .beta-mode .round-schedule-row {
   border-color: #303036;
