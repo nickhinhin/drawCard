@@ -102,5 +102,5 @@ export const TERMS_OF_SERVICE = [
   "14.2　LiveDraw 未有行使或延遲行使本條款下之任何權利，不構成放棄該權利。",
   "14.3　本條款連同平台《私隱政策》及各盲盒活動頁面所列之規則，構成用戶與 LiveDraw 之間就使用平台之完整協議。",
   "14.4　本條款如有其他語言版本，與中文版本有任何歧異，概以中文版本為準。",
-  "14.5　如有任何查詢，請聯絡 LiveDraw 客服：電郵livedraw.internal@gmail.com；WhatsApp：54208951；服務時間為星期一至五上午 10 時至下午 6 時（公眾假期除外）。",
+  "14.5　如有任何查詢，請聯絡 LiveDraw 客服：電郵livedraw.internal@gmail.com；WhatsApp：70736165；服務時間為星期一至五上午 10 時至下午 6 時（公眾假期除外）。",
 ];

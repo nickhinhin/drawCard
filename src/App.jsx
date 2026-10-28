@@ -224,7 +224,7 @@ const statusLabels = {
 };
 
 const ROUND_BUY_LOCKED_LABEL = "本場已停止購買";
-const SUPPORT_WHATSAPP_URL = "https://wa.me/85254208951";
+const SUPPORT_WHATSAPP_URL = "https://wa.me/85270736165";
 const collectionStatuses = ["pending", "shipping", "shipped"];
 const betaCollectionStatuses = ["pending", "shipping", "shipped", "converted"];
 const CONVERSION_RATE = 0.8;
