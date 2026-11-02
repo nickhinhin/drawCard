@@ -5232,21 +5232,7 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
             <strong>選擇號碼</strong>
             <small>已選 {numbers.length} / {INSTANT_NUMBER_COUNT}</small>
           </div>
-          <div className="instant-board">
-            <div className="instant-number-grid">
-              {INSTANT_NUMBERS.map((number) => (
-                <button
-                  aria-pressed={numbers.includes(number)}
-                  className={numbers.includes(number) ? "selected" : ""}
-                  key={number}
-                  type="button"
-                  onClick={() => toggleNumber(number)}
-                >
-                  {number}
-                </button>
-              ))}
-            </div>
-          </div>
+          <InstantNumberBoard numbers={numbers} onToggle={toggleNumber} />
           <div className="instant-draw-actions">
             <button className="small-btn" type="button" onClick={() => setNumbers(INSTANT_NUMBERS)} disabled={drawing}>全選</button>
             <button className="small-btn" type="button" onClick={() => setNumbers([])} disabled={drawing || !numbers.length}>清除</button>
@@ -5275,6 +5261,51 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
       {boostRun && <InstantBoostGame run={boostRun} onUpdate={handleBoostUpdate} />}
       {result && <InstantDrawReveal result={result} onClose={() => setResult(null)} />}
     </section>
+  );
+}
+
+// The console artwork is drawn at 1564 × 1006; on phones its outer edges are cropped so the
+// keys stay big enough to tap.
+const INSTANT_BOARD_VIEWS = { wide: { x: 0, y: 0, width: 1564, height: 1006 }, narrow: { x: 96, y: 62, width: 1372, height: 836 } };
+const INSTANT_BOARD_NARROW_PX = 520;
+
+function InstantNumberBoard({ numbers, onToggle }) {
+  const stage = useRef(null);
+  const [width, setWidth] = useState(640);
+  useLayoutEffect(() => {
+    const element = stage.current;
+    const measure = () => setWidth(element.getBoundingClientRect().width || 640);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const view = width < INSTANT_BOARD_NARROW_PX ? INSTANT_BOARD_VIEWS.narrow : INSTANT_BOARD_VIEWS.wide;
+  const scale = width / view.width;
+  return (
+    <div className="instant-board" ref={stage} style={{ aspectRatio: `${view.width} / ${view.height}` }}>
+      <div className="instant-board-art" style={{ transform: `scale(${scale}) translate(${-view.x}px, ${-view.y}px)` }}>
+        <img src="/selfdraw/selfdraw-board.webp" alt="" />
+        <div className="instant-number-grid">
+          {INSTANT_NUMBERS.map((number) => {
+            const selected = numbers.includes(number);
+            return (
+              <button
+                aria-label={`號碼 ${number}${selected ? "，已選" : "，未選"}`}
+                aria-pressed={selected}
+                className={selected ? "selected" : ""}
+                key={number}
+                type="button"
+                onClick={() => onToggle(number)}
+              >
+                <img src={`/selfdraw/selfdraw-tile-${selected ? "selected" : "normal"}.webp`} alt="" />
+                <span>{number}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
   );
 }
 
