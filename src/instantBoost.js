@@ -28,9 +28,9 @@ export function nextBoostTier(count) {
 
 export const BOOST_THROW_WINDOW_MS = 6000;
 export const BOOST_FLIGHT_MS = 420;
-// Each stage is smaller and faster; tuned towards hit rates of 85%, 55% and 35%.
+// Each stage is smaller and faster; tuned towards hit rates of 90%, 55% and 35%.
 export const BOOST_STAGES = [
-  { radius: 0.125, ballMs: 2400, targetMs: 3400 },
+  { radius: 0.135, ballMs: 2500, targetMs: 3600 },
   { radius: 0.075, ballMs: 1750, targetMs: 2300 },
   { radius: 0.055, ballMs: 1450, targetMs: 1800 },
 ];

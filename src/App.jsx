@@ -5268,6 +5268,11 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
 // keys stay big enough to tap.
 const INSTANT_BOARD_VIEWS = { wide: { x: 0, y: 0, width: 1564, height: 1006 }, narrow: { x: 96, y: 62, width: 1372, height: 836 } };
 const INSTANT_BOARD_NARROW_PX = 520;
+// Where the lamps sit on the console artwork, lit in a wave.
+const INSTANT_BOARD_LEDS = [
+  [491, 143], [519, 143], [547, 143], [576, 143], [604, 143], [1007, 143], [1036, 143], [1065, 143], [1094, 143],
+  [245, 308], [231, 355], [215, 405], [197, 458], [178, 513], [1318, 305], [1332, 355], [1340, 405], [1365, 460], [1385, 515],
+];
 
 function InstantNumberBoard({ numbers, onToggle }) {
   const stage = useRef(null);
@@ -5286,6 +5291,9 @@ function InstantNumberBoard({ numbers, onToggle }) {
     <div className="instant-board" ref={stage} style={{ aspectRatio: `${view.width} / ${view.height}` }}>
       <div className="instant-board-art" style={{ transform: `scale(${scale}) translate(${-view.x}px, ${-view.y}px)` }}>
         <img src="/selfdraw/selfdraw-board.webp" alt="" />
+        {INSTANT_BOARD_LEDS.map(([x, y], index) => (
+          <span className="instant-board-led" key={`${x}-${y}`} style={{ left: x, top: y, animationDelay: `${(index % 5) * 180}ms` }} />
+        ))}
         <div className="instant-number-grid">
           {INSTANT_NUMBERS.map((number) => {
             const selected = numbers.includes(number);
