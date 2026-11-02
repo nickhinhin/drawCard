@@ -7961,3 +7961,309 @@
   border-color: #f5c542;
   background: rgba(245, 197, 66, .08);
 }
+
+/* 自助抽卡 Boost: 擲球捕卡 */
+.beta-mode .instant-boost-offer {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px dashed #3b3b44;
+  border-radius: 8px;
+  background: #17171c;
+  color: #fff;
+}
+
+.beta-mode .instant-boost-offer.unlocked {
+  border: 1px solid #f5c542;
+  background: linear-gradient(180deg, rgba(245, 197, 66, .12), #17171c);
+}
+
+.beta-mode .instant-boost-offer > strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #f5c542;
+}
+
+.beta-mode .instant-boost-offer p {
+  margin: 0;
+  font-size: 14px;
+}
+
+.beta-mode .instant-boost-offer small {
+  color: #c9c9d2;
+}
+
+.beta-mode .instant-boost-choices {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.beta-mode .instant-boost-choices button {
+  display: grid;
+  gap: 2px;
+  min-height: 56px;
+  padding: 8px 6px;
+  border: 1px solid #3b3b44;
+  border-radius: 6px;
+  background: #0f0f13;
+  color: #fff;
+}
+
+.beta-mode .instant-boost-choices button.active {
+  border-color: #f5c542;
+  box-shadow: inset 0 0 0 1px #f5c542;
+}
+
+.beta-mode .instant-boost-choices button:disabled {
+  opacity: .55;
+}
+
+.instant-boost-modal {
+  width: min(520px, calc(100vw - 24px));
+}
+
+.instant-boost-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.instant-boost-panel p {
+  margin: 0;
+}
+
+.instant-boost-decide {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.instant-boost-arena {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: min(52vh, 360px);
+  margin-top: 12px;
+  overflow: hidden;
+  border: 1px solid #3b3b44;
+  border-radius: 10px;
+  background: radial-gradient(circle at 50% 110%, #33202b, #0d0d13 70%);
+  color: #fff;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.instant-boost-arena > small {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 46%;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.instant-boost-time {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 4px;
+  background: #f5c542;
+  transform: scaleX(var(--left));
+  transform-origin: left;
+}
+
+/* The drawn sizes match the hit test: the target is twice the radius wide. */
+.instant-boost-target {
+  position: absolute;
+  top: 34px;
+  display: grid;
+  place-items: center;
+  width: calc(var(--radius) * 200%);
+  height: 54px;
+  border: 2px solid #f5c542;
+  border-radius: 8px;
+  background: rgba(245, 197, 66, .18);
+  color: #f5c542;
+  transform: translateX(-50%);
+}
+
+.instant-boost-target.hit {
+  background: #f5c542;
+  color: #1a1204;
+}
+
+.instant-boost-target.miss {
+  border-color: #6b6b76;
+  color: #6b6b76;
+}
+
+.instant-boost-ball {
+  position: absolute;
+  bottom: 16px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #fff3c2, #f5c542 45%, #b87a12);
+  box-shadow: 0 0 14px rgba(245, 197, 66, .8);
+  transform: translateX(-50%);
+}
+
+.instant-boost-ball.flying {
+  bottom: calc(100% - 74px);
+  transition: bottom var(--flight) linear;
+}
+
+.instant-flip-bonus {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #f5c542;
+  color: #1a1204;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+@media (max-width: 640px) {
+  .beta-mode .instant-boost-choices {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 自助抽卡 number board: 5 × 4 keys on a glowing tilted console */
+.beta-mode .instant-board-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 10px;
+}
+
+.beta-mode .instant-board-side {
+  display: grid;
+  gap: 2px;
+  padding: 12px 6px;
+  border: 2px solid;
+  border-radius: 12px 12px 12px 12px / 16px;
+  color: #fff;
+  text-align: center;
+}
+
+.beta-mode .instant-board-side strong {
+  font-size: clamp(20px, 4vw, 32px);
+  font-style: italic;
+  font-weight: 900;
+}
+
+.beta-mode .instant-board-side small {
+  font-size: clamp(12px, 2vw, 15px);
+  font-weight: 800;
+}
+
+.beta-mode .instant-board-side.heaven {
+  border-color: #2f8bff;
+  background: linear-gradient(145deg, #082a66, #061022);
+  box-shadow: 0 0 18px rgba(47, 139, 255, .55), inset 0 0 18px rgba(47, 139, 255, .25);
+}
+
+.beta-mode .instant-board-side.heaven strong {
+  color: #a9d6ff;
+}
+
+.beta-mode .instant-board-side.hell {
+  border-color: #f02435;
+  background: linear-gradient(145deg, #5a0710, #1c0408);
+  box-shadow: 0 0 18px rgba(240, 36, 53, .55), inset 0 0 18px rgba(240, 36, 53, .25);
+}
+
+.beta-mode .instant-board-side.hell strong {
+  color: #ff5f70;
+}
+
+.beta-mode .instant-board-title {
+  display: grid;
+  gap: 4px;
+  text-align: center;
+}
+
+.beta-mode .instant-board-title strong {
+  color: #fff;
+  font-size: clamp(22px, 5vw, 42px);
+  font-style: italic;
+  font-weight: 900;
+  text-shadow: 0 0 12px rgba(240, 36, 53, .9);
+}
+
+.beta-mode .instant-board-title small {
+  color: #c9c9d2;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.beta-mode .instant-board {
+  position: relative;
+  padding: clamp(34px, 6vw, 56px) clamp(26px, 5vw, 52px) clamp(24px, 4vw, 40px);
+  overflow: hidden;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at 50% 100%, rgba(240, 36, 53, .28), transparent 60%),
+    linear-gradient(180deg, #1c0508, #09090c);
+  perspective: 900px;
+}
+
+/* LED strips down both sides. */
+.beta-mode .instant-board::before,
+.beta-mode .instant-board::after {
+  content: "";
+  position: absolute;
+  top: 22%;
+  bottom: 22%;
+  width: 8px;
+  background: radial-gradient(circle, #ff8b95 0 3px, #f02435 3px 4px, transparent 5px) center top / 8px 34px repeat-y;
+  filter: drop-shadow(0 0 5px #f02435);
+}
+
+.beta-mode .instant-board::before {
+  left: clamp(8px, 2vw, 18px);
+}
+
+.beta-mode .instant-board::after {
+  right: clamp(8px, 2vw, 18px);
+}
+
+.beta-mode .instant-board .instant-number-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: clamp(7px, 1.6vw, 14px);
+  padding: clamp(12px, 2.4vw, 22px);
+  border: 2px solid #f02435;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #1b1114, #120b0d);
+  box-shadow: 0 0 22px rgba(240, 36, 53, .75), inset 0 0 18px rgba(240, 36, 53, .28);
+  transform: rotateX(14deg);
+  transform-origin: 50% 100%;
+}
+
+.beta-mode .instant-board .instant-number-grid button {
+  min-height: clamp(50px, 9vw, 78px);
+  border: 1px solid #55555f;
+  border-radius: 8px;
+  background: radial-gradient(circle at 50% 42%, #35353c 0 30%, #24242a 31%, #3a3a42 100%);
+  box-shadow: 0 5px 0 #0a0a0d, inset 0 1px 0 rgba(255, 255, 255, .28);
+  font-size: clamp(20px, 4vw, 34px);
+  font-style: italic;
+  text-shadow: 0 2px 3px #000;
+}
+
+.beta-mode .instant-board .instant-number-grid button.selected {
+  border-color: #ff6b78;
+  background: radial-gradient(circle at 50% 42%, #e0202f 0 30%, #b90f1f 31%, #e8293a 100%);
+  color: #fff;
+  box-shadow: 0 5px 0 #4f0710, 0 0 16px rgba(240, 36, 53, .85), inset 0 1px 0 rgba(255, 255, 255, .4);
+  transform: translateY(2px);
+}

@@ -13,6 +13,8 @@ export function summarizeAdminDay(records, reviews, newUserCount, totalUserCount
   const paid = records.filter((record) => Number(record.tokenCost) > 0);
   const purchases = paid.filter((record) => record.source !== "instant");
   const instant = paid.filter((record) => record.source === "instant");
+  // Boost cards cost the player nothing but are still paid out.
+  const instantBonus = records.filter((record) => record.source === "instant" && record.bonus === true);
   const settled = purchases.filter((record) => Boolean(record.cardId));
   const approved = reviews.filter((request) => request.status === "approved" && request.proofMode !== "promo");
   const sum = (items, field) => items.reduce((total, item) => {
@@ -35,9 +37,9 @@ export function summarizeAdminDay(records, reviews, newUserCount, totalUserCount
     unsettledCount: purchases.length - settled.length,
     instantCount: instant.length,
     instantBuyerCount: new Set(instant.map((record) => record.uid).filter(Boolean)).size,
-    instantSalesTokens: sum(instant, "tokenCost"),
-    instantPayoutTokens: payoutOf(instant),
-    instantHeavenCount: instant.filter((record) => record.resultSide === "heaven").length,
+    instantSalesTokens: sum(instant, "tokenCost") + sum(instant, "boostFee"),
+    instantPayoutTokens: payoutOf(instant) + payoutOf(instantBonus),
+    instantHeavenCount: instant.filter((record) => record.resultSide === "heaven").length + instantBonus.length,
     approvedPaymentCount: approved.length,
     approvedHkd: sum(approved, "verifiedHkdAmount"),
   };

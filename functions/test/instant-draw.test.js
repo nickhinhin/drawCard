@@ -50,7 +50,7 @@ test("prices and modes follow the card library", () => {
   assert.equal(isDrawableCard({ ...card, archived: true }, { name: "hell" }), false);
   assert.deepEqual(poolCardSnapshot("c1", { ...card, name: "A", conversionValue: 999, hellCardId: "h" }), {
     id: "c1", name: "A", category: "", imageUrl: "", thumbUrl: "", tokenValue: 100,
-    modePrices: { half: 100, fifth: 40, tenth: 25 }, allowedShareModes: ["1/2", "1/10"],
+    modePrices: { half: 100, fifth: 40, tenth: 25 }, allowedShareModes: ["1/2", "1/10"], boost: false,
   });
 });
 

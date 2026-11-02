@@ -254,3 +254,13 @@
 - `auditCards`、`auditDraws`：相關價格／卡池變更後呼叫同步。使用原本的 retryable triggers，讀取最新文件而非事件中的舊值；不另新增背景排程。
 - 管理網站重算改由 `adminRecalculateCardPrices` 處理，移除瀏覽器另一套重算及整份房間副本覆寫流程。
 - 驗證：`npm run test:purchase-incident` 涵蓋未變卡價的副本修復、歷史資料保留及 93 張歷史卡牌的 canonical-price 購買；Functions 單元測試及 callable/security 流程亦覆蓋舊管理頁面、重試、搶號與防止少付。
+
+## 自助抽卡 Boost（擲球捕卡）
+
+- 目的：買夠號碼的玩家可擲球贏取贈送號碼；每個號碼機率不變，只是多揭號碼。
+- 規則：三種玩法共用 `functions/src/instant-boost.js` 的固定表，買 10／15／20 個解鎖；`src/instantBoost.js` 必須與它完全相同，測試會核對。
+- 毛利：卡牌在每種玩法的售價須達公式價 × 1.2 才提供 Boost，於儲存卡池或售價同步時檢查，抽卡時不重新計算。
+- 付款：`instantDraw` 傳入 `boost` 時即時扣款並鎖定號碼盤，卡牌紀錄待整局結束才寫入。
+- 回合：`instantBoostAction` 重播每一擲；贈送號碼先填滿原號碼盤，其餘放到新號碼盤，未中不獲地獄卡。
+- 中途離開：`settleInstantBoostRuns` 每 5 分鐘結算逾時回合，保留已贏獎勵並隨機選號。
+- 發佈：須部署 Functions、規則及網站；首次部署排程需要 Cloud Scheduler。

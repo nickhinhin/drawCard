@@ -1,5 +1,5 @@
 import { FieldValue } from "firebase-admin/firestore";
-import { cardPrice } from "./instant-draw.js";
+import { boostEligible, cardPrice } from "./instant-draw.js";
 
 export const OPEN_PRICE_STATUSES = ["live", "scheduled", "draft"];
 const PRICE_MODES = { half: "1/2", fifth: "1/5", tenth: "1/10" };
@@ -63,6 +63,9 @@ export async function syncCardPrices(db, cardId, { dryRun = false, rooms = true 
     const [snapshot, showcase, instant] = await tx.getAll(cardRef, showcaseRef, instantRef);
     if (!snapshot.exists) return 0;
     const card = snapshot.data();
+    const hellId = String(card.hellCardId || "");
+    const hell = hellId ? await tx.get(db.collection("cards").doc(hellId)) : null;
+    const boost = boostEligible(card, hell?.data());
     let changed = 0;
     const patch = showcase.exists ? copyPricePatch(showcase.data(), card) : null;
     if (patch) {
@@ -73,9 +76,9 @@ export async function syncCardPrices(db, cardId, { dryRun = false, rooms = true 
     const cards = (Array.isArray(instant.data()?.cards) ? instant.data().cards : undefined)?.map((copy) => {
       if (copy.id !== cardId) return copy;
       const update = copyPricePatch(copy, card);
-      if (!update) return copy;
+      if (!update && copy.boost === boost) return copy;
       instantChanged = true;
-      return { ...copy, ...update };
+      return { ...copy, ...update, boost };
     });
     if (instantChanged) {
       changed++;

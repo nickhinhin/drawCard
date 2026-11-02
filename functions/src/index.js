@@ -6,6 +6,7 @@ import { logger } from "firebase-functions";
 import { setGlobalOptions } from "firebase-functions/v2";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { onDocumentUpdated } from "firebase-functions/v2/firestore";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import { syncAllPrices, syncAdminPriceWrites } from "./price-sync.js";
 import { purchaseLiveSlot } from "./live-purchase.js";
 import { analyzeAuditEntries } from "./audit-analysis.js";
@@ -13,8 +14,10 @@ import { analyticsDayRange, summarizeAdminDay } from "./admin-analytics.js";
 import { isGuestKey, summarizeLiveSessions, summarizeVisitors } from "./live-audience.js";
 import {
   INSTANT_SHARE_MODES, MAX_INSTANT_DAILY_LIMIT, MAX_INSTANT_POOL_CARDS, cardPrice, cardShareModes, dailyLimit,
-  drawBoard, hongKongDay, isDrawableCard, poolCardSnapshot, spentToday, validNumbers,
+  drawBoard, hongKongDay, instantPrizeCopy, instantRecord, isDrawableCard, poolCardSnapshot, spentToday, validNumbers,
 } from "./instant-draw.js";
+import { BOOST_FEE_NUMBERS, BOOST_FREE_COOLDOWN_MS, BOOST_PAID_DAILY_LIMIT, BOOST_RUN_TTL_MS, boostTier } from "./instant-boost.js";
+import { publicRun, runBoostAction, settleExpiredBoostRuns } from "./boost-run.js";
 import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeAudience, sanitizeClientError } from "./monitor.js";
 
 // Least-privilege runtime identity: Firestore, this project's bucket, App Check and logging only.
@@ -1686,6 +1689,7 @@ export const submitTokenPaymentRequest = onCall(tokenProofCallableOptions, async
 // Admins switch it on in the admin site; a player's draw is decided and paid for in one
 // transaction here, so the page can only show (animate) a result it cannot change.
 const allowInstantDraw = createRateLimiter(1, 1500);
+const allowBoostAction = createRateLimiter(8, 2000);
 
 // off: nobody; admin: only admins (testing on the live site, players do not see it); all: everyone.
 const INSTANT_DRAW_MODES = new Set(["off", "admin", "all"]);
@@ -1715,7 +1719,8 @@ export const adminSaveInstantDraw = onCall(adminCallableOptions, async (request)
   const skipped = [];
   cardSnapshots.forEach((item) => {
     const card = item.exists ? item.data() : null;
-    if (isDrawableCard(card, hellById.get(String(card?.hellCardId || "")))) cards.push(poolCardSnapshot(item.id, card));
+    const hell = hellById.get(String(card?.hellCardId || ""));
+    if (isDrawableCard(card, hell)) cards.push(poolCardSnapshot(item.id, card, hell));
     else skipped.push(String(card?.name || item.id));
   });
   if (enabled && !cards.length) {
@@ -1736,7 +1741,7 @@ export const adminSaveInstantDraw = onCall(adminCallableOptions, async (request)
     before && { mode: instantDrawMode(before), dailyTokenLimit: before.dailyTokenLimit ?? null, cardIds: before.cardIds ?? [] },
     { mode, dailyTokenLimit, cardIds: after.cardIds, skipped }, request,
   ));
-  return { ok: true, cards: cards.length, cardIds: after.cardIds, skipped };
+  return { ok: true, cards: cards.length, cardIds: after.cardIds, skipped, noBoost: cards.filter((card) => !card.boost).map((card) => card.name) };
 });
 
 // Player identity, pricing and receipt creation are validated together on the server.
@@ -1765,6 +1770,8 @@ export const instantDraw = onCall(userCallableOptions, async (request) => {
   const numbers = validNumbers(request.data?.numbers);
   if (!numbers) throw new HttpsError("invalid-argument", "請選擇 1 至 20 個號碼。");
   const expectedPrice = Number(request.data?.unitPrice);
+  const boost = String(request.data?.boost || "");
+  if (!["", "free", "paid"].includes(boost)) throw new HttpsError("invalid-argument", "Boost 資料不正確。");
   if (!allowInstantDraw(uid)) throw new HttpsError("resource-exhausted", "抽卡太快，請稍等一秒再試。");
 
   const settings = (await instantDrawSettingsRef().get()).data() || {};
@@ -1813,7 +1820,25 @@ export const instantDraw = onCall(userCallableOptions, async (request) => {
     const unitPrice = cardPrice(card, shareMode);
     if (!unitPrice) throw new HttpsError("failed-precondition", "這張卡暫時未有此玩法的售價。");
     if (unitPrice !== expectedPrice) throw new HttpsError("failed-precondition", "售價已更新，請重新整理後再試。");
-    const total = unitPrice * numbers.length;
+    if (user.instantBoostRunId) throw new HttpsError("failed-precondition", "你有一局未完成的 Boost，請先完成。");
+    const nowMs = Date.now();
+    const paidToday = user.instantBoostPaidDay === day ? Number(user.instantBoostPaidCount) || 0 : 0;
+    let ladder = [];
+    if (boost) {
+      const poolCard = settings.cards?.find((item) => item.id === cardId);
+      const tier = boostTier(numbers.length);
+      if (!tier || poolCard?.boost !== true) throw new HttpsError("failed-precondition", "這次購買不符合 Boost 條件。");
+      if (boost === "free" && nowMs < Number(user.instantBoostFreeAt || 0)) {
+        throw new HttpsError("failed-precondition", "免費 Boost 尚未重置。");
+      }
+      if (boost === "paid" && paidToday >= BOOST_PAID_DAILY_LIMIT) {
+        throw new HttpsError("resource-exhausted", `付費 Boost 每日上限為 ${BOOST_PAID_DAILY_LIMIT} 次。`);
+      }
+      // The third stage may be attempted once a Hong Kong day.
+      ladder = tier[boost].slice(0, user.instantBoostThirdDay === day ? 2 : 3);
+    }
+    const fee = boost === "paid" ? unitPrice * BOOST_FEE_NUMBERS : 0;
+    const total = unitPrice * numbers.length + fee;
     const tokens = Number(user.tokens || 0);
     if (tokens < total) throw new HttpsError("failed-precondition", `代幣不足：需要 ${total} 代幣，你現有 ${tokens} 代幣。`);
     const spent = spentToday(user, day);
@@ -1824,40 +1849,59 @@ export const instantDraw = onCall(userCallableOptions, async (request) => {
     const now = FieldValue.serverTimestamp();
     // A fresh board for this purchase; the chosen numbers are revealed from it.
     const board = drawBoard(shareMode);
+    const sale = {
+      uid, username, affiliateReferrerUid: String(user.referredByUid || ""), shareMode, unitPrice,
+      targetCardId: cardId, targetCardName: String(card.name || ""),
+      targetCardImageUrl: String(card.thumbUrl || card.imageUrl || ""),
+      heaven: instantPrizeCopy(cardId, card), hell: instantPrizeCopy(hellId, hell),
+    };
+    const charge = { tokens: tokens - total, instantDrawDay: day, instantDrawSpent: spent + total, updatedAt: now };
+    if (boost) {
+      // Paid now and locked; the cards are written when the round ends.
+      const runRef = db.collection("instantBoostRuns").doc();
+      const run = {
+        ...sale, numbers, board, boost, fee, total, ladder, stage: 0, prize: 0, status: "ready", lastHit: null,
+        seed: 0, stageStartedAtMs: 0, expiresAtMs: nowMs + BOOST_RUN_TTL_MS, createdAt: now,
+      };
+      transaction.create(runRef, run);
+      transaction.update(userRef, {
+        ...charge, instantBoostRunId: runRef.id,
+        ...(boost === "free"
+          ? { instantBoostFreeAt: nowMs + BOOST_FREE_COOLDOWN_MS }
+          : { instantBoostPaidDay: day, instantBoostPaidCount: paidToday + 1 }),
+      });
+      return { draws: [], boostRun: publicRun(runRef.id, run), tokens: tokens - total, spentToday: spent + total };
+    }
     const draws = numbers.map((number) => {
       const resultSide = board[number - 1];
-      const [prizeId, prize] = resultSide === "heaven" ? [cardId, card] : [hellId, hell];
       const recordRef = db.collection("drawRecords").doc();
-      const record = {
-        uid, username, affiliateReferrerUid: String(user.referredByUid || ""),
-        source: "instant", drawId: "", drawTitle: "自助抽卡", round: "", number,
-        tokenCost: unitPrice, shareMode,
-        targetCardId: cardId, targetCardName: String(card.name || ""),
-        targetCardImageUrl: String(card.thumbUrl || card.imageUrl || ""), targetCardValue: unitPrice,
-        cardId: prizeId, cardName: String(prize.name || ""), cardCategory: String(prize.category || ""),
-        cardImageUrl: String(prize.thumbUrl || prize.imageUrl || ""),
-        cardValue: Number(prize.tokenValue || 0),
-        cardConversionValue: Number(prize.conversionValue ?? prize.tokenValue ?? 0),
-        resultSide, selectedHeavenCardId: cardId, collectionStatus: "pending",
-        assignedAt: now, assignedBy: "instant-draw", createdAt: now, updatedAt: now,
-      };
+      const record = instantRecord(sale, number, resultSide, now, { tokenCost: unitPrice });
       transaction.create(recordRef, record);
       return {
         recordId: recordRef.id, number, resultSide,
-        cardId: prizeId, cardName: record.cardName, cardImageUrl: record.cardImageUrl,
+        cardId: record.cardId, cardName: record.cardName, cardImageUrl: record.cardImageUrl,
         cardConversionValue: record.cardConversionValue,
       };
     });
-    transaction.update(userRef, {
-      tokens: tokens - total, instantDrawDay: day, instantDrawSpent: spent + total, updatedAt: now,
-    });
+    transaction.update(userRef, charge);
     return { draws, tokens: tokens - total, spentToday: spent + total };
   });
   logger.info("Instant draw.", {
-    uid, cardId, shareMode, count: numbers.length,
+    uid, cardId, shareMode, count: numbers.length, boost,
     heaven: result.draws.filter((item) => item.resultSide === "heaven").length,
   });
   return { ok: true, ...result, dailyLimit: limit };
+});
+
+export const instantBoostAction = onCall(userCallableOptions, async (request) => {
+  if (!request.auth) throw new HttpsError("unauthenticated", "請先登入後再抽卡。");
+  if (!allowBoostAction(request.auth.uid)) throw new HttpsError("resource-exhausted", "操作太快，請稍等一秒再試。");
+  return { ok: true, ...await runBoostAction(db, request.auth.uid, request.data) };
+});
+
+export const settleInstantBoostRuns = onSchedule({ schedule: "every 5 minutes", region: "asia-east2" }, async () => {
+  const settled = await settleExpiredBoostRuns(db);
+  if (settled) logger.info("Settled left Boost runs.", { settled });
 });
 
 export const __test = {

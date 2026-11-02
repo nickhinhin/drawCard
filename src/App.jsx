@@ -92,6 +92,10 @@ import {
 import { httpsCallable } from "firebase/functions";
 import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
 import { reportClientError } from "./errorReporting.js";
+import {
+  BOOST_FEE_NUMBERS, BOOST_FLIGHT_MS, BOOST_PAID_DAILY_LIMIT, BOOST_STAGES, BOOST_THROW_WINDOW_MS,
+  boostPositions, boostThrowHits, boostTier, nextBoostTier,
+} from "./instantBoost.js";
 import { TERMS_LAST_UPDATED, TERMS_OF_SERVICE } from "./termsOfService.js";
 import { getToken as getAppCheckToken } from "firebase/app-check";
 import { appCheck, auth, db, functions, getRealtimeDb, googleProvider } from "./firebase";
@@ -5048,7 +5052,8 @@ function requestLogin(notice) {
 // Admins switch it on in the admin site (publicSiteSettings/instantDraw). A player picks
 // a card, an odds mode and up to 20 numbers; the instantDraw function draws each number
 // on the server when it is paid for, and the page then only animates those results.
-const INSTANT_NUMBERS = Array.from({ length: 20 }, (_, index) => index + 1);
+const INSTANT_NUMBER_COUNT = 20;
+const INSTANT_NUMBERS = Array.from({ length: INSTANT_NUMBER_COUNT }, (_, index) => index + 1);
 // Heavens on each purchase's 20-number board (same as the server's INSTANT_HEAVEN_COUNT).
 const INSTANT_MODE_HEAVENS = { "1/2": 10, "1/5": 4, "1/10": 2 };
 
@@ -5094,6 +5099,9 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
   const [numbers, setNumbers] = useState([]);
   const [drawing, setDrawing] = useState(false);
   const [result, setResult] = useState(null);
+  const [boost, setBoost] = useState("free");
+  const [boostRun, setBoostRun] = useState(null);
+  const clock = useBoostClock();
   const card = cards.find((item) => item.id === cardId) || null;
   const modes = useMemo(() => instantCardModes(card), [card]);
 
@@ -5106,7 +5114,13 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
   }, [card, modes, shareMode]);
 
   const unitPrice = card ? instantCardPrice(card, shareMode) : 0;
-  const total = unitPrice * numbers.length;
+  const tier = card?.boost === true ? boostTier(numbers.length) : null;
+  const freeBoostIn = Math.max(0, Number(profile?.instantBoostFreeAt || 0) - clock);
+  const paidBoostsLeft = BOOST_PAID_DAILY_LIMIT
+    - (profile?.instantBoostPaidDay === hongKongDayKey() ? Number(profile.instantBoostPaidCount || 0) : 0);
+  const boostFee = unitPrice * BOOST_FEE_NUMBERS;
+  const activeBoost = !tier ? "" : boost === "free" && !freeBoostIn ? "free" : boost === "paid" && paidBoostsLeft > 0 ? "paid" : "";
+  const total = unitPrice * numbers.length + (activeBoost === "paid" ? boostFee : 0);
   const limit = Number.isSafeInteger(Number(settings?.dailyTokenLimit)) ? Number(settings.dailyTokenLimit) : 500;
   const spent = profile?.instantDrawDay === hongKongDayKey() ? Number(profile.instantDrawSpent || 0) : 0;
   const remaining = limit > 0 ? Math.max(0, limit - spent) : null;
@@ -5115,6 +5129,27 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
     : total > tokens ? `代幣不足：需要 ${formatTokenNumber(total)}，你現有 ${formatTokenNumber(tokens)}。`
       : remaining !== null && total > remaining ? `超出今日上限：今日尚可使用 ${formatTokenNumber(remaining)} 代幣。`
         : "";
+
+  // A round left open (page closed mid-game) carries on where it stopped.
+  const openRunId = profile?.instantBoostRunId;
+  useEffect(() => {
+    if (!openRunId || boostRun) return undefined;
+    let cancelled = false;
+    httpsCallable(functions, "instantBoostAction")({ action: "resume", runId: openRunId })
+      .then(({ data }) => { if (!cancelled) handleBoostUpdate(data); })
+      .catch((error) => console.error("Boost resume failed.", error));
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openRunId]);
+
+  function handleBoostUpdate(data) {
+    if (data.draws) {
+      setBoostRun(null);
+      setResult({ draws: data.draws, card: { name: data.run.cardName }, shareMode: data.run.shareMode, total: data.run.total });
+    } else {
+      setBoostRun(data.run);
+    }
+  }
 
   function toggleNumber(number) {
     setNumbers((current) => (current.includes(number)
@@ -5130,8 +5165,9 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
     if (!card || !numbers.length || drawing || problem) return;
     setDrawing(true);
     try {
-      const { data } = await httpsCallable(functions, "instantDraw")({ cardId: card.id, shareMode, numbers, unitPrice });
-      setResult({ draws: data.draws || [], card, shareMode, total });
+      const { data } = await httpsCallable(functions, "instantDraw")({ cardId: card.id, shareMode, numbers, unitPrice, boost: activeBoost });
+      if (data.boostRun) setBoostRun(data.boostRun);
+      else setResult({ draws: data.draws || [], card, shareMode, total });
       setNumbers([]);
     } catch (error) {
       showSafeError(error, "抽卡失敗，請稍後再試。");
@@ -5194,25 +5230,50 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
               </button>
             ))}
           </div>
-          <h3 className="instant-draw-step">3. 選擇號碼（可以多選）</h3>
-          <div className="instant-number-grid">
-            {INSTANT_NUMBERS.map((number) => (
-              <button
-                aria-pressed={numbers.includes(number)}
-                className={numbers.includes(number) ? "selected" : ""}
-                key={number}
-                type="button"
-                onClick={() => toggleNumber(number)}
-              >
-                {number}
-              </button>
-            ))}
+                    <div className="instant-board-header">
+            <div className="instant-board-side heaven">
+              <strong>天堂</strong>
+              <small>{INSTANT_MODE_HEAVENS[shareMode]} 張天堂卡</small>
+            </div>
+            <div className="instant-board-title">
+              <strong>選擇號碼</strong>
+              <small>已選 {numbers.length} / {INSTANT_NUMBER_COUNT}</small>
+            </div>
+            <div className="instant-board-side hell">
+              <strong>地獄</strong>
+              <small>{INSTANT_NUMBER_COUNT - INSTANT_MODE_HEAVENS[shareMode]} 張地獄卡</small>
+            </div>
+          </div>
+          <div className="instant-board">
+            <div className="instant-number-grid">
+              {INSTANT_NUMBERS.map((number) => (
+                <button
+                  aria-pressed={numbers.includes(number)}
+                  className={numbers.includes(number) ? "selected" : ""}
+                  key={number}
+                  type="button"
+                  onClick={() => toggleNumber(number)}
+                >
+                  {number}
+                </button>
+              ))}
+            </div>
           </div>
           <div className="instant-draw-actions">
             <button className="small-btn" type="button" onClick={() => setNumbers(INSTANT_NUMBERS)} disabled={drawing}>全選</button>
             <button className="small-btn" type="button" onClick={() => setNumbers([])} disabled={drawing || !numbers.length}>清除</button>
             <span>已選 {numbers.length} 個號碼 · 合共 <TokenAmount value={total} /></span>
           </div>
+          {card.boost === true && (
+            <InstantBoostOffer
+              count={numbers.length}
+              choice={activeBoost}
+              fee={boostFee}
+              freeBoostIn={freeBoostIn}
+              onChoose={setBoost}
+              paidBoostsLeft={paidBoostsLeft}
+            />
+          )}
           {problem && <p className="form-note" role="alert">{problem}</p>}
           <button
             className="primary-btn instant-draw-submit"
@@ -5224,8 +5285,203 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
           </button>
         </>
       )}
+      {boostRun && <InstantBoostGame run={boostRun} onUpdate={handleBoostUpdate} />}
       {result && <InstantDrawReveal result={result} onClose={() => setResult(null)} />}
     </section>
+  );
+}
+
+// Ticks once a second for the free Boost countdown.
+function useBoostClock() {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return now;
+}
+
+function formatBoostCountdown(ms) {
+  const seconds = Math.ceil(ms / 1000);
+  return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
+    .map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+// Tells the player how far they are from a Boost, what it gives, and lets them choose it.
+function InstantBoostOffer({ count, choice, fee, freeBoostIn, onChoose, paidBoostsLeft }) {
+  const tier = boostTier(count);
+  const next = nextBoostTier(count);
+  const top = (ladder) => ladder[ladder.length - 1];
+  return (
+    <div className={`instant-boost-offer${tier ? " unlocked" : ""}`}>
+      <strong><Sparkles size={16} /> Boost：擲球捕卡</strong>
+      {tier
+        ? <p>已解鎖！擲中目標可獲贈送號碼，最高 +{top(tier.free)}（付費 Boost 最高 +{top(tier.paid)}）。每個號碼機率不變。</p>
+        : <p>再選 {next.min - count} 個號碼，即可解鎖 Boost：擲中目標可獲贈送號碼，最高 +{top(next.free)}。</p>}
+      {tier && next && <p>再選 {next.min - count} 個，最高獎勵升至 +{top(next.free)}（付費 +{top(next.paid)}）。</p>}
+      {tier ? (
+        <div className="instant-boost-choices">
+          <button className={choice === "free" ? "active" : ""} disabled={freeBoostIn > 0} type="button" onClick={() => onChoose("free")}>
+            <strong>免費 Boost</strong>
+            <small>{freeBoostIn > 0 ? `下次免費 Boost ${formatBoostCountdown(freeBoostIn)}` : "現在可用"}</small>
+          </button>
+          <button className={choice === "paid" ? "active" : ""} disabled={paidBoostsLeft <= 0} type="button" onClick={() => onChoose("paid")}>
+            <strong>付費 Boost</strong>
+            <small>{paidBoostsLeft > 0 ? <><TokenAmount value={fee} /> · 今日尚餘 {paidBoostsLeft} 次</> : "今日已用完"}</small>
+          </button>
+          <button className={choice === "" ? "active" : ""} type="button" onClick={() => onChoose("")}>
+            <strong>不使用</strong>
+            <small>直接開卡</small>
+          </button>
+        </div>
+      ) : (
+        freeBoostIn > 0 && <small>下次免費 Boost {formatBoostCountdown(freeBoostIn)}</small>
+      )}
+      {choice === "paid" && <small role="alert">付費 Boost 挑戰失敗不退回代幣，已購買的號碼照常開卡。</small>}
+    </div>
+  );
+}
+
+// 擲球捕卡. The board is locked on the server; this only plays the throws and reports the
+// taps, and the server replays each one from the same seed before anything counts.
+function InstantBoostGame({ run, onUpdate }) {
+  const [busy, setBusy] = useState(false);
+  const act = async (action, input = {}) => {
+    setBusy(true);
+    try {
+      const { data } = await httpsCallable(functions, "instantBoostAction")({ action, runId: run.runId, ...input });
+      onUpdate(data);
+    } catch (error) {
+      showSafeError(error, "Boost 操作失敗，請再試一次。");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const nextPrize = run.ladder[run.stage + 1];
+  return (
+    <div className="modal-backdrop instant-reveal-backdrop" role="presentation">
+      <section className="modal instant-reveal-modal instant-boost-modal" role="dialog" aria-modal="true" aria-labelledby="instant-boost-title">
+        <header className="instant-reveal-header">
+          <span className="instant-reveal-kicker"><Sparkles size={15} />擲球捕卡 · 第 {run.stage + 1} 關</span>
+          <h2 id="instant-boost-title">
+            {run.status === "decide" ? `擲中！+${run.prize}` : run.status === "pick" ? `選擇 ${run.prize} 個贈送號碼` : `擲中可得 +${run.ladder[run.stage]}`}
+          </h2>
+          <p>已購買 {run.numbers.length} 個號碼已鎖定，結果不受遊戲影響。</p>
+        </header>
+        {run.status === "ready" && (
+          <div className="instant-boost-panel">
+            <p>球和目標都在移動，球會直飛上去，請預判目標的位置再按下。只有一次機會。</p>
+            <button className="primary-btn" disabled={busy} type="button" onClick={() => act("start")}>開始</button>
+          </div>
+        )}
+        {run.status === "playing" && <InstantBoostThrow key={`${run.seed}-${run.stage}`} run={run} onThrow={(tapMs) => act("throw", { tapMs })} />}
+        {run.status === "decide" && (
+          <div className="instant-boost-panel">
+            <p>收下 +{run.prize}，或挑戰下一關贏取 +{nextPrize}。下一關更快更難，失敗便沒有贈送號碼。</p>
+            <div className="instant-boost-decide">
+              <button className="small-btn" disabled={busy} type="button" onClick={() => act("take")}>收下 +{run.prize}</button>
+              <button className="primary-btn" disabled={busy} type="button" onClick={() => act("challenge")}>挑戰 +{nextPrize}</button>
+            </div>
+          </div>
+        )}
+        {run.status === "pick" && <InstantBoostPicks busy={busy} run={run} onFinish={(picks) => act("finish", picks)} />}
+      </section>
+    </div>
+  );
+}
+
+function InstantBoostThrow({ run, onThrow }) {
+  const ball = useRef(null);
+  const target = useRef(null);
+  const tapRef = useRef(null);
+  const startRef = useRef(0);
+  const [thrown, setThrown] = useState(null);
+  const [left, setLeft] = useState(BOOST_THROW_WINDOW_MS);
+  const radius = BOOST_STAGES[run.stage].radius;
+
+  useEffect(() => {
+    startRef.current = performance.now();
+    let frame;
+    const tick = () => {
+      const elapsed = performance.now() - startRef.current;
+      const tap = tapRef.current;
+      const positions = boostPositions(run.seed, run.stage, elapsed);
+      if (target.current) target.current.style.left = `${positions.target * 100}%`;
+      if (tap === null && ball.current) ball.current.style.left = `${positions.ball * 100}%`;
+      if (tap === null && elapsed >= BOOST_THROW_WINDOW_MS) {
+        tapRef.current = -1;
+        onThrow(null);
+        return;
+      }
+      if (tap === null) setLeft(BOOST_THROW_WINDOW_MS - elapsed);
+      if (tap === null || elapsed < tap + BOOST_FLIGHT_MS) frame = requestAnimationFrame(tick);
+      else {
+        setThrown((current) => ({ ...current, landed: true }));
+        window.setTimeout(() => onThrow(tap), 450);
+      }
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function tapThrow() {
+    if (tapRef.current !== null) return;
+    const tapMs = Math.round(performance.now() - startRef.current);
+    tapRef.current = tapMs;
+    setThrown({ hit: boostThrowHits(run.seed, run.stage, tapMs), landed: false });
+  }
+
+  return (
+    <button className="instant-boost-arena" type="button" onPointerDown={tapThrow}>
+      <span className="instant-boost-time" style={{ "--left": left / BOOST_THROW_WINDOW_MS }} />
+      <span className={`instant-boost-target${thrown?.landed ? (thrown.hit ? " hit" : " miss") : ""}`} ref={target} style={{ "--radius": radius }}>
+        <Package size={22} />
+      </span>
+      <span className={`instant-boost-ball${thrown ? " flying" : ""}`} ref={ball} style={{ "--flight": `${BOOST_FLIGHT_MS}ms` }} />
+      <small>{thrown ? (thrown.landed ? (thrown.hit ? "擲中！" : "差一點！") : "") : "按下擲球"}</small>
+    </button>
+  );
+}
+
+// Free numbers first fill the bought board, then go on a new one.
+function InstantBoostPicks({ busy, run, onFinish }) {
+  const open = INSTANT_NUMBER_COUNT - run.numbers.length;
+  const firstCount = Math.min(open, run.prize);
+  const secondCount = run.prize - firstCount;
+  const [first, setFirst] = useState(() => (firstCount === open ? INSTANT_NUMBERS.filter((number) => !run.numbers.includes(number)) : []));
+  const [second, setSecond] = useState([]);
+  const toggle = (set, max) => (number) => set((current) => {
+    if (current.includes(number)) return current.filter((item) => item !== number);
+    return current.length < max ? [...current, number].sort((left, right) => left - right) : current;
+  });
+  const ready = first.length === firstCount && second.length === secondCount;
+  const grid = (picked, onToggle, locked = []) => (
+    <div className="instant-number-grid">
+      {INSTANT_NUMBERS.map((number) => (
+        <button
+          aria-pressed={picked.includes(number)}
+          className={picked.includes(number) ? "selected" : ""}
+          disabled={locked.includes(number)}
+          key={number}
+          type="button"
+          onClick={() => onToggle(number)}
+        >
+          {number}
+        </button>
+      ))}
+    </div>
+  );
+  return (
+    <div className="instant-boost-panel">
+      {firstCount > 0 && firstCount < open && <h3 className="instant-draw-step">原本的號碼組：已選 {first.length} / {firstCount}</h3>}
+      {firstCount > 0 && firstCount < open && grid(first, toggle(setFirst, firstCount), run.numbers)}
+      {firstCount > 0 && firstCount === open && <p>原本的號碼組餘下 {open} 個號碼已全部加入。</p>}
+      {secondCount > 0 && <h3 className="instant-draw-step">新一組號碼：已選 {second.length} / {secondCount}</h3>}
+      {secondCount > 0 && grid(second, toggle(setSecond, secondCount))}
+      <small>每個贈送號碼的機率與購買的號碼相同；贈送號碼未中不會獲得地獄卡。</small>
+      <button className="primary-btn" disabled={busy || !ready} type="button" onClick={() => onFinish({ first, second })}>確定並開卡</button>
+    </div>
   );
 }
 
@@ -5328,21 +5584,22 @@ function InstantDrawReveal({ result, onClose }) {
             return (
               <div
                 className={`instant-flip ${item.resultSide} ${dealt ? "dealt" : ""} ${state}`}
-                key={item.recordId}
+                key={item.recordId || `${item.board}-${item.number}`}
                 style={{ "--deal-delay": `${index * INSTANT_DEAL_STEP_MS}ms` }}
               >
                 <div className="instant-flip-inner">
                   <div className="instant-flip-face instant-flip-back">
-                    <span className="instant-flip-number">#{item.number}</span>
+                    <span className="instant-flip-number">{item.bonus ? "贈" : ""}#{item.number}</span>
                     <img className="instant-flip-logo" src="/livedraw-logo.svg" alt="" />
                     <span className="instant-flip-shine" />
                   </div>
                   <div className="instant-flip-face instant-flip-front">
                     {item.cardImageUrl ? <img src={item.cardImageUrl} alt={item.cardName} /> : <Package size={30} />}
                     <span className="instant-flip-foil" />
+                    {item.bonus && <span className="instant-flip-bonus">贈送</span>}
                     {item.resultSide === "heaven" && <span className="instant-flip-rarity">★</span>}
-                    <em>{item.resultSide === "heaven" ? "天堂" : "地獄"}</em>
-                    <small>#{item.number} · {item.cardName}</small>
+                    <em>{item.resultSide === "heaven" ? "天堂" : item.bonus ? "未中" : "地獄"}</em>
+                    <small>{item.board === 2 ? "第 2 組 " : ""}#{item.number}{item.recordId ? ` · ${item.cardName}` : ""}</small>
                   </div>
                 </div>
                 {item.resultSide === "heaven" && index < shown && (
@@ -5357,7 +5614,7 @@ function InstantDrawReveal({ result, onClose }) {
         {summaryReady && (
           <div className="instant-reveal-summary">
             <span className="heaven"><strong>{heaven}</strong>天堂</span>
-            <span className="hell"><strong>{draws.length - heaven}</strong>地獄</span>
+            <span className="hell"><strong>{draws.filter((item) => item.resultSide === "hell" && !item.bonus).length}</strong>地獄</span>
             <span><strong>{formatTokenNumber(result.total)}</strong>代幣</span>
           </div>
         )}
@@ -9561,7 +9818,7 @@ function AdminInstantDrawPanel({ cards, loading }) {
     try {
       const { data } = await httpsCallable(functions, "adminSaveInstantDraw")({ mode, dailyTokenLimit: limitValue, cardIds: selectedIds });
       setSelectedIds(Array.isArray(data.cardIds) ? data.cardIds : selectedIds);
-      alert(`已儲存：自助抽卡${INSTANT_MODE_LABELS[mode]}，卡池 ${data.cards} 張卡。${data.skipped?.length ? `\n以下卡牌未設定地獄對應卡或售價，未有加入：${data.skipped.join("、")}` : ""}`);
+      alert(`已儲存：自助抽卡${INSTANT_MODE_LABELS[mode]}，卡池 ${data.cards} 張卡。${data.skipped?.length ? `\n以下卡牌未設定地獄對應卡或售價，未有加入：${data.skipped.join("、")}` : ""}${data.noBoost?.length ? `\n以下卡牌毛利低於 Boost 要求，不提供 Boost：${data.noBoost.join("、")}` : ""}`);
     } catch (error) {
       showSafeError(error, "未能儲存自助抽卡設定。");
     } finally {
@@ -9570,7 +9827,7 @@ function AdminInstantDrawPanel({ cards, loading }) {
   }
 
   const stats = (items) => {
-    const sales = items.reduce((sum, record) => sum + Number(record.tokenCost || 0), 0);
+    const sales = items.reduce((sum, record) => sum + Number(record.tokenCost || 0) + Number(record.boostFee || 0), 0);
     const payout = items.reduce((sum, record) => sum + Number(record.cardConversionValue || 0), 0);
     const heaven = items.filter((record) => record.resultSide === "heaven").length;
     return { count: items.length, sales, payout, heaven, players: new Set(items.map((record) => record.uid)).size };

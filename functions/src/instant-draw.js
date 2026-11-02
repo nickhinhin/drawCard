@@ -7,6 +7,7 @@
 // settings (on / off, card pool, daily limit) live in publicSiteSettings/instantDraw
 // so guests can see the pool; prices always come from the card library.
 import { randomInt } from "node:crypto";
+import { BOOST_MIN_MARGIN } from "./instant-boost.js";
 
 export const INSTANT_SHARE_MODES = ["1/2", "1/5", "1/10"];
 export const INSTANT_NUMBER_COUNT = 20;
@@ -53,8 +54,20 @@ export function isDrawableCard(card, hellCard) {
     && cardShareModes(card).some((mode) => cardPrice(card, mode) > 0));
 }
 
+// Only cards earning the Boost table's margin in every mode may offer a Boost. Checked when
+// the pool is saved or a price changes, not on each draw. Prices round to whole tokens.
+export function boostEligible(card, hellCard) {
+  const heaven = Number(card?.conversionValue ?? card?.tokenValue ?? 0);
+  const hell = Number(hellCard?.conversionValue ?? hellCard?.tokenValue ?? 0);
+  const modes = cardShareModes(card);
+  return modes.length > 0 && modes.every((mode) => {
+    const chance = INSTANT_HEAVEN_COUNT[mode] / INSTANT_NUMBER_COUNT;
+    return cardPrice(card, mode) >= Math.round((chance * heaven + (1 - chance) * hell) * BOOST_MIN_MARGIN);
+  });
+}
+
 // The public copy of a pool card: what the page shows, never what the server charges.
-export function poolCardSnapshot(id, card) {
+export function poolCardSnapshot(id, card, hellCard) {
   return {
     id,
     name: String(card.name || ""),
@@ -68,6 +81,33 @@ export function poolCardSnapshot(id, card) {
       tenth: cardPrice(card, "1/10"),
     },
     allowedShareModes: cardShareModes(card),
+    boost: boostEligible(card, hellCard),
+  };
+}
+
+// A card's details as draw records store them.
+export function instantPrizeCopy(id, card) {
+  return {
+    id, name: String(card.name || ""), category: String(card.category || ""),
+    imageUrl: String(card.thumbUrl || card.imageUrl || ""), value: Number(card.tokenValue || 0),
+    conversionValue: Number(card.conversionValue ?? card.tokenValue ?? 0),
+  };
+}
+
+// One settled card. `sale` holds the purchase: uid, username, affiliateReferrerUid, shareMode,
+// unitPrice, targetCardId, targetCardName, targetCardImageUrl and both prize copies.
+export function instantRecord(sale, number, resultSide, now, extra) {
+  const prize = resultSide === "heaven" ? sale.heaven : sale.hell;
+  return {
+    uid: sale.uid, username: sale.username, affiliateReferrerUid: sale.affiliateReferrerUid,
+    source: "instant", drawId: "", drawTitle: "自助抽卡", round: "", number,
+    shareMode: sale.shareMode, targetCardId: sale.targetCardId, targetCardName: sale.targetCardName,
+    targetCardImageUrl: sale.targetCardImageUrl, targetCardValue: sale.unitPrice,
+    cardId: prize.id, cardName: prize.name, cardCategory: prize.category, cardImageUrl: prize.imageUrl,
+    cardValue: prize.value, cardConversionValue: prize.conversionValue,
+    resultSide, selectedHeavenCardId: sale.targetCardId, collectionStatus: "pending",
+    assignedAt: now, assignedBy: "instant-draw", createdAt: now, updatedAt: now,
+    ...extra,
   };
 }
 
