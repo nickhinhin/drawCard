@@ -93,7 +93,7 @@ import { httpsCallable } from "firebase/functions";
 import { IS_ADMIN_SITE, IS_BETA } from "./appVariant.js";
 import { reportClientError } from "./errorReporting.js";
 import {
-  BOOST_FEE_NUMBERS, BOOST_FLIGHT_MS, BOOST_PAID_DAILY_LIMIT, BOOST_STAGES, BOOST_THROW_WINDOW_MS,
+  BOOST_FEE_NUMBERS, BOOST_FLIGHT_MS, BOOST_STAGES, BOOST_THROW_WINDOW_MS,
   boostPositions, boostThrowHits, boostTier, nextBoostTier,
 } from "./instantBoost.js";
 import { TERMS_LAST_UPDATED, TERMS_OF_SERVICE } from "./termsOfService.js";
@@ -5116,10 +5116,8 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
   const unitPrice = card ? instantCardPrice(card, shareMode) : 0;
   const tier = card?.boost === true ? boostTier(numbers.length) : null;
   const freeBoostIn = Math.max(0, Number(profile?.instantBoostFreeAt || 0) - clock);
-  const paidBoostsLeft = BOOST_PAID_DAILY_LIMIT
-    - (profile?.instantBoostPaidDay === hongKongDayKey() ? Number(profile.instantBoostPaidCount || 0) : 0);
   const boostFee = unitPrice * BOOST_FEE_NUMBERS;
-  const activeBoost = !tier ? "" : boost === "free" && !freeBoostIn ? "free" : boost === "paid" && paidBoostsLeft > 0 ? "paid" : "";
+  const activeBoost = !tier ? "" : boost === "free" && !freeBoostIn ? "free" : boost === "paid" ? "paid" : "";
   const total = unitPrice * numbers.length + (activeBoost === "paid" ? boostFee : 0);
   const limit = Number.isSafeInteger(Number(settings?.dailyTokenLimit)) ? Number(settings.dailyTokenLimit) : 500;
   const spent = profile?.instantDrawDay === hongKongDayKey() ? Number(profile.instantDrawSpent || 0) : 0;
@@ -5261,7 +5259,6 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
               fee={boostFee}
               freeBoostIn={freeBoostIn}
               onChoose={setBoost}
-              paidBoostsLeft={paidBoostsLeft}
             />
           )}
           {problem && <p className="form-note" role="alert">{problem}</p>}
@@ -5298,7 +5295,7 @@ function formatBoostCountdown(ms) {
 }
 
 // Tells the player how far they are from a Boost, what it gives, and lets them choose it.
-function InstantBoostOffer({ count, choice, fee, freeBoostIn, onChoose, paidBoostsLeft }) {
+function InstantBoostOffer({ count, choice, fee, freeBoostIn, onChoose }) {
   const tier = boostTier(count);
   const next = nextBoostTier(count);
   const top = (ladder) => ladder[ladder.length - 1];
@@ -5315,9 +5312,9 @@ function InstantBoostOffer({ count, choice, fee, freeBoostIn, onChoose, paidBoos
             <strong>免費 Boost</strong>
             <small>{freeBoostIn > 0 ? `下次免費 Boost ${formatBoostCountdown(freeBoostIn)}` : "現在可用"}</small>
           </button>
-          <button className={choice === "paid" ? "active" : ""} disabled={paidBoostsLeft <= 0} type="button" onClick={() => onChoose("paid")}>
+          <button className={choice === "paid" ? "active" : ""} type="button" onClick={() => onChoose("paid")}>
             <strong>付費 Boost</strong>
-            <small>{paidBoostsLeft > 0 ? <><TokenAmount value={fee} /> · 今日尚餘 {paidBoostsLeft} 次</> : "今日已用完"}</small>
+            <small><TokenAmount value={fee} /></small>
           </button>
           <button className={choice === "" ? "active" : ""} type="button" onClick={() => onChoose("")}>
             <strong>不使用</strong>
@@ -5354,7 +5351,7 @@ function InstantBoostGame({ run, onUpdate }) {
         <header className="instant-reveal-header">
           <span className="instant-reveal-kicker"><Sparkles size={15} />擲球捕卡 · 第 {run.stage + 1} 關</span>
           <h2 id="instant-boost-title">
-            {run.status === "decide" ? `擲中！+${run.prize}` : run.status === "pick" ? `選擇 ${run.prize} 個贈送號碼` : `擲中可得 +${run.ladder[run.stage]}`}
+            {run.status === "decide" ? (run.prize ? `擲中！+${run.prize}` : "擲中！") : run.status === "pick" ? `選擇 ${run.prize} 個贈送號碼` : run.ladder[run.stage] ? `擲中可得 +${run.ladder[run.stage]}` : "擲中可進入下一關"}
           </h2>
           <p>已購買 {run.numbers.length} 個號碼已鎖定，結果不受遊戲影響。</p>
         </header>
@@ -5367,9 +5364,9 @@ function InstantBoostGame({ run, onUpdate }) {
         {run.status === "playing" && <InstantBoostThrow key={`${run.seed}-${run.stage}`} run={run} onThrow={(tapMs) => act("throw", { tapMs })} />}
         {run.status === "decide" && (
           <div className="instant-boost-panel">
-            <p>收下 +{run.prize}，或挑戰下一關贏取 +{nextPrize}。下一關更快更難，失敗便沒有贈送號碼。</p>
+            <p>{run.prize ? `收下 +${run.prize}，或挑戰` : "挑戰"}下一關贏取 +{nextPrize}。下一關更快更難，失敗便沒有贈送號碼。</p>
             <div className="instant-boost-decide">
-              <button className="small-btn" disabled={busy} type="button" onClick={() => act("take")}>收下 +{run.prize}</button>
+              <button className="small-btn" disabled={busy} type="button" onClick={() => act("take")}>{run.prize ? `收下 +${run.prize}` : "放棄並開卡"}</button>
               <button className="primary-btn" disabled={busy} type="button" onClick={() => act("challenge")}>挑戰 +{nextPrize}</button>
             </div>
           </div>

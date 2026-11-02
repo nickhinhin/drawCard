@@ -9,12 +9,11 @@
 export const BOOST_MIN_MARGIN = 1.2;
 export const BOOST_FEE_NUMBERS = 4;
 export const BOOST_FREE_COOLDOWN_MS = 8 * 60 * 60 * 1000;
-export const BOOST_PAID_DAILY_LIMIT = 3;
 export const BOOST_RUN_TTL_MS = 15 * 60 * 1000;
 export const BOOST_TIERS = [
-  { min: 10, free: [2], paid: [2, 4] },
-  { min: 15, free: [2, 3], paid: [2, 4, 6] },
-  { min: 20, free: [2, 4], paid: [2, 4, 8] },
+  { min: 10, free: [0, 1, 2], paid: [1, 2, 4] },
+  { min: 15, free: [1, 2, 3], paid: [2, 4, 6] },
+  { min: 20, free: [1, 2, 4], paid: [2, 4, 8] },
 ];
 
 // The highest tier a purchase of `count` numbers reaches, or null.

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { advanceRun, bonusSlots, publicRun, validBonusPicks } from "../src/boost-run.js";
 import {
-  BOOST_FEE_NUMBERS, BOOST_TIERS, BOOST_THROW_WINDOW_MS, boostThrowHits, boostTier, nextBoostTier,
+  BOOST_FEE_NUMBERS, BOOST_STAGES, BOOST_TIERS, BOOST_THROW_WINDOW_MS, boostThrowHits, boostTier, nextBoostTier,
 } from "../src/instant-boost.js";
 import { boostEligible } from "../src/instant-draw.js";
 import { summarizeAdminDay } from "../src/admin-analytics.js";
@@ -30,11 +30,25 @@ test("the table never gives away more than a sale earns, in any mode", () => {
   }
 });
 
+test("every Boost has three stages, each harder and worth more", () => {
+  for (const tier of BOOST_TIERS) {
+    for (const ladder of [tier.free, tier.paid]) {
+      assert.equal(ladder.length, 3);
+      assert.ok(ladder[0] < ladder[1] && ladder[1] < ladder[2]);
+    }
+  }
+  for (let stage = 1; stage < 3; stage += 1) {
+    assert.ok(BOOST_STAGES[stage].radius < BOOST_STAGES[stage - 1].radius);
+    assert.ok(BOOST_STAGES[stage].ballMs < BOOST_STAGES[stage - 1].ballMs);
+    assert.ok(BOOST_STAGES[stage].targetMs < BOOST_STAGES[stage - 1].targetMs);
+  }
+});
+
 test("tiers unlock by numbers bought", () => {
   assert.equal(boostTier(9), null);
-  assert.deepEqual(boostTier(10).free, [2]);
-  assert.deepEqual(boostTier(14).paid, [2, 4]);
-  assert.deepEqual(boostTier(15).free, [2, 3]);
+  assert.deepEqual(boostTier(10).free, [0, 1, 2]);
+  assert.deepEqual(boostTier(14).paid, [1, 2, 4]);
+  assert.deepEqual(boostTier(15).free, [1, 2, 3]);
   assert.deepEqual(boostTier(20).paid, [2, 4, 8]);
   assert.equal(nextBoostTier(4).min, 10);
   assert.equal(nextBoostTier(12).min, 15);
@@ -75,8 +89,8 @@ test("a round steps through stages and a miss loses the prize", () => {
   assert.equal(advanceRun({ ...base, ...hit }, "take", {}, 0).status, "pick");
   const next = advanceRun({ ...base, ...hit }, "challenge", {}, 0);
   assert.deepEqual([next.status, next.stage, next.prize], ["ready", 1, 0]);
-  const third = advanceRun({ ...base, ...hit, stage: 1 }, "challenge", {}, Date.parse("2026-11-02T00:00:00Z"));
-  assert.equal(third.userPatch.instantBoostThirdDay, "2026-11-02");
+  const gate = advanceRun({ ...base, ladder: [0, 1, 2] }, "throw", { tapMs: hitTap }, BOOST_THROW_WINDOW_MS);
+  assert.deepEqual([gate.status, gate.prize], ["decide", 0]);
   const miss = advanceRun({ ...base, prize: 0 }, "throw", { tapMs: findTap(123, 0, false) }, BOOST_THROW_WINDOW_MS);
   assert.deepEqual([miss.status, miss.prize], ["pick", 0]);
   const last = advanceRun({ ...base, ladder: [2] }, "throw", { tapMs: hitTap }, BOOST_THROW_WINDOW_MS);

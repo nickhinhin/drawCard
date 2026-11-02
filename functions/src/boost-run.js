@@ -6,7 +6,7 @@ import { randomInt } from "node:crypto";
 import { FieldValue } from "firebase-admin/firestore";
 import { HttpsError } from "firebase-functions/v2/https";
 import { BOOST_RUN_TTL_MS, BOOST_THROW_WINDOW_MS, boostThrowHits } from "./instant-boost.js";
-import { INSTANT_NUMBER_COUNT, drawBoard, hongKongDay, instantRecord, validNumbers } from "./instant-draw.js";
+import { INSTANT_NUMBER_COUNT, drawBoard, instantRecord, validNumbers } from "./instant-draw.js";
 
 const ALL_NUMBERS = Array.from({ length: INSTANT_NUMBER_COUNT }, (_, index) => index + 1);
 // Page and server clocks start a moment apart; a tap later than this is not believed.
@@ -44,7 +44,7 @@ export function validBonusPicks(numbers, prize, first, second) {
   return { first: pickedFirst, second: pickedSecond };
 }
 
-// One step of the round. Returns the run's changes, plus `userPatch` for the player's doc.
+// One step of the round. Returns the run's changes.
 export function advanceRun(run, action, input, nowMs, random = randomInt) {
   if (action === "start" && run.status === "ready") {
     return { status: "playing", seed: random(1, 2147483647), stageStartedAtMs: nowMs, lastHit: null };
@@ -61,11 +61,7 @@ export function advanceRun(run, action, input, nowMs, random = randomInt) {
   }
   if (action === "take" && run.status === "decide") return { status: "pick" };
   if (action === "challenge" && run.status === "decide") {
-    const stage = run.stage + 1;
-    return {
-      status: "ready", stage, prize: 0, lastHit: null,
-      ...(stage === 2 ? { userPatch: { instantBoostThirdDay: hongKongDay(nowMs) } } : {}),
-    };
+    return { status: "ready", stage: run.stage + 1, prize: 0, lastHit: null };
   }
   throw new HttpsError("failed-precondition", "這局 Boost 已更新，請重新整理後再試。");
 }
@@ -147,7 +143,7 @@ export async function runBoostAction(db, uid, data, nowMs = Date.now()) {
       const draws = settleRun(transaction, db, runRef, run, picks, nowMs);
       return { run: publicRun(runId, { ...run, status: "done" }), draws };
     }
-    const { userPatch, ...changes } = advanceRun(run, action, data, nowMs);
+    const changes = advanceRun(run, action, data, nowMs);
     const next = { ...run, ...changes };
     // Nothing was won: there is nothing to pick, so the numbers are revealed at once.
     if (next.status === "pick" && !next.prize) {
@@ -155,7 +151,6 @@ export async function runBoostAction(db, uid, data, nowMs = Date.now()) {
       return { run: publicRun(runId, { ...next, status: "done" }), draws };
     }
     transaction.update(runRef, { ...changes, expiresAtMs: nowMs + BOOST_RUN_TTL_MS });
-    if (userPatch) transaction.update(db.collection("users").doc(uid), userPatch);
     return { run: publicRun(runId, next), draws: null };
   });
 }

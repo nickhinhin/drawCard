@@ -71,9 +71,12 @@ check("no second draw while a round is open", err(await call("instantDraw", { ca
 const other = await player("BoostO", 0);
 check("another player cannot touch the run", err(await act(other, { action: "start", runId: run1.runId })).startsWith("NOT_FOUND"));
 const t1 = await play(p1, run1.runId, 0, true);
-check("a hit offers take or challenge", t1.result?.run.status === "decide" && t1.result.run.prize === 2, JSON.stringify(t1));
+check("a hit offers take or challenge", t1.result?.run.status === "decide" && t1.result.run.prize === 1, JSON.stringify(t1));
 await act(p1, { action: "challenge", runId: run1.runId });
-const t2 = await play(p1, run1.runId, 1, true);
+const t1b = await play(p1, run1.runId, 1, true);
+check("stage 2 pays more", t1b.result?.run.status === "decide" && t1b.result.run.prize === 2, JSON.stringify(t1b));
+await act(p1, { action: "challenge", runId: run1.runId });
+const t2 = await play(p1, run1.runId, 2, true);
 check("the top stage goes straight to picking", t2.result?.run.status === "pick" && t2.result.run.prize === 4, JSON.stringify(t2));
 check("wrong picks refused", err(await act(p1, { action: "finish", runId: run1.runId, first: [], second: [1, 2] })).startsWith("INVALID_ARGUMENT"));
 const f1 = await act(p1, { action: "finish", runId: run1.runId, first: [], second: [1, 2, 3, 4] });
@@ -97,10 +100,13 @@ check("a miss opens the bought numbers with no free ones", t3.result?.draws?.len
 check("the fee is recorded once", (await read(`drawRecords/${t3.result.draws[0].recordId}`)).boostFee === 264);
 await sleep(1600);
 
-// Limit: three paid a day.
-await seed(`users/${p1.uid}`, { ...(await read(`users/${p1.uid}`)), instantBoostPaidDay: new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10), instantBoostPaidCount: 3 });
-check("fourth paid Boost refused", err(await call("instantDraw", { cardId: "boost-A", shareMode: "1/2", numbers: nums(10), unitPrice: 66, boost: "paid" }, p1.token)).startsWith("RESOURCE_EXHAUSTED"));
-await sleep(1600);
+// Paid Boosts have no limit of their own.
+for (let i = 0; i < 4; i += 1) {
+  const paid = await call("instantDraw", { cardId: "boost-A", shareMode: "1/2", numbers: nums(10), unitPrice: 66, boost: "paid" }, p1.token);
+  check(`paid Boost ${i + 2} accepted`, Boolean(paid.result?.boostRun), JSON.stringify(paid));
+  await play(p1, paid.result.boostRun.runId, 0, false);
+  await sleep(1600);
+}
 
 // A round left open is settled, keeping a prize already won.
 const p2 = await player("BoostB", 100000);
@@ -110,7 +116,7 @@ await play(p2, runId, 0, true);
 const left = await read(`instantBoostRuns/${runId}`);
 await seed(`instantBoostRuns/${runId}`, { ...left, expiresAtMs: 1, createdAt: new Date() });
 const r1 = await act(p2, { action: "resume", runId });
-check("expired round settles with its +2", r1.result?.draws?.length === 17 && r1.result.draws.filter((x) => x.bonus).length === 2, JSON.stringify(r1).slice(0, 300));
+check("expired round settles with its +1", r1.result?.draws?.length === 16 && r1.result.draws.filter((x) => x.bonus).length === 1, JSON.stringify(r1).slice(0, 300));
 check("board stays private from the player", (await fetch(`${FS}/instantBoostRuns/${runId}`, { headers: { Authorization: `Bearer ${p2.token}` } })).status === 403);
 
 console.log(`\n${ok} passed, ${bad} failed`);

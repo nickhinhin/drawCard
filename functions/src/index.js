@@ -16,7 +16,7 @@ import {
   INSTANT_SHARE_MODES, MAX_INSTANT_DAILY_LIMIT, MAX_INSTANT_POOL_CARDS, cardPrice, cardShareModes, dailyLimit,
   drawBoard, hongKongDay, instantPrizeCopy, instantRecord, isDrawableCard, poolCardSnapshot, spentToday, validNumbers,
 } from "./instant-draw.js";
-import { BOOST_FEE_NUMBERS, BOOST_FREE_COOLDOWN_MS, BOOST_PAID_DAILY_LIMIT, BOOST_RUN_TTL_MS, boostTier } from "./instant-boost.js";
+import { BOOST_FEE_NUMBERS, BOOST_FREE_COOLDOWN_MS, BOOST_RUN_TTL_MS, boostTier } from "./instant-boost.js";
 import { publicRun, runBoostAction, settleExpiredBoostRuns } from "./boost-run.js";
 import { buildMonitorReport, createRateLimiter, groupClientErrors, groupServerErrors, sanitizeAudience, sanitizeClientError } from "./monitor.js";
 
@@ -1822,7 +1822,6 @@ export const instantDraw = onCall(userCallableOptions, async (request) => {
     if (unitPrice !== expectedPrice) throw new HttpsError("failed-precondition", "售價已更新，請重新整理後再試。");
     if (user.instantBoostRunId) throw new HttpsError("failed-precondition", "你有一局未完成的 Boost，請先完成。");
     const nowMs = Date.now();
-    const paidToday = user.instantBoostPaidDay === day ? Number(user.instantBoostPaidCount) || 0 : 0;
     let ladder = [];
     if (boost) {
       const poolCard = settings.cards?.find((item) => item.id === cardId);
@@ -1831,11 +1830,7 @@ export const instantDraw = onCall(userCallableOptions, async (request) => {
       if (boost === "free" && nowMs < Number(user.instantBoostFreeAt || 0)) {
         throw new HttpsError("failed-precondition", "免費 Boost 尚未重置。");
       }
-      if (boost === "paid" && paidToday >= BOOST_PAID_DAILY_LIMIT) {
-        throw new HttpsError("resource-exhausted", `付費 Boost 每日上限為 ${BOOST_PAID_DAILY_LIMIT} 次。`);
-      }
-      // The third stage may be attempted once a Hong Kong day.
-      ladder = tier[boost].slice(0, user.instantBoostThirdDay === day ? 2 : 3);
+      ladder = tier[boost];
     }
     const fee = boost === "paid" ? unitPrice * BOOST_FEE_NUMBERS : 0;
     const total = unitPrice * numbers.length + fee;
@@ -1866,9 +1861,7 @@ export const instantDraw = onCall(userCallableOptions, async (request) => {
       transaction.create(runRef, run);
       transaction.update(userRef, {
         ...charge, instantBoostRunId: runRef.id,
-        ...(boost === "free"
-          ? { instantBoostFreeAt: nowMs + BOOST_FREE_COOLDOWN_MS }
-          : { instantBoostPaidDay: day, instantBoostPaidCount: paidToday + 1 }),
+        ...(boost === "free" ? { instantBoostFreeAt: nowMs + BOOST_FREE_COOLDOWN_MS } : {}),
       });
       return { draws: [], boostRun: publicRun(runRef.id, run), tokens: tokens - total, spentToday: spent + total };
     }
