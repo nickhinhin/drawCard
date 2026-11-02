@@ -5230,19 +5230,9 @@ function InstantDrawPanel({ profile, settings, adminTest = false }) {
               </button>
             ))}
           </div>
-                    <div className="instant-board-header">
-            <div className="instant-board-side heaven">
-              <strong>天堂</strong>
-              <small>{INSTANT_MODE_HEAVENS[shareMode]} 張天堂卡</small>
-            </div>
-            <div className="instant-board-title">
-              <strong>選擇號碼</strong>
-              <small>已選 {numbers.length} / {INSTANT_NUMBER_COUNT}</small>
-            </div>
-            <div className="instant-board-side hell">
-              <strong>地獄</strong>
-              <small>{INSTANT_NUMBER_COUNT - INSTANT_MODE_HEAVENS[shareMode]} 張地獄卡</small>
-            </div>
+                    <div className="instant-board-title">
+            <strong>選擇號碼</strong>
+            <small>已選 {numbers.length} / {INSTANT_NUMBER_COUNT}</small>
           </div>
           <div className="instant-board">
             <div className="instant-number-grid">
