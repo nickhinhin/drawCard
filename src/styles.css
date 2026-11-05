@@ -2061,6 +2061,9 @@ textarea:focus {
 .analytics-toolbar p { margin: 0; }
 .analytics-controls { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; }
 .analytics-date-picker { position: relative; display: grid; gap: 5px; }
+.analytics-export { display: grid; gap: 10px; margin-top: 16px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.analytics-export p { margin: 0; font-size: .84rem; }
+.analytics-export .analytics-calendar { right: auto; left: 0; }
 .analytics-date-label { font-size: .85rem; font-weight: 700; }
 .analytics-date-trigger { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 184px; min-height: 42px; padding: 8px 11px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: #fff; color: inherit; }
 .analytics-date-trigger strong { font-size: 1rem; }

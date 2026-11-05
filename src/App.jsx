@@ -9079,7 +9079,7 @@ function formatAnalyticsTime(value) {
 }
 
 // Explicit calendar picker works the same on desktop, tablet and mobile browsers.
-function AnalyticsDatePicker({ day, onChange }) {
+function AnalyticsDatePicker({ day, onChange, label = "選擇日期" }) {
   const [open, setOpen] = useState(false);
   const [month, setMonth] = useState(day.slice(0, 7));
   const pickerRef = useRef(null);
@@ -9115,8 +9115,8 @@ function AnalyticsDatePicker({ day, onChange }) {
 
   return (
     <div className="analytics-date-picker" ref={pickerRef}>
-      <span className="analytics-date-label">選擇日期</span>
-      <button className="analytics-date-trigger" type="button" aria-label={`選擇日期，目前 ${day}`} aria-expanded={open} onClick={() => { setMonth(day.slice(0, 7)); setOpen((value) => !value); }}>
+      <span className="analytics-date-label">{label}</span>
+      <button className="analytics-date-trigger" type="button" aria-label={`${label}，目前 ${day}`} aria-expanded={open} onClick={() => { setMonth(day.slice(0, 7)); setOpen((value) => !value); }}>
         <CalendarDays size={18} /><strong>{day}</strong><ChevronDown size={16} />
       </button>
       {open && <div className="analytics-calendar" role="dialog" aria-label="選擇統計日期">
@@ -9138,6 +9138,42 @@ function AnalyticsDatePicker({ day, onChange }) {
   );
 }
 
+const ANALYTICS_EXPORT_MAX_DAYS = 92;
+
+// Every Hong Kong calendar day from start to end inclusive (YYYY-MM-DD).
+function analyticsDaysBetween(start, end) {
+  const days = [];
+  const cursor = new Date(`${start}T00:00:00Z`);
+  const last = new Date(`${end}T00:00:00Z`);
+  while (cursor <= last && days.length <= ANALYTICS_EXPORT_MAX_DAYS) {
+    days.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return days;
+}
+
+const ANALYTICS_CSV_COLUMNS = [
+  ["日期", (s) => s.day],
+  ["當日新會員", (s) => s.newUserCount],
+  ["當日購買（筆）", (s) => s.purchaseCount],
+  ["購買人數", (s) => s.buyerCount],
+  ["當日銷售（代幣）", (s) => s.salesTokens],
+  ["已結算銷售（代幣）", (s) => s.settledSalesTokens],
+  ["已結算兌換值（代幣）", (s) => s.payoutTokens],
+  ["已結算毛利估算（代幣）", (s) => (s.settledSalesTokens || 0) - (s.payoutTokens || 0)],
+  ["未結算購買（筆）", (s) => s.unsettledCount],
+  ["批准入金（HK$）", (s) => s.approvedHkd],
+  ["批准入金（筆）", (s) => s.approvedPaymentCount],
+  ["自助抽卡次數", (s) => s.instantCount ?? 0],
+  ["自助抽卡人數", (s) => s.instantBuyerCount ?? 0],
+  ["自助抽卡銷售（代幣）", (s) => s.instantSalesTokens ?? 0],
+  ["自助抽卡派出兌換值（代幣）", (s) => s.instantPayoutTokens ?? 0],
+  ["自助抽卡毛利估算（代幣）", (s) => (s.instantSalesTokens || 0) - (s.instantPayoutTokens || 0)],
+  ["自助抽卡天堂", (s) => s.instantHeavenCount ?? 0],
+];
+// Distinct buyers cannot be added across days, so the total row leaves them blank.
+const ANALYTICS_CSV_NOT_SUMMABLE = new Set(["日期", "購買人數", "自助抽卡人數"]);
+
 function AdminAnalytics() {
   const [day, setDay] = useState(() => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()));
   const [view, setView] = useState("users");
@@ -9150,6 +9186,10 @@ function AdminAnalytics() {
   const [loadingRows, setLoadingRows] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [userSort, setUserSort] = useState({ field: "createdAt", direction: "desc" });
+  const [exportStart, setExportStart] = useState(day);
+  const [exportEnd, setExportEnd] = useState(day);
+  const [exportProgress, setExportProgress] = useState(null);
+  const [exportError, setExportError] = useState("");
   const sortParams = view === "users" ? { sort: userSort.field, direction: userSort.direction } : {};
 
   function toggleUserSort(field) {
@@ -9202,6 +9242,46 @@ function AdminAnalytics() {
     }
   }
 
+  // Fetch one daily summary per day in the range, a few at a time, then build the CSV.
+  async function exportRangeCsv() {
+    if (exportProgress) return;
+    const [start, end] = exportStart <= exportEnd ? [exportStart, exportEnd] : [exportEnd, exportStart];
+    const days = analyticsDaysBetween(start, end);
+    if (days.length > ANALYTICS_EXPORT_MAX_DAYS) {
+      setExportError(`每次最多匯出 ${ANALYTICS_EXPORT_MAX_DAYS} 日，請縮短日期範圍。`);
+      return;
+    }
+    setExportError("");
+    setExportProgress({ done: 0, total: days.length });
+    const results = new Array(days.length);
+    let next = 0;
+    let done = 0;
+    const call = httpsCallable(functions, "adminAnalytics");
+    async function worker() {
+      while (next < days.length) {
+        const index = next++;
+        const { data } = await call({ mode: "summary", day: days[index] });
+        results[index] = { ...data, day: days[index] };
+        done += 1;
+        setExportProgress({ done, total: days.length });
+      }
+    }
+    try {
+      await Promise.all(Array.from({ length: Math.min(4, days.length) }, worker));
+      const headers = ANALYTICS_CSV_COLUMNS.map(([heading]) => heading);
+      const rows = results.map((item) => Object.fromEntries(ANALYTICS_CSV_COLUMNS.map(([heading, read]) => [heading, read(item) ?? 0])));
+      const total = Object.fromEntries(headers.map((heading) => [heading,
+        ANALYTICS_CSV_NOT_SUMMABLE.has(heading) ? "" : rows.reduce((sum, row) => sum + Number(row[heading] || 0), 0)]));
+      total["日期"] = "合計";
+      const memberRow = { 日期: `會員總數（匯出時）：${results.at(-1)?.totalUserCount ?? "--"}` };
+      downloadTextFile(`livedraw-analytics-${start}_to_${end}.csv`, createCsvText(headers, [...rows, total, memberRow]));
+    } catch (error) {
+      setExportError(getSafeErrorMessage(error, "未能匯出 CSV，請再試。"));
+    } finally {
+      setExportProgress(null);
+    }
+  }
+
   const margin = (summary?.settledSalesTokens || 0) - (summary?.payoutTokens || 0);
   const cards = summary ? [
     ["會員總數", formatTokenNumber(summary.totalUserCount), "人"],
@@ -9232,6 +9312,18 @@ function AdminAnalytics() {
             <AnalyticsDatePicker day={day} onChange={setDay} />
             <button className="small-btn" type="button" onClick={() => setRefresh((value) => value + 1)}><RefreshCcw size={15} />重新整理</button>
           </div>
+        </div>
+        <div className="analytics-export">
+          <strong>匯出 CSV（每日一行）</strong>
+          <div className="analytics-controls">
+            <AnalyticsDatePicker label="開始日期" day={exportStart} onChange={setExportStart} />
+            <AnalyticsDatePicker label="結束日期" day={exportEnd} onChange={setExportEnd} />
+            <button className="small-btn" type="button" disabled={Boolean(exportProgress)} onClick={exportRangeCsv}>
+              <Download size={15} />{exportProgress ? `匯出中 ${exportProgress.done}/${exportProgress.total}` : "下載 CSV"}
+            </button>
+          </div>
+          <p className="muted">每次最多 {ANALYTICS_EXPORT_MAX_DAYS} 日。購買人數按日計算，合計列不加總。</p>
+          {exportError && <p className="error-note" role="alert">{exportError}</p>}
         </div>
         {summaryError && <p className="error-note" role="alert">{summaryError}</p>}
         {!summary && !summaryError && <InlineLoading label="正在計算當日數據..." />}
