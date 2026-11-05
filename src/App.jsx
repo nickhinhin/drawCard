@@ -9138,7 +9138,7 @@ function AnalyticsDatePicker({ day, onChange, label = "選擇日期" }) {
   );
 }
 
-const ANALYTICS_EXPORT_MAX_DAYS = 92;
+const ANALYTICS_EXPORT_MAX_DAYS = 400;
 
 // Every Hong Kong calendar day from start to end inclusive (YYYY-MM-DD).
 function analyticsDaysBetween(start, end) {
@@ -9267,7 +9267,7 @@ function AdminAnalytics() {
       }
     }
     try {
-      await Promise.all(Array.from({ length: Math.min(4, days.length) }, worker));
+      await Promise.all(Array.from({ length: Math.min(8, days.length) }, worker));
       const headers = ANALYTICS_CSV_COLUMNS.map(([heading]) => heading);
       const rows = results.map((item) => Object.fromEntries(ANALYTICS_CSV_COLUMNS.map(([heading, read]) => [heading, read(item) ?? 0])));
       const total = Object.fromEntries(headers.map((heading) => [heading,
