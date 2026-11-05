@@ -9312,12 +9312,55 @@ function AdminAnalytics() {
         .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")));
       const payments = results.flatMap((item) => item.payments)
         .sort((left, right) => String(right.reviewedAt || "").localeCompare(String(left.reviewedAt || "")));
+      // Per-member totals for the range, built from the purchase and payment lists above.
+      const activity = new Map();
+      const activityOf = (uid) => {
+        if (!activity.has(uid)) {
+          activity.set(uid, { purchaseCount: 0, spend: 0, settledSpend: 0, payout: 0, unsettled: 0, depositHkd: 0, depositCount: 0, grantedTokens: 0, lastPurchase: "" });
+        }
+        return activity.get(uid);
+      };
+      purchases.forEach((item) => {
+        if (!item.uid) return;
+        const row = activityOf(item.uid);
+        const cost = Number(item.tokenCost || 0);
+        if (cost > 0) {
+          row.purchaseCount += 1;
+          row.spend += cost;
+          if (item.cardId) row.settledSpend += cost;
+          else row.unsettled += 1;
+        }
+        if (item.cardId) row.payout += getCardConversionRefund(item);
+        if (String(item.createdAt || "") > row.lastPurchase) row.lastPurchase = String(item.createdAt);
+      });
+      payments.forEach((item) => {
+        if (!item.uid || item.status !== "approved") return;
+        const row = activityOf(item.uid);
+        row.grantedTokens += Number(item.amount || 0);
+        if (item.proofMode !== "promo") {
+          row.depositHkd += Number(item.verifiedHkdAmount || 0);
+          row.depositCount += 1;
+        }
+      });
+      const memberStats = users.map((item, index) => ({ item, joinDay: joinDays[index], stats: activity.get(item.id) || activityOf(item.id) }))
+        .sort((left, right) => right.stats.spend - left.stats.spend || right.stats.depositHkd - left.stats.depositHkd);
       const sections = [
         ["每日數據", headers, [...rows, total]],
-        ["會員（按加入日期）", ["會員", "會員 ID", "電郵", "電話", "加入日期", "代幣餘額", "累計入金（HK$）", "VIP 等級"], rangeUsers.map((item) => ({
+        ["新會員（按加入日期）", ["會員", "會員 ID", "電郵", "電話", "加入日期", "代幣餘額", "累計入金（HK$）", "VIP 等級"], rangeUsers.map((item) => ({
           會員: item.username || item.displayName || "未命名", "會員 ID": item.id, 電郵: displayEmail(item.email) || "",
           電話: item.phoneNumber || "", 加入日期: formatAnalyticsTime(item.createdAt), 代幣餘額: Number(item.tokens || 0),
           "累計入金（HK$）": Number(item.totalDeposits || 0), "VIP 等級": item.vipLevel ?? "",
+        }))],
+        ["會員數據（全部會員，期內活動）", ["會員", "會員 ID", "電郵", "電話", "加入日期", "期內加入", "代幣餘額", "累計入金（HK$）", "VIP 等級",
+          "期內購買次數", "期內消費（代幣）", "期內已結算消費（代幣）", "期內兌換值（代幣）", "期內毛利估算（代幣）", "期內未結算（筆）",
+          "期內入金（HK$）", "期內入金（筆）", "期內批出代幣", "期內最後購買"], memberStats.map(({ item, joinDay, stats }) => ({
+          會員: item.username || item.displayName || "未命名", "會員 ID": item.id, 電郵: displayEmail(item.email) || "",
+          電話: item.phoneNumber || "", 加入日期: formatAnalyticsTime(item.createdAt), 期內加入: joinDay && joinDay >= start && joinDay <= end ? "是" : "",
+          代幣餘額: Number(item.tokens || 0), "累計入金（HK$）": Number(item.totalDeposits || 0), "VIP 等級": item.vipLevel ?? "",
+          期內購買次數: stats.purchaseCount, "期內消費（代幣）": stats.spend, "期內已結算消費（代幣）": stats.settledSpend,
+          "期內兌換值（代幣）": stats.payout, "期內毛利估算（代幣）": stats.settledSpend - stats.payout, "期內未結算（筆）": stats.unsettled,
+          "期內入金（HK$）": stats.depositHkd, "期內入金（筆）": stats.depositCount, 期內批出代幣: stats.grantedTokens,
+          期內最後購買: stats.lastPurchase ? formatAnalyticsTime(stats.lastPurchase) : "",
         }))],
         ["購買交易", ["購買時間", "會員", "會員 ID", "交易 ID", "場次", "輪次", "號碼", "消費（代幣）", "結果", "兌換值（代幣）"], purchases.map((item) => ({
           購買時間: formatAnalyticsTime(item.createdAt), 會員: item.username || "", "會員 ID": item.uid || "", "交易 ID": item.id,
@@ -9376,7 +9419,7 @@ function AdminAnalytics() {
           </div>
         </div>
         <div className="analytics-export">
-          <strong>匯出 CSV（每日數據、會員、購買交易、入金審批）</strong>
+          <strong>匯出 CSV（每日數據、新會員、會員數據、購買交易、入金審批）</strong>
           <div className="analytics-controls">
             <AnalyticsDatePicker label="開始日期" day={exportStart} onChange={setExportStart} />
             <AnalyticsDatePicker label="結束日期" day={exportEnd} onChange={setExportEnd} />
