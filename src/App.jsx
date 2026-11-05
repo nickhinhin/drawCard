@@ -9154,6 +9154,7 @@ function analyticsDaysBetween(start, end) {
 
 const ANALYTICS_CSV_COLUMNS = [
   ["日期", (s) => s.day],
+  ["會員總數", (s) => s.memberTotal],
   ["當日新會員", (s) => s.newUserCount],
   ["當日購買（筆）", (s) => s.purchaseCount],
   ["購買人數", (s) => s.buyerCount],
@@ -9172,7 +9173,7 @@ const ANALYTICS_CSV_COLUMNS = [
   ["自助抽卡天堂", (s) => s.instantHeavenCount ?? 0],
 ];
 // Distinct buyers cannot be added across days, so the total row leaves them blank.
-const ANALYTICS_CSV_NOT_SUMMABLE = new Set(["日期", "購買人數", "自助抽卡人數"]);
+const ANALYTICS_CSV_NOT_SUMMABLE = new Set(["日期", "會員總數", "購買人數", "自助抽卡人數"]);
 
 function AdminAnalytics() {
   const [day, setDay] = useState(() => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()));
@@ -9268,8 +9269,9 @@ function AdminAnalytics() {
     const results = new Array(days.length);
     let next = 0;
     let done = 0;
+    let failed = false;
     async function worker() {
-      while (next < days.length) {
+      while (next < days.length && !failed) {
         const index = next++;
         const day = days[index];
         const [{ data }, purchases, payments] = await Promise.all([
@@ -9279,29 +9281,40 @@ function AdminAnalytics() {
         ]);
         results[index] = { summary: { ...data, day }, purchases, payments };
         done += 1;
-        setExportProgress({ done, total: days.length });
+        if (!failed) setExportProgress({ done, total: days.length });
       }
     }
     try {
       const [users] = await Promise.all([
-        fetchAll({ mode: "users", sort: "createdAt", direction: "desc" }),
+        fetchAll({ mode: "users", day: end, sort: "createdAt", direction: "desc" }),
         Promise.all(Array.from({ length: Math.min(6, days.length) }, worker)),
       ]);
-      const summaries = results.map((item) => item.summary);
+      // Hong Kong join date per member; members without one count as joined before the range.
+      const hkDay = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit" });
+      const joinDayOf = (item) => {
+        const joined = item.createdAt ? new Date(item.createdAt) : null;
+        return joined && !Number.isNaN(joined.getTime()) ? hkDay.format(joined) : "";
+      };
+      const joinDays = users.map(joinDayOf);
+      // 會員總數 for each day = members who had joined by the end of that day.
+      const summaries = results.map((item) => ({
+        ...item.summary,
+        memberTotal: joinDays.filter((joinDay) => joinDay <= item.summary.day).length,
+      }));
+      const rangeUsers = users.filter((item, index) => joinDays[index] && joinDays[index] >= start && joinDays[index] <= end);
       const headers = ANALYTICS_CSV_COLUMNS.map(([heading]) => heading);
       const rows = summaries.map((item) => Object.fromEntries(ANALYTICS_CSV_COLUMNS.map(([heading, read]) => [heading, read(item) ?? 0])));
       const total = Object.fromEntries(headers.map((heading) => [heading,
         ANALYTICS_CSV_NOT_SUMMABLE.has(heading) ? "" : rows.reduce((sum, row) => sum + Number(row[heading] || 0), 0)]));
       total["日期"] = "合計";
-      const memberRow = { 日期: `會員總數（匯出時）：${summaries.at(-1)?.totalUserCount ?? "--"}` };
       // Purchases and payments are listed newest first, matching the page.
       const purchases = results.flatMap((item) => item.purchases)
         .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")));
       const payments = results.flatMap((item) => item.payments)
         .sort((left, right) => String(right.reviewedAt || "").localeCompare(String(left.reviewedAt || "")));
       const sections = [
-        ["每日數據", headers, [...rows, total, memberRow]],
-        ["會員（全部，匯出時資料）", ["會員", "會員 ID", "電郵", "電話", "加入日期", "代幣餘額", "累計入金（HK$）", "VIP 等級"], users.map((item) => ({
+        ["每日數據", headers, [...rows, total]],
+        ["會員（按加入日期）", ["會員", "會員 ID", "電郵", "電話", "加入日期", "代幣餘額", "累計入金（HK$）", "VIP 等級"], rangeUsers.map((item) => ({
           會員: item.username || item.displayName || "未命名", "會員 ID": item.id, 電郵: displayEmail(item.email) || "",
           電話: item.phoneNumber || "", 加入日期: formatAnalyticsTime(item.createdAt), 代幣餘額: Number(item.tokens || 0),
           "累計入金（HK$）": Number(item.totalDeposits || 0), "VIP 等級": item.vipLevel ?? "",
@@ -9323,6 +9336,8 @@ function AdminAnalytics() {
         [escapeCsvCell(`【${title}】`), createCsvText(sectionHeaders, sectionRows).replace(/^\uFEFF/, "")].join("\n")).join("\n\n");
       downloadTextFile(`livedraw-analytics-${start}_to_${end}.csv`, `\uFEFF${text}`);
     } catch (error) {
+      // Stop the other workers so the button does not keep counting after a failure.
+      failed = true;
       setExportError(getSafeErrorMessage(error, "未能匯出 CSV，請再試。"));
     } finally {
       setExportProgress(null);
@@ -9369,7 +9384,7 @@ function AdminAnalytics() {
               <Download size={15} />{exportProgress ? `匯出中 ${exportProgress.done}/${exportProgress.total}` : "下載 CSV"}
             </button>
           </div>
-          <p className="muted">每次最多 {ANALYTICS_EXPORT_MAX_DAYS} 日。購買交易按下單日期、入金按審批日期篩選；會員列出全部。購買人數按日計算，合計列不加總。</p>
+          <p className="muted">每次最多 {ANALYTICS_EXPORT_MAX_DAYS} 日。會員按加入日期、購買交易按下單日期、入金按審批日期篩選。購買人數按日計算，合計列不加總。</p>
           {exportError && <p className="error-note" role="alert">{exportError}</p>}
         </div>
         {summaryError && <p className="error-note" role="alert">{summaryError}</p>}
