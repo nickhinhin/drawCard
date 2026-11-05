@@ -9253,28 +9253,75 @@ function AdminAnalytics() {
     }
     setExportError("");
     setExportProgress({ done: 0, total: days.length });
+    const call = httpsCallable(functions, "adminAnalytics");
+    // Follow the 50-row cursor until the list for that mode/day is complete.
+    async function fetchAll(params) {
+      const items = [];
+      let cursor = "";
+      do {
+        const { data } = await call({ ...params, ...(cursor ? { cursor } : {}) });
+        items.push(...(data.items || []));
+        cursor = data.nextCursor || "";
+      } while (cursor);
+      return items;
+    }
     const results = new Array(days.length);
     let next = 0;
     let done = 0;
-    const call = httpsCallable(functions, "adminAnalytics");
     async function worker() {
       while (next < days.length) {
         const index = next++;
-        const { data } = await call({ mode: "summary", day: days[index] });
-        results[index] = { ...data, day: days[index] };
+        const day = days[index];
+        const [{ data }, purchases, payments] = await Promise.all([
+          call({ mode: "summary", day }),
+          fetchAll({ mode: "purchases", day }),
+          fetchAll({ mode: "payments", day }),
+        ]);
+        results[index] = { summary: { ...data, day }, purchases, payments };
         done += 1;
         setExportProgress({ done, total: days.length });
       }
     }
     try {
-      await Promise.all(Array.from({ length: Math.min(8, days.length) }, worker));
+      const [users] = await Promise.all([
+        fetchAll({ mode: "users", sort: "createdAt", direction: "desc" }),
+        Promise.all(Array.from({ length: Math.min(6, days.length) }, worker)),
+      ]);
+      const summaries = results.map((item) => item.summary);
       const headers = ANALYTICS_CSV_COLUMNS.map(([heading]) => heading);
-      const rows = results.map((item) => Object.fromEntries(ANALYTICS_CSV_COLUMNS.map(([heading, read]) => [heading, read(item) ?? 0])));
+      const rows = summaries.map((item) => Object.fromEntries(ANALYTICS_CSV_COLUMNS.map(([heading, read]) => [heading, read(item) ?? 0])));
       const total = Object.fromEntries(headers.map((heading) => [heading,
         ANALYTICS_CSV_NOT_SUMMABLE.has(heading) ? "" : rows.reduce((sum, row) => sum + Number(row[heading] || 0), 0)]));
       total["日期"] = "合計";
-      const memberRow = { 日期: `會員總數（匯出時）：${results.at(-1)?.totalUserCount ?? "--"}` };
-      downloadTextFile(`livedraw-analytics-${start}_to_${end}.csv`, createCsvText(headers, [...rows, total, memberRow]));
+      const memberRow = { 日期: `會員總數（匯出時）：${summaries.at(-1)?.totalUserCount ?? "--"}` };
+      // Purchases and payments are listed newest first, matching the page.
+      const purchases = results.flatMap((item) => item.purchases)
+        .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")));
+      const payments = results.flatMap((item) => item.payments)
+        .sort((left, right) => String(right.reviewedAt || "").localeCompare(String(left.reviewedAt || "")));
+      const sections = [
+        ["每日數據", headers, [...rows, total, memberRow]],
+        ["會員（全部，匯出時資料）", ["會員", "會員 ID", "電郵", "電話", "加入日期", "代幣餘額", "累計入金（HK$）", "VIP 等級"], users.map((item) => ({
+          會員: item.username || item.displayName || "未命名", "會員 ID": item.id, 電郵: displayEmail(item.email) || "",
+          電話: item.phoneNumber || "", 加入日期: formatAnalyticsTime(item.createdAt), 代幣餘額: Number(item.tokens || 0),
+          "累計入金（HK$）": Number(item.totalDeposits || 0), "VIP 等級": item.vipLevel ?? "",
+        }))],
+        ["購買交易", ["購買時間", "會員", "會員 ID", "交易 ID", "場次", "輪次", "號碼", "消費（代幣）", "結果", "兌換值（代幣）"], purchases.map((item) => ({
+          購買時間: formatAnalyticsTime(item.createdAt), 會員: item.username || "", "會員 ID": item.uid || "", "交易 ID": item.id,
+          場次: item.drawTitle || "", 輪次: formatRoundLabel(item.round), 號碼: item.number ?? "", "消費（代幣）": Number(item.tokenCost || 0),
+          結果: item.cardId ? item.cardName || "已分配" : "未結算", "兌換值（代幣）": item.cardId ? getCardConversionRefund(item) : "",
+        }))],
+        ["入金審批", ["審批時間", "會員", "會員 ID", "申請 ID", "狀態", "類型", "核實入金（HK$）", "代幣", "付款參考"], payments.map((item) => ({
+          審批時間: formatAnalyticsTime(item.reviewedAt), 會員: item.username || "", "會員 ID": item.uid || "", "申請 ID": item.id,
+          狀態: item.status === "approved" ? "已批准" : item.status === "rejected" ? "已駁回" : item.status || "",
+          類型: item.proofMode === "promo" ? "推廣碼" : "入金", "核實入金（HK$）": item.proofMode === "promo" ? "" : Number(item.verifiedHkdAmount || 0),
+          代幣: Number(item.amount || 0), 付款參考: item.paymentReference || "",
+        }))],
+      ];
+      // One file, one titled block per section, separated by a blank line.
+      const text = sections.map(([title, sectionHeaders, sectionRows]) =>
+        [escapeCsvCell(`【${title}】`), createCsvText(sectionHeaders, sectionRows).replace(/^\uFEFF/, "")].join("\n")).join("\n\n");
+      downloadTextFile(`livedraw-analytics-${start}_to_${end}.csv`, `\uFEFF${text}`);
     } catch (error) {
       setExportError(getSafeErrorMessage(error, "未能匯出 CSV，請再試。"));
     } finally {
@@ -9314,7 +9361,7 @@ function AdminAnalytics() {
           </div>
         </div>
         <div className="analytics-export">
-          <strong>匯出 CSV（每日一行）</strong>
+          <strong>匯出 CSV（每日數據、會員、購買交易、入金審批）</strong>
           <div className="analytics-controls">
             <AnalyticsDatePicker label="開始日期" day={exportStart} onChange={setExportStart} />
             <AnalyticsDatePicker label="結束日期" day={exportEnd} onChange={setExportEnd} />
@@ -9322,7 +9369,7 @@ function AdminAnalytics() {
               <Download size={15} />{exportProgress ? `匯出中 ${exportProgress.done}/${exportProgress.total}` : "下載 CSV"}
             </button>
           </div>
-          <p className="muted">每次最多 {ANALYTICS_EXPORT_MAX_DAYS} 日。購買人數按日計算，合計列不加總。</p>
+          <p className="muted">每次最多 {ANALYTICS_EXPORT_MAX_DAYS} 日。購買交易按下單日期、入金按審批日期篩選；會員列出全部。購買人數按日計算，合計列不加總。</p>
           {exportError && <p className="error-note" role="alert">{exportError}</p>}
         </div>
         {summaryError && <p className="error-note" role="alert">{summaryError}</p>}
