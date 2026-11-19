@@ -3,11 +3,23 @@
 import React, { useEffect, useState } from "react";
 import { collection, limit, limitToLast, onSnapshot, orderBy, query, where } from "firebase/firestore";
 import { db } from "../../firebase";
-import { toMillis } from "../../App.jsx";
+import {
+  KickEmbed,
+  LIVE_SNAPSHOT_OPTIONS,
+  formatRoundLabel,
+  getBlindBoxOdds,
+  getRoomCurrentRound,
+  getRoomRoundCount,
+  getRoomShareMode,
+  getRoundSchedule,
+  toMillis,
+  toRoundId,
+} from "../../App.jsx";
+import LegacyUI from "../LegacyUI.jsx";
 import { DCLogic, route, asset } from "../runtime.jsx";
 import { fmt } from "../ui.jsx";
 
-const CSS = "\nbody{margin:0;background:#0b0e12}\n*{box-sizing:border-box}\na{color:#ffffff;text-decoration:none}a:hover{color:#ffe390}\nbutton,input,textarea{font-family:inherit}\n:focus-visible{outline:2px solid #f4022b;outline-offset:2px}\ninput::placeholder,textarea::placeholder{color:#6b767f}\n.ld-nav{transition:background-color 150ms,color 150ms}\n.ld-nav:hover{background-color:#13161b !important;color:#ffffff !important}\n.ld-lift{transition:border-color 150ms,box-shadow 150ms}\n.ld-lift:hover{border-color:#6b767f !important}\n.ld-link:hover{color:#ffffff !important}\n.ld-card{transition:transform 150ms,border-color 150ms,box-shadow 150ms}\n.ld-card:hover{transform:translateY(-4px);border-color:#fdc800 !important;box-shadow:0 0 24px rgba(253,200,0,.25)}\n.ld-card:hover .ld-shine{animation:ld-sweep 900ms ease-out}\n.ld-marquee{-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 48px,#000 calc(100% - 48px),transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 48px,#000 calc(100% - 48px),transparent 100%)}\n.ld-track{animation:ld-marquee 36s linear infinite}\n.ld-marquee:hover .ld-track,.ld-marquee:focus-within .ld-track{animation-play-state:paused}\n@keyframes ld-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-50% - 7px))}}\n@media (prefers-reduced-motion:reduce){.ld-marquee{overflow-x:auto !important;-webkit-mask-image:none;mask-image:none}}\n.ld-ticker{-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 32px,#000 calc(100% - 32px),transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 32px,#000 calc(100% - 32px),transparent 100%)}\n.ld-ttrack{animation:ld-ticker 40s linear infinite}\n.ld-ticker:hover .ld-ttrack{animation-play-state:paused}\n@keyframes ld-ticker{from{transform:translateX(0)}to{transform:translateX(-50%)}}\n@media (prefers-reduced-motion:reduce){.ld-ticker{overflow-x:auto !important;-webkit-mask-image:none;mask-image:none}}\n@keyframes ld-sweep{from{transform:translateX(-160%) skewX(-20deg)}to{transform:translateX(330%) skewX(-20deg)}}\n@keyframes ld-blink{0%,100%{opacity:1}50%{opacity:.35}}\n@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none !important;transition:none !important}}\n\n.ld-menubtn,.ld-tabbar,.ld-drawer-close,.ld-backdrop{display:none}\n@media (max-width:760px){\n.ld-root{padding-bottom:68px}\n.ld-header{padding:8px 12px !important;gap:8px !important;flex-wrap:nowrap !important;position:sticky;top:0;z-index:40}\n.ld-search,.ld-hide-m,.ld-uname{display:none !important}\n.ld-logo{width:auto !important;flex:1 1 auto !important;min-width:0}\n.ld-logo img{width:104px !important;height:auto !important}\n.ld-tools{gap:6px !important;flex-wrap:nowrap !important}\n.ld-tools > a,.ld-tools > button,.ld-tools > span > button{height:38px !important}\n.ld-menubtn{display:flex !important}\n.ld-main h1{font-size:34px !important;line-height:40px !important}\n.ld-tools > a:first-child > span:last-child,.ld-tools > span > button > span{display:none !important}\n.ld-logo{min-width:96px !important}\n.ld-bleed{margin:-12px -12px 0 !important}\n.ld-sframe{width:84% !important}\n.ld-tools > span > button{padding:0 8px !important;gap:4px !important}\n.ld-tools > span > button > svg:last-child{display:none}\n.ld-tools > button{width:38px !important}\n.ld-tools > a:last-child{padding:0 3px !important;border:0 !important}\n.ld-tools > a:first-child{padding:0 4px 0 8px !important;gap:5px !important;font-size:17px !important}\n.ld-side{display:none !important}\n.ld-side.ld-side-open{display:flex !important;position:fixed;top:0;left:0;bottom:0;width:min(300px,84vw);z-index:80;overflow-y:auto;box-shadow:12px 0 40px rgba(0,0,0,.6)}\n.ld-side.ld-side-open .ld-drawer-close{display:flex !important}\n.ld-backdrop{display:block !important;position:fixed;top:0;right:0;bottom:0;left:0;z-index:79;border:0;background:rgba(0,0,0,.6)}\n.ld-main{padding:12px !important;gap:12px !important}\n.ld-footer{padding:24px 16px 20px !important;gap:16px !important}\n.ld-tabbar{display:flex !important;position:fixed;left:0;right:0;bottom:0;z-index:60;height:64px;background:#080b0e;border-top:1px solid #282d36}\n}\n";
+const CSS = "\nbody{margin:0;background:#0b0e12}\n*{box-sizing:border-box}\na{color:#ffffff;text-decoration:none}a:hover{color:#ffe390}\nbutton,input,textarea{font-family:inherit}\n:focus-visible{outline:2px solid #f4022b;outline-offset:2px}\ninput::placeholder,textarea::placeholder{color:#6b767f}\n.ld-nav{transition:background-color 150ms,color 150ms}\n.ld-nav:hover{background-color:#13161b !important;color:#ffffff !important}\n.ld-lift{transition:border-color 150ms,box-shadow 150ms}\n.ld-lift:hover{border-color:#6b767f !important}\n.ld-link:hover{color:#ffffff !important}\n.ld-card{transition:transform 150ms,border-color 150ms,box-shadow 150ms}\n.ld-card:hover{transform:translateY(-4px);border-color:#fdc800 !important;box-shadow:0 0 24px rgba(253,200,0,.25)}\n.ld-card:hover .ld-shine{animation:ld-sweep 900ms ease-out}\n.ld-marquee{-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 48px,#000 calc(100% - 48px),transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 48px,#000 calc(100% - 48px),transparent 100%)}\n.ld-track{animation:ld-marquee 36s linear infinite}\n.ld-marquee:hover .ld-track,.ld-marquee:focus-within .ld-track{animation-play-state:paused}\n@keyframes ld-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-50% - 7px))}}\n@media (prefers-reduced-motion:reduce){.ld-marquee{overflow-x:auto !important;-webkit-mask-image:none;mask-image:none}}\n.ld-ticker{-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 32px,#000 calc(100% - 32px),transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 32px,#000 calc(100% - 32px),transparent 100%)}\n.ld-ttrack{animation:ld-ticker 40s linear infinite}\n.ld-ticker:hover .ld-ttrack{animation-play-state:paused}\n@keyframes ld-ticker{from{transform:translateX(0)}to{transform:translateX(-50%)}}\n@media (prefers-reduced-motion:reduce){.ld-ticker{overflow-x:auto !important;-webkit-mask-image:none;mask-image:none}}\n@keyframes ld-sweep{from{transform:translateX(-160%) skewX(-20deg)}to{transform:translateX(330%) skewX(-20deg)}}\n@keyframes ld-blink{0%,100%{opacity:1}50%{opacity:.35}}\n@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none !important;transition:none !important}}\n\n.ld-home-player .kick-frame-wrap{position:absolute;inset:0;width:100%;height:100%;margin:0;border:0;border-radius:0;aspect-ratio:auto}\n.ld-home-player .stream-player-stage,.ld-home-player .kick-frame,.ld-home-player video{width:100%;height:100%}\n.ld-home-player .stream-mute-btn,.ld-home-player .stream-fullscreen-btn{display:none}\n.ld-home-player .stream-fallback{height:100%;display:flex;align-items:center;justify-content:center;color:#a0a5ad}\n.ld-menubtn,.ld-tabbar,.ld-drawer-close,.ld-backdrop{display:none}\n@media (max-width:760px){\n.ld-root{padding-bottom:68px}\n.ld-header{padding:8px 12px !important;gap:8px !important;flex-wrap:nowrap !important;position:sticky;top:0;z-index:40}\n.ld-search,.ld-hide-m,.ld-uname{display:none !important}\n.ld-logo{width:auto !important;flex:1 1 auto !important;min-width:0}\n.ld-logo img{width:104px !important;height:auto !important}\n.ld-tools{gap:6px !important;flex-wrap:nowrap !important}\n.ld-tools > a,.ld-tools > button,.ld-tools > span > button{height:38px !important}\n.ld-menubtn{display:flex !important}\n.ld-main h1{font-size:34px !important;line-height:40px !important}\n.ld-tools > a:first-child > span:last-child,.ld-tools > span > button > span{display:none !important}\n.ld-logo{min-width:96px !important}\n.ld-bleed{margin:-12px -12px 0 !important}\n.ld-sframe{width:84% !important}\n.ld-tools > span > button{padding:0 8px !important;gap:4px !important}\n.ld-tools > span > button > svg:last-child{display:none}\n.ld-tools > button{width:38px !important}\n.ld-tools > a:last-child{padding:0 3px !important;border:0 !important}\n.ld-tools > a:first-child{padding:0 4px 0 8px !important;gap:5px !important;font-size:17px !important}\n.ld-side{display:none !important}\n.ld-side.ld-side-open{display:flex !important;position:fixed;top:0;left:0;bottom:0;width:min(300px,84vw);z-index:80;overflow-y:auto;box-shadow:12px 0 40px rgba(0,0,0,.6)}\n.ld-side.ld-side-open .ld-drawer-close{display:flex !important}\n.ld-backdrop{display:block !important;position:fixed;top:0;right:0;bottom:0;left:0;z-index:79;border:0;background:rgba(0,0,0,.6)}\n.ld-main{padding:12px !important;gap:12px !important}\n.ld-footer{padding:24px 16px 20px !important;gap:16px !important}\n.ld-tabbar{display:flex !important;position:fixed;left:0;right:0;bottom:0;z-index:60;height:64px;background:#080b0e;border-top:1px solid #282d36}\n}\n";
 
 class HomePage extends DCLogic {
   constructor(...args) {
@@ -67,8 +79,9 @@ class HomePage extends DCLogic {
     const packs = this.props.packs || [];
     const chat = this.props.chat || [];
     const feed = this.props.feed || [];
-    const liveNow = Boolean(this.props.live);
-    return { loggedIn: loggedIn, loggedOut: !loggedIn, packs: packs, chat: chat, feed: feed, hasFeed: feed.length > 0, noChat: chat.length === 0, liveNow: liveNow, offAir: !liveNow };
+    const lobby = this.props.lobby || {};
+    const liveNow = Boolean(lobby.live);
+    return { loggedIn: loggedIn, loggedOut: !loggedIn, packs: packs, chat: chat, feed: feed, hasFeed: feed.length > 0, noChat: chat.length === 0, liveNow: liveNow, offAir: !liveNow, lobby: lobby };
   }
 
   renderVals() {
@@ -219,28 +232,35 @@ HomePage.prototype.template = function template(v) {
             </svg>{"LIVE"}
           </span>
         </>) : null}{"\n        "}
-        {v.offAir ? (<>
-          <span style={{display: "inline-flex", alignItems: "center", height: "22px", padding: "0 8px", borderRadius: "4px", border: "1px solid #3a414b", background: "#13161b", color: "#c3c8cd", fontSize: "12px", fontWeight: "700"}}>{"今晚 20:30 開播"}</span>
+        {v.offAir && v.lobby.offAirLabel ? (<>
+          <span style={{display: "inline-flex", alignItems: "center", height: "22px", padding: "0 8px", borderRadius: "4px", border: "1px solid #3a414b", background: "#13161b", color: "#c3c8cd", fontSize: "12px", fontWeight: "700"}}>{v.lobby.offAirLabel}</span>
         </>) : null}{"\n        "}
-        <span style={{height: "24px", padding: "0 10px", borderRadius: "999px", background: "#13161b", border: "1px solid #282d36", fontSize: "12px", lineHeight: "22px", color: "#c3c8cd"}}>{"29/10（四）共 20 場"}</span>{"\n      "}
+        {v.lobby.dayChip ? <span style={{height: "24px", padding: "0 10px", borderRadius: "999px", background: "#13161b", border: "1px solid #282d36", fontSize: "12px", lineHeight: "22px", color: "#c3c8cd"}}>{v.lobby.dayChip}</span> : null}{"\n      "}
       </div>{"\n      "}
       <div style={{display: "flex", flexWrap: "wrap", gap: "16px 20px", alignItems: "stretch"}}>{"\n        "}
         <div style={{position: "relative", flex: "1 1 340px", minWidth: "0", minHeight: "190px", borderRadius: "6px", overflow: "hidden", border: "1px solid #282d36", background: "radial-gradient(70% 90% at 50% 45%, #2a0710 0%, #05070a 72%)"}}>{"\n          "}
+          {v.lobby.kickUrl ? (
+            <div className="ld-home-player" aria-hidden="true" style={{position: "absolute", top: "0", right: "0", bottom: "0", left: "0", pointerEvents: "none"}}>
+              <LegacyUI><KickEmbed kickUrl={v.lobby.kickUrl} title={v.lobby.title || "LiveDraw 直播"} /></LegacyUI>
+            </div>
+          ) : (<>
           <img src="/revamp/images/logo.png" alt="" style={{position: "absolute", left: "24px", top: "20px", width: "130px", opacity: "0.6"}} />{"\n          "}
-          <button type="button" aria-label="播放直播" style={{position: "absolute", left: "50%", top: "50%", width: "56px", height: "56px", margin: "-28px 0 0 -28px", display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "999px", border: "2px solid rgba(255, 255, 255, 0.85)", background: "rgba(5, 7, 10, 0.6)", color: "#ffffff", cursor: "pointer"}}>
+          <span aria-hidden="true" style={{position: "absolute", left: "50%", top: "50%", width: "56px", height: "56px", margin: "-28px 0 0 -28px", display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "999px", border: "2px solid rgba(255, 255, 255, 0.85)", background: "rgba(5, 7, 10, 0.6)", color: "#ffffff"}}>
             <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M8 5.5v13l10.5-6.5z" fill="currentColor"></path>
             </svg>
-          </button>{"\n          "}
+          </span>
+          </>)}
+          <a href="/beta/live" aria-label="進入直播大廳" style={{position: "absolute", top: "0", right: "0", bottom: "0", left: "0", zIndex: "4"}}></a>{"\n          "}
           {v.liveNow ? (<>
-            <span style={{position: "absolute", left: "12px", bottom: "12px", display: "inline-flex", alignItems: "center", gap: "6px", height: "28px", padding: "0 10px", borderRadius: "4px", background: "rgba(5, 7, 10, 0.8)", fontSize: "14px", fontWeight: "700"}}>
+            <span style={{position: "absolute", zIndex: "3", left: "12px", bottom: "12px", display: "inline-flex", alignItems: "center", gap: "6px", height: "28px", padding: "0 10px", borderRadius: "4px", background: "rgba(5, 7, 10, 0.8)", fontSize: "14px", fontWeight: "700"}}>
               <span aria-hidden="true" style={{width: "8px", height: "8px", borderRadius: "999px", background: "#f4022b", animation: "ld-blink 1.2s ease-in-out infinite"}}></span>{"LIVE"}
             </span>
           </>) : null}{"\n        "}
         </div>{"\n        "}
         <div style={{flex: "1 1 260px", display: "flex", flexDirection: "column", alignItems: "flex-start", gap: "10px", padding: "4px 0"}}>{"\n          "}
-          <h3 style={{margin: "0", fontSize: "20px", lineHeight: "28px", fontWeight: "900"}}>{"第 5 場　|　盲盒機率二份之一"}</h3>{"\n          "}
-          <p style={{margin: "0", fontSize: "15px", lineHeight: "24px", color: "#c3c8cd"}}>{"今晚 8:30 準時開抽！"}
+          <h3 style={{margin: "0", fontSize: "20px", lineHeight: "28px", fontWeight: "900"}}>{v.lobby.roundLine}</h3>{"\n          "}
+          <p style={{margin: "0", fontSize: "15px", lineHeight: "24px", color: "#c3c8cd"}}>{v.lobby.startLine}
             <br />{"多款熱門卡盒，與大家一起見證稀有卡誕生！"}
           </p>{"\n          "}
           <a href="/beta/live" style={{marginTop: "auto", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: "8px", width: "180px", height: "44px", borderRadius: "4px", background: "#f4022b", color: "#ffffff", fontSize: "16px", fontWeight: "700"}}>{"進入直播大廳"}
@@ -314,14 +334,48 @@ HomePage.prototype.template = function template(v) {
 
 const CHAT_COLORS = [["#4a0511", "#ffffff"], ["#21252d", "#ffffff"], ["#3a2a00", "#ffe390"], ["#13161b", "#ffffff"]];
 
+// The room the live page opens by default: the live one, else the next draft / scheduled one.
 function useLiveRoom() {
   const [room, setRoom] = useState(null);
-  useEffect(() => onSnapshot(query(collection(db, "draws"), where("status", "==", "live")), (snapshot) => {
+  useEffect(() => onSnapshot(query(collection(db, "draws"), where("status", "in", ["live", "scheduled", "draft"])), LIVE_SNAPSHOT_OPTIONS, (snapshot) => {
     const rooms = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
       .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
-    setRoom(rooms[0] || null);
+    setRoom(rooms.find((item) => item.status === "live") || rooms.find((item) => item.status === "draft") || rooms[0] || null);
   }, (error) => console.error("Live room listener failed.", error)), []);
   return room;
+}
+
+const hkParts = (date) => {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(date);
+  const get = (type) => parts.find((part) => part.type === type)?.value || "";
+  const weekday = new Intl.DateTimeFormat("zh-HK", { timeZone: "Asia/Hong_Kong", weekday: "narrow" }).format(date);
+  return { day: `${get("year")}-${get("month")}-${get("day")}`, dm: `${get("day")}/${get("month")}`, wd: weekday, hm: `${get("hour")}:${get("minute")}`, h: Number(get("hour")) };
+};
+
+// 今晚 20:30 / 今日 14:00 / 18/11（二）20:30, in Hong Kong time.
+function whenText(date) {
+  const p = hkParts(date);
+  if (p.day === hkParts(new Date()).day) return `${p.h >= 18 ? "今晚" : "今日"} ${p.hm}`;
+  return `${p.dm}（${p.wd}）${p.hm}`;
+}
+
+function lobbyInfo(room) {
+  if (!room) {
+    return { live: false, roundLine: "暫時未有直播", startLine: "直播資料準備中，請稍後再試。", dayChip: "", offAirLabel: "", kickUrl: "" };
+  }
+  const live = room.status === "live";
+  const roundId = live ? toRoundId(getRoomCurrentRound(room)) : "round-001";
+  const at = getRoundSchedule(room, roundId);
+  const p = at instanceof Date ? hkParts(at) : null;
+  return {
+    live,
+    title: room.title || "",
+    kickUrl: live ? room.kickUrl || "" : "",
+    dayChip: `${p ? `${p.dm}（${p.wd}）` : ""}共 ${getRoomRoundCount(room)} 場`,
+    roundLine: `${formatRoundLabel(roundId)}　|　盲盒機率${getBlindBoxOdds(getRoomShareMode(room, roundId)).label}`,
+    startLine: live ? "直播進行中，立即進入直播大廳選號！" : p ? `${whenText(at)} 準時開抽！` : "開抽時間待定，請留意直播公告。",
+    offAirLabel: p ? `${whenText(at)} 開播` : "",
+  };
 }
 
 function useShowcase() {
@@ -362,5 +416,5 @@ export default function HomeRoute({ session }) {
     const name = m.username || "玩家";
     return { name, time: hkTime(m.createdAt), text: m.text || "", bg, fg, initial: name.charAt(0).toUpperCase() };
   });
-  return <HomePage loggedIn={session.signedIn} live={Boolean(room)} packs={packs} chat={chat} feed={[]} />;
+  return <HomePage loggedIn={session.signedIn} lobby={lobbyInfo(room)} packs={packs} chat={chat} feed={[]} />;
 }
